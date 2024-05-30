@@ -119,7 +119,8 @@ typedef struct
   vnet_link_t linkt;
   u64 packets;
   u64 bytes;
-} ip4_nbr_counter_t;
+} 
+ip4_nbr_counter_t;
 
 typedef struct
 {
@@ -133,16 +134,16 @@ struct vat_registered_features_t;
 
 typedef struct vat_main_
 {
-  /* vpe input queue */
+  /* vpe input queue 输出队列*/
   svm_queue_t *vl_input_queue;
 
-  /* interface name table */
+  /* interface name table 接口名称表*/
   uword *sw_if_index_by_interface_name;
 
-  /* subinterface table */
+  /* subinterface table 子接口表*/
   sw_interface_subif_t *sw_if_subif_table;
 
-  /* Graph node table */
+  /* Graph node table 图节点表*/
   uword *graph_node_index_by_name;
   vlib_node_t ***graph_nodes;
 
@@ -167,7 +168,8 @@ typedef struct vat_main_
   /* Errors by number */
   uword *error_string_by_error_number;
 
-  /* Main thread can spin (w/ timeout) here if needed */
+  /* Main thread can spin (w/ timeout) here if needed 
+  如果需要，主线程可以在这里旋转（带超时）。*/
   u32 async_mode;
   u32 async_errors;
   volatile u32 result_ready;
@@ -188,7 +190,7 @@ typedef struct vat_main_
   int jump_buf_set;
   volatile int do_exit;
 
-  /* temporary parse buffer */
+  /* temporary parse buffer 临时解析缓冲区*/
   unformat_input_t *input;
 
   /* input buffer */
@@ -199,10 +201,10 @@ typedef struct vat_main_
   u8 *current_file;
   u32 input_line_number;
 
-  /* exec mode toggle */
+  /* exec mode toggle 执行模式切换*/
   int exec_mode;
 
-  /* Regenerate the interface table */
+  /* Regenerate the interface table 重新生成接口表*/
   volatile int regenerate_interface_table;
 
   /* flag for JSON output format */
@@ -211,7 +213,8 @@ typedef struct vat_main_
   /* flag for interface event display */
   u8 interface_event_display;
 
-  /* JSON tree used in composing dump api call results */
+  /* JSON tree used in composing dump api call results 
+  用于合成转储 api 调用结果的 JSON 树*/
   vat_json_node_t json_tree;
 
   /* counters */

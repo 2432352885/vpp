@@ -35,7 +35,7 @@
 #include <limits.h>
 
 /*
- * Load plugins from /usr/lib/vpp_plugins by default
+ * Load plugins from /usr/lib/vpp_plugins by default 加载默认的插件 
  */
 char *vlib_plugin_path = NULL;
 char *vlib_plugin_app_version = VPP_BUILD_VER;
@@ -82,7 +82,7 @@ done:
 static void
 vpe_main_init (vlib_main_t * vm)
 {
-#if VPP_API_TEST_BUILTIN > 0
+#if VPP_API_TEST_BUILTIN > 0//测试
   void vat_plugin_hash_create (void);
 #endif
 
@@ -91,7 +91,8 @@ vpe_main_init (vlib_main_t * vm)
   else
     vlib_unix_cli_set_prompt ("vpp# ");
 
-  /* Turn off network stack components which we don't want */
+  /* Turn off network stack components which we don't want
+  关闭我们不需要的网络协议栈组件 */
   vlib_mark_init_function_complete (vm, srp_init);
 
   /*
@@ -114,8 +115,9 @@ int
 main (int argc, char *argv[])
 {
   int i;
+  //前向声明
   void vl_msg_api_set_first_available_msg_id (u16);
-  uword main_heap_size = (1ULL << 30);
+  uword main_heap_size = (1ULL << 30);//1G
   u8 *sizep;
   u32 size;
   clib_mem_page_sz_t main_heap_log2_page_sz = CLIB_MEM_PAGE_SZ_DEFAULT;

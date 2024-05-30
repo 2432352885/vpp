@@ -72,7 +72,7 @@ typedef enum
   VLIB_NODE_TYPE_INTERNAL,
 
   /* Nodes which input data into the processing graph.
-     Input nodes are called for each iteration of main loop. */
+     Input nodes are called for each iteration of main loop. 主循环的每次迭代都会调用输入节点*/
   VLIB_NODE_TYPE_INPUT,
 
   /* Nodes to be called before all input nodes.
@@ -249,48 +249,51 @@ typedef enum
 
 typedef struct vlib_node_t
 {
-  /* Vector processing function for this node. */
+  /* Vector processing function for this node. 节点的矢量处理函数 */
   vlib_node_function_t *function;
 
   /* Node name. */
   u8 *name;
 
-  /* Node name index in elog string table. */
+  /* Node name index in elog string table. elog字符串表的节点名索引*/
   u32 name_elog_string;
 
-  /* Total statistics for this node. */
+  /* Total statistics for this node. 节点的统计总数*/
   vlib_node_stats_t stats_total;
 
-  /* Saved values as of last clear (or zero if never cleared).
-     Current values are always stats_total - stats_last_clear. */
+  /* Saved values as of last clear (or zero if never cleared).上次清零时的保存值（如果从未清零，则为零）。
+     Current values are always stats_total - stats_last_clear. 当前值始终为 stats_total - stats_last_clear。*/
   vlib_node_stats_t stats_last_clear;
 
-  /* Type of this node. */
+  /* Type of this node. 节点类型*/
   vlib_node_type_t type;
 
   /* Node index. */
   u32 index;
 
-  /* Index of corresponding node runtime. */
+  /* Index of corresponding node runtime. 相应节点运行时的索引*/
   u32 runtime_index;
 
-  /* Runtime data for this node. */
+  /* Runtime data for this node. 节点运行时的诗句*/
   u8 *runtime_data;
 
-  /* Node flags. */
+  /* Node flags. 节点标记*/
   u16 flags;
 
   /* Processing function keeps frame.  Tells node dispatching code not
-     to free frame after dispatch is done.  */
+     to free frame after dispatch is done.  
+     处理函数保留帧。  告诉节点调度代码在调度完成后不要释放帧。*/
 #define VLIB_NODE_FLAG_FRAME_NO_FREE_AFTER_DISPATCH (1 << 0)
 
-  /* Node counts as output/drop/punt node for stats purposes. */
+  /* Node counts as output/drop/punt node for stats purposes.
+  就统计而言，节点算作输出/删除/分流节点 */
 #define VLIB_NODE_FLAG_IS_OUTPUT (1 << 1)
 #define VLIB_NODE_FLAG_IS_DROP (1 << 2)
 #define VLIB_NODE_FLAG_IS_PUNT (1 << 3)
 #define VLIB_NODE_FLAG_IS_HANDOFF (1 << 4)
 
-  /* Set if current node runtime has traced vectors. */
+  /* Set if current node runtime has traced vectors.
+  设置当前节点运行时是否跟踪矢量 */
 #define VLIB_NODE_FLAG_TRACE (1 << 5)
 
 #define VLIB_NODE_FLAG_SWITCH_FROM_INTERRUPT_TO_POLLING_MODE (1 << 6)
@@ -304,48 +307,53 @@ typedef struct vlib_node_t
   /* Number of bytes of run time data. */
   u8 runtime_data_bytes;
 
-  /* protocol at b->data[b->current_data] upon entry to the dispatch fn */
+  /* protocol at b->data[b->current_data] upon entry to the dispatch fn 
+  进入调度 fn 时，在 b->data[b->current_data] 处的协议*/
   u8 protocol_hint;
 
   /* Number of error codes used by this node. */
   u16 n_errors;
 
-  /* Size of scalar and vector arguments in bytes. */
+  /* Size of scalar and vector arguments in bytes. 标量和向量参数的大小（字节）*/
   u16 frame_size, scalar_offset, vector_offset, magic_offset, aux_offset;
   u16 frame_size_index;
 
-  /* Handle/index in error heap for this node. */
+  /* Handle/index in error heap for this node. 该节点在错误堆中的句柄/索引。*/
   u32 error_heap_handle;
   u32 error_heap_index;
 
-  /* Counter structures indexed by counter code for this node. */
+  /* Counter structures indexed by counter code for this node. 该节点在错误堆中的句柄/索引。*/
   vlib_error_desc_t *error_counters;
 
-  /* Vector of next node names.
+  /* Vector of next node names.下一个节点名向量
      Only used before next_nodes array is initialized. */
   char **next_node_names;
 
   /* Next node indices for this node. */
   u32 *next_nodes;
 
-  /* Name of node that we are sibling of. */
+  /* Name of node that we are sibling of. 兄弟节点的名称*/
   char *sibling_of;
 
   /* Bitmap of all of this node's siblings. */
   uword *sibling_bitmap;
 
-  /* Total number of vectors sent to each next node. */
+  /* Total number of vectors sent to each next node.发送到下一个节点的向量总数。 */
   u64 *n_vectors_by_next_node;
 
   /* Hash table mapping next node index into slot in
      next_nodes vector.  Quickly determines whether this node
-     is connected to given next node and, if so, with which slot. */
+     is connected to given next node and, if so, with which slot. 
+     将下一节点索引映射到 next_nodes 向量中插槽的哈希表。   
+     快速确定此节点是否与给定的下一节点相连，如果是，则确定与哪个槽相连。*/
   uword *next_slot_by_node;
 
-  /* Bitmap of node indices which feed this node. */
+  /* Bitmap of node indices which feed this node. 
+  为该节点提供数据的节点索引位图。*/
   uword *prev_node_bitmap;
 
-  /* Node/next-index which own enqueue rights with to this node. */
+  /* Node/next-index which own enqueue rights with to this node. 
+  Node/next-index 拥有该节点的入队权限。*/
   u32 owner_node_index, owner_next_index;
 
   /* Buffer format/unformat for this node. */
@@ -355,14 +363,16 @@ typedef struct vlib_node_t
   /* Trace buffer format/unformat for this node. */
   format_function_t *format_trace;
 
-  /* Function to validate incoming frames. */
+  /* Function to validate incoming frames. 
+  验证传入帧的功能*/
   u8 *(*validate_frame) (struct vlib_main_t * vm,
 			 struct vlib_node_runtime_t *,
 			 struct vlib_frame_t * f);
   /* for pretty-printing, not typically valid */
   u8 *state_string;
 
-  /* Node function candidate registration with priority */
+  /* Node function candidate registration with priority 
+  节点功能候选优先注册*/
   vlib_node_fn_registration_t *node_fn_registrations;
 } vlib_node_t;
 

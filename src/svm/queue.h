@@ -24,8 +24,9 @@
 
 typedef struct _svm_queue
 {
-  pthread_mutex_t mutex;	/* 8 bytes */
-  pthread_cond_t condvar;	/* 8 bytes */
+  //线程间同步
+  pthread_mutex_t mutex;	/* 8 bytes 进程互斥量 */
+  pthread_cond_t condvar;	/* 8 bytes 条件变量*/
   int head;
   int tail;
   volatile int cursize;

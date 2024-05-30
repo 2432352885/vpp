@@ -28,7 +28,8 @@ typedef struct
 } sample_trace_t;
 
 
-/* packet trace format function */
+/* packet trace format function 
+	数据包跟踪格式功能*/
 static u8 *
 format_sample_trace (u8 * s, va_list * args)
 {

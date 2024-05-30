@@ -472,7 +472,9 @@ typedef struct
 /** CLI global state. */
 typedef struct
 {
-  /** Prompt string for CLI. */
+  /** Prompt string for CLI.
+   * CLI 提示字符串
+   */
   u8 *cli_prompt;
 
   /** Vec pool of CLI sessions. */
