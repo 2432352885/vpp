@@ -104,6 +104,22 @@ session_program_tx_io_evt (session_handle_tu_t sh, session_evt_type_t evt_type)
 }
 
 int
+session_program_rx_io_evt (session_handle_tu_t sh)
+{
+  if (sh.thread_index == vlib_get_thread_index ())
+    {
+      session_t *s = session_get_from_handle (sh);
+      return session_enqueue_notify (s);
+    }
+  else
+    {
+      return session_send_evt_to_thread ((void *) &sh.session_index, 0,
+					 (u32) sh.thread_index,
+					 SESSION_IO_EVT_BUILTIN_RX);
+    }
+}
+
+int
 session_send_ctrl_evt_to_thread (session_t * s, session_evt_type_t evt_type)
 {
   /* only events supported are disconnect, shutdown and reset */
@@ -1659,8 +1675,10 @@ session_transport_close (session_t * s)
     {
       if (s->session_state == SESSION_STATE_TRANSPORT_CLOSED)
 	session_set_state (s, SESSION_STATE_CLOSED);
-      /* If transport is already deleted, just free the session */
-      else if (s->session_state >= SESSION_STATE_TRANSPORT_DELETED)
+      /* If transport is already deleted, just free the session. Half-opens
+       * expected to be already cleaning up at this point */
+      else if (s->session_state >= SESSION_STATE_TRANSPORT_DELETED &&
+	       !(s->flags & SESSION_F_HALF_OPEN))
 	session_program_cleanup (s);
       return;
     }
@@ -1687,7 +1705,8 @@ session_transport_reset (session_t * s)
     {
       if (s->session_state == SESSION_STATE_TRANSPORT_CLOSED)
 	session_set_state (s, SESSION_STATE_CLOSED);
-      else if (s->session_state >= SESSION_STATE_TRANSPORT_DELETED)
+      else if (s->session_state >= SESSION_STATE_TRANSPORT_DELETED &&
+	       !(s->flags & SESSION_F_HALF_OPEN))
 	session_program_cleanup (s);
       return;
     }
@@ -1866,7 +1885,8 @@ session_register_update_time_fn (session_update_time_fn fn, u8 is_add)
     }
   else
     {
-      vec_del1 (smm->update_time_fns, fi_pos);
+      if (found)
+	vec_del1 (smm->update_time_fns, fi_pos);
     }
 }
 
@@ -2148,6 +2168,16 @@ session_node_enable_dma (u8 is_en, int n_vlibs)
     }
 }
 
+static void
+session_main_start_q_process (vlib_main_t *vm, vlib_node_state_t state)
+{
+  vlib_node_t *n;
+
+  vlib_node_set_state (vm, session_queue_process_node.index, state);
+  n = vlib_get_node (vm, session_queue_process_node.index);
+  vlib_start_process (vm, n->runtime_index);
+}
+
 void
 session_node_enable_disable (u8 is_en)
 {
@@ -2155,7 +2185,6 @@ session_node_enable_disable (u8 is_en)
   u8 state = is_en ? VLIB_NODE_STATE_POLLING : VLIB_NODE_STATE_DISABLED;
   session_main_t *sm = &session_main;
   vlib_main_t *vm;
-  vlib_node_t *n;
   int n_vlibs, i;
 
   n_vlibs = vlib_get_n_threads ();
@@ -2169,10 +2198,7 @@ session_node_enable_disable (u8 is_en)
 	  if (is_en)
 	    {
 	      session_main_get_worker (0)->state = SESSION_WRK_INTERRUPT;
-	      vlib_node_set_state (vm, session_queue_process_node.index,
-				   state);
-	      n = vlib_get_node (vm, session_queue_process_node.index);
-	      vlib_start_process (vm, n->runtime_index);
+	      session_main_start_q_process (vm, state);
 	    }
 	  else
 	    {

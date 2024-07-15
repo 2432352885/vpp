@@ -1512,6 +1512,10 @@ tcp_main_enable (vlib_main_t * vm)
   clib_error_t *error = 0;
   int thread;
 
+  /* Already initialized */
+  if (tm->wrk_ctx)
+    return 0;
+
   if ((error = vlib_call_init_function (vm, ip_main_init)))
     return error;
   if ((error = vlib_call_init_function (vm, ip4_lookup_init)))
@@ -1642,6 +1646,9 @@ tcp_configuration_init (void)
 
   /* This value is seconds */
   tcp_cfg.cleanup_time = 0.1;	/* 100ms */
+
+  /* Time constants defined as tcp tick (1us) multiples */
+  tcp_cfg.syn_rcvd_time = TCP_ESTABLISH_TIME;
 }
 
 static clib_error_t *

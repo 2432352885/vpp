@@ -31,6 +31,7 @@ from vpp_papi.macaddress import mac_ntop
 from socket import inet_ntop
 from vpp_papi import VppEnum
 from vpp_sub_interface import VppDot1ADSubint
+from config import config
 
 
 TMPL_COMMON_FIELD_COUNT = 6
@@ -183,9 +184,7 @@ class MethodHolder(VppTestCase):
         variables and configure VPP.
         """
         super(MethodHolder, cls).setUpClass()
-        if (is_distro_ubuntu2204 == True or is_distro_debian11 == True) and not hasattr(
-            cls, "vpp"
-        ):
+        if (is_distro_debian11 == True) and not hasattr(cls, "vpp"):
             return
         try:
             # Create pg interfaces
@@ -386,6 +385,9 @@ class MethodHolder(VppTestCase):
 @tag_fixme_vpp_workers
 @tag_fixme_ubuntu2204
 @tag_fixme_debian11
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class Flowprobe(MethodHolder):
     """Template verification, timer tests"""
 
@@ -1228,6 +1230,9 @@ class DatapathTestsHolder(object):
         self.logger.info("FFP_TEST_FINISH_0002")
 
 
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class DatapathTx(MethodHolder, DatapathTestsHolder):
     """Collect info on Ethernet, IP4 and IP6 datapath (TX) (no timers)"""
 
@@ -1308,6 +1313,9 @@ class DatapathTx(MethodHolder, DatapathTestsHolder):
         ipfix.remove_vpp_config()
 
 
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class DatapathRx(MethodHolder, DatapathTestsHolder):
     """Collect info on Ethernet, IP4 and IP6 datapath (RX) (no timers)"""
 
@@ -1318,6 +1326,9 @@ class DatapathRx(MethodHolder, DatapathTestsHolder):
 
 
 @unittest.skipUnless(config.extended, "part of extended tests")
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class DisableIPFIX(MethodHolder):
     """Disable IPFIX"""
 
@@ -1366,6 +1377,9 @@ class DisableIPFIX(MethodHolder):
 
 
 @unittest.skipUnless(config.extended, "part of extended tests")
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class ReenableIPFIX(MethodHolder):
     """Re-enable IPFIX"""
 
@@ -1433,6 +1447,9 @@ class ReenableIPFIX(MethodHolder):
 
 
 @unittest.skipUnless(config.extended, "part of extended tests")
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class DisableFP(MethodHolder):
     """Disable Flowprobe feature"""
 
@@ -1541,6 +1558,9 @@ class DisableFP(MethodHolder):
 
 
 @unittest.skipUnless(config.extended, "part of extended tests")
+@unittest.skipIf(
+    "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+)
 class ReenableFP(MethodHolder):
     """Re-enable Flowprobe feature"""
 

@@ -70,6 +70,7 @@ typedef struct ct_main_
   u32 **fwrk_pending_connects;		/**< First wrk pending half-opens */
   u32 fwrk_thread;			/**< First worker thread */
   u8 fwrk_have_flush;			/**< Flag for connect flush rpc */
+  u8 is_init;
 } ct_main_t;
 
 static ct_main_t ct_main;
@@ -1350,14 +1351,22 @@ ct_enable_disable (vlib_main_t * vm, u8 is_en)
   ct_main_t *cm = &ct_main;
   ct_worker_t *wrk;
 
+  if (is_en == 0)
+    return 0;
+
+  if (cm->is_init)
+    return 0;
+
   cm->n_workers = vlib_num_workers ();
   cm->fwrk_thread = transport_cl_thread ();
   vec_validate (cm->wrk, vtm->n_vlib_mains);
+  vec_validate (cm->fwrk_pending_connects, cm->n_workers);
   vec_foreach (wrk, cm->wrk)
     clib_spinlock_init (&wrk->pending_connects_lock);
   clib_spinlock_init (&cm->ho_reuseable_lock);
   clib_rwlock_init (&cm->app_segs_lock);
-  vec_validate (cm->fwrk_pending_connects, cm->n_workers);
+  cm->is_init = 1;
+
   return 0;
 }
 

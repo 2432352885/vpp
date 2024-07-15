@@ -419,10 +419,12 @@ vnet_ip_table_cmd (vlib_main_t * vm,
   unformat_input_t _line_input, *line_input = &_line_input;
   clib_error_t *error = NULL;
   u32 table_id, is_add;
+  u8 create_mfib;
   u8 *name = NULL;
 
   is_add = 1;
   table_id = ~0;
+  create_mfib = 1;
 
   /* Get a line of input. */
   if (!unformat_user (main_input, unformat_line_input, line_input))
@@ -438,6 +440,8 @@ vnet_ip_table_cmd (vlib_main_t * vm,
 	is_add = 1;
       else if (unformat (line_input, "name %s", &name))
 	;
+      else if (unformat (line_input, "no-mfib"))
+	create_mfib = 0;
       else
 	{
 	  error = unformat_parse_error (line_input);
@@ -459,7 +463,8 @@ vnet_ip_table_cmd (vlib_main_t * vm,
 		  table_id = ip_table_get_unused_id (fproto);
 		  vlib_cli_output (vm, "%u\n", table_id);
 		}
-	      ip_table_create (fproto, table_id, 0, name);
+	      ip_table_create (fproto, table_id, 0 /* is_api */, create_mfib,
+			       name);
 	    }
 	  else
 	    {
@@ -603,6 +608,8 @@ VLIB_CLI_COMMAND (vlib_cli_show_ip6_command, static) = {
  * @cliexcmd{ip route add 7.0.0.1/32 via 6.0.0.2 GigabitEthernet2/0/0 weight 3}
  * To add a route to a particular FIB table (VRF), use:
  * @cliexcmd{ip route add 172.16.24.0/24 table 7 via GigabitEthernet2/0/0}
+ * To add a route to drop the traffic:
+ * @cliexcmd{ip route add 172.16.24.0/24 table 100 via 127.0.0.1 drop}
  ?*/
 VLIB_CLI_COMMAND (ip_route_command, static) = {
   .path = "ip route",
@@ -612,7 +619,7 @@ VLIB_CLI_COMMAND (ip_route_command, static) = {
 		"<value>] [udp-encap <value>] [ip4-lookup-in-table <value>] "
 		"[ip6-lookup-in-table <value>] [mpls-lookup-in-table <value>] "
 		"[resolve-via-host] [resolve-via-connected] [rx-ip4|rx-ip6 "
-		"<interface>] [out-labels <value value value>]",
+		"<interface>] [out-labels <value value value>] [drop]",
   .function = vnet_ip_route_cmd,
   .is_mp_safe = 1,
 };

@@ -12,6 +12,12 @@
 #include <vnet/flow/flow.h>
 #include <vnet/udp/udp.h>
 #include <vnet/ipsec/esp.h>
+#include <vnet/ethernet/packet.h>
+#include <vnet/ip/ip_packet.h>
+#include <vnet/ip/icmp46_packet.h>
+#include <vnet/ip/igmp_packet.h>
+#include <vnet/gre/packet.h>
+#include <vxlan/vxlan.h>
 #include <base/roc_api.h>
 #include <dev_octeon/hw_defs.h>
 
@@ -140,6 +146,17 @@ vnet_dev_rv_t oct_flow_validate_params (vlib_main_t *, vnet_dev_port_t *,
 					uword *);
 vnet_dev_rv_t oct_flow_query (vlib_main_t *, vnet_dev_port_t *, u32, uword,
 			      u64 *);
+
+/* counter.c */
+void oct_port_add_counters (vlib_main_t *, vnet_dev_port_t *);
+void oct_port_clear_counters (vlib_main_t *, vnet_dev_port_t *);
+void oct_rxq_clear_counters (vlib_main_t *, vnet_dev_rx_queue_t *);
+void oct_txq_clear_counters (vlib_main_t *, vnet_dev_tx_queue_t *);
+vnet_dev_rv_t oct_port_get_stats (vlib_main_t *, vnet_dev_port_t *);
+vnet_dev_rv_t oct_rxq_get_stats (vlib_main_t *, vnet_dev_port_t *,
+				 vnet_dev_rx_queue_t *);
+vnet_dev_rv_t oct_txq_get_stats (vlib_main_t *, vnet_dev_port_t *,
+				 vnet_dev_tx_queue_t *);
 
 #define log_debug(dev, f, ...)                                                \
   vlib_log (VLIB_LOG_LEVEL_DEBUG, oct_log.class, "%U: " f,                    \

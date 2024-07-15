@@ -72,7 +72,7 @@ DEB_DEPENDS += debhelper dkms git libtool libapr1-dev dh-python
 DEB_DEPENDS += libconfuse-dev git-review exuberant-ctags cscope pkg-config
 DEB_DEPENDS += gcovr lcov chrpath autoconf libnuma-dev
 DEB_DEPENDS += python3-all python3-setuptools check
-DEB_DEPENDS += libffi-dev python3-ply
+DEB_DEPENDS += libffi-dev python3-ply libunwind-dev
 DEB_DEPENDS += cmake ninja-build python3-jsonschema python3-yaml
 DEB_DEPENDS += python3-venv  # ensurepip
 DEB_DEPENDS += python3-dev python3-pip
@@ -89,8 +89,14 @@ DEB_DEPENDS += tshark
 DEB_DEPENDS += jq # for extracting test summary from .json report (hs-test)
 
 LIBFFI=libffi6 # works on all but 20.04 and debian-testing
-
-ifeq ($(OS_VERSION_ID),22.04)
+ifeq ($(OS_VERSION_ID),24.04)
+        DEB_DEPENDS += libssl-dev
+        DEB_DEPENDS += llvm clang clang-format-14
+	# overwrite clang-format version to run `make checkstyle` successfully
+	export CLANG_FORMAT_VER=14
+        LIBFFI=libffi8
+        DEB_DEPENDS += enchant-2  # for docs
+else ifeq ($(OS_VERSION_ID),22.04)
 	DEB_DEPENDS += python3-virtualenv
 	DEB_DEPENDS += libssl-dev
 	DEB_DEPENDS += clang clang-format-11
@@ -245,6 +251,7 @@ help:
 	@echo " build                - build debug binaries"
 	@echo " build-release        - build release binaries"
 	@echo " build-coverity       - build coverity artifacts"
+	@echo " build-vpp-gcov 		 - build gcov vpp only"
 	@echo " rebuild              - wipe and build debug binaries"
 	@echo " rebuild-release      - wipe and build release binaries"
 	@echo " run                  - run debug binary"
@@ -252,6 +259,8 @@ help:
 	@echo " debug                - run debug binary with debugger"
 	@echo " debug-release        - run release binary with debugger"
 	@echo " test                 - build and run tests"
+	@echo " test-cov-hs   		 - build and run host stack tests with coverage"
+	@echo " test-cov-both	  	 - build and run python and host stack tests, merge coverage data"
 	@echo " test-help            - show help on test framework"
 	@echo " run-vat              - run vpp-api-test tool"
 	@echo " pkg-deb              - build DEB packages"
@@ -268,8 +277,10 @@ help:
 	@echo " checkstyle-commit    - check commit message format"
 	@echo " checkstyle-python    - check python coding style using 'black' formatter"
 	@echo " checkstyle-api       - check api for incompatible changes"
+	@echo " checkstyle-go        - check style of .go source files"
 	@echo " fixstyle             - fix coding style"
 	@echo " fixstyle-python      - fix python coding style using 'black' formatter"
+	@echo " fixstyle-go          - format .go source files"
 	@echo " doxygen              - DEPRECATED - use 'make docs'"
 	@echo " bootstrap-doxygen    - DEPRECATED"
 	@echo " wipe-doxygen         - DEPRECATED"
@@ -278,6 +289,7 @@ help:
 	@echo " json-api-files       - (re)-generate json api files"
 	@echo " json-api-files-debug - (re)-generate json api files for debug target"
 	@echo " go-api-files         - (re)-generate golang api files"
+	@echo " cleanup-hst          - stops and removes all docker contaiers and namespaces"
 	@echo " docs                 - Build the Sphinx documentation"
 	@echo " docs-venv            - Build the virtual environment for the Sphinx docs"
 	@echo " docs-clean           - Remove the generated files from the Sphinx docs"
@@ -440,6 +452,10 @@ rebuild: wipe build
 build-release: $(BR)/.deps.ok
 	$(call make,$(PLATFORM),$(addsuffix -install,$(TARGETS)))
 
+.PHONY: build-vpp-gcov
+build-vpp-gcov:
+	$(call test,vpp_gcov)
+
 .PHONY: wipe-release
 wipe-release: test-wipe $(BR)/.deps.ok
 	$(call make,$(PLATFORM),$(addsuffix -wipe,$(TARGETS)))
@@ -486,6 +502,20 @@ test-cov:
 	$(eval TEST_GCOV=1)
 	$(call test,vpp_gcov,cov)
 
+.PHONY: test-cov-hs
+test-cov-hs:
+	@$(MAKE) -C extras/hs-test build-cov
+	@$(MAKE) -C extras/hs-test test-cov
+
+.PHONY: test-cov-both
+test-cov-both:
+	@echo "Running Python, Golang tests and merging coverage reports."
+	find $(BR) -name '*.gcda' -delete
+	@$(MAKE) test-cov
+	find $(BR) -name '*.gcda' -delete
+	@$(MAKE) test-cov-hs
+	@$(MAKE) cov-merge
+
 .PHONY: test-cov-build
 test-cov-build:
 	$(eval CC=gcc)
@@ -501,6 +531,14 @@ test-cov-prep:
 test-cov-post:
 	$(eval CC=gcc)
 	$(call test,vpp_gcov,cov-post)
+
+.PHONY: cov-merge
+cov-merge:
+	@lcov --add-tracefile $(BR)/test-coverage-merged/coverage-filtered.info \
+		-a $(BR)/test-coverage-merged/coverage-filtered1.info -o $(BR)/test-coverage-merged/coverage-merged.info
+	@genhtml $(BR)/test-coverage-merged/coverage-merged.info \
+		--output-directory $(BR)/test-coverage-merged/html
+	@echo "Code coverage report is in $(BR)/test-coverage-merged/html/index.html"
 
 .PHONY: test-all
 test-all:
@@ -551,7 +589,7 @@ test-shell-cov:
 
 .PHONY: test-dep
 test-dep:
-	@make -C test test-dep
+	@$(MAKE) -C test test-dep
 
 .PHONY: test-doc
 test-doc:
@@ -711,6 +749,10 @@ json-api-files-debug:
 go-api-files: json-api-files
 	$(WS_ROOT)/src/tools/vppapigen/generate_go.py $(ARGS)
 
+.PHONY: cleanup-hst
+cleanup-hst:
+	$(MAKE) -C extras/hs-test cleanup-hst
+
 .PHONY: ctags
 ctags: ctags.files
 	@ctags --totals --tag-relative=yes -L $<
@@ -748,8 +790,16 @@ checkstyle-test:
 checkstyle-python:
 	@$(MAKE) -C test checkstyle-python-all
 
+.PHONY: checkstyle-go
+checkstyle-go:
+	@$(MAKE) -C extras/hs-test checkstyle-go
+
+.PHONY: fixstyle-go
+fixstyle-go:
+	@$(MAKE) -C extras/hs-test fixstyle-go
+
 .PHONY: checkstyle-all
-checkstyle-all: checkstyle-commit checkstyle checkstyle-python docs-spell
+checkstyle-all: checkstyle-commit checkstyle checkstyle-python docs-spell checkstyle-go
 
 .PHONY: fixstyle
 fixstyle:

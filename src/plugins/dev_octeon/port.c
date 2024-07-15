@@ -4,7 +4,6 @@
 
 #include <vnet/vnet.h>
 #include <vnet/dev/dev.h>
-#include <vnet/dev/pci.h>
 #include <vnet/dev/counters.h>
 #include <dev_octeon/octeon.h>
 #include <dev_octeon/common.h>
@@ -124,6 +123,8 @@ oct_port_init (vlib_main_t *vm, vnet_dev_port_t *port)
 	  return rv;
 	}
 
+  oct_port_add_counters (vm, port);
+
   return VNET_DEV_OK;
 }
 
@@ -172,6 +173,21 @@ oct_port_poll (vlib_main_t *vm, vnet_dev_port_t *port)
   vnet_dev_port_state_changes_t changes = {};
   int rrv;
 
+  if (oct_port_get_stats (vm, port))
+    return;
+
+  foreach_vnet_dev_port_rx_queue (q, port)
+    {
+      if (oct_rxq_get_stats (vm, port, q))
+	return;
+    }
+
+  foreach_vnet_dev_port_tx_queue (q, port)
+    {
+      if (oct_txq_get_stats (vm, port, q))
+	return;
+    }
+
   if (roc_nix_is_lbk (nix))
     {
       link_info.status = 1;
@@ -203,7 +219,8 @@ oct_port_poll (vlib_main_t *vm, vnet_dev_port_t *port)
   if (cd->speed != link_info.speed)
     {
       changes.change.link_speed = 1;
-      changes.link_speed = link_info.speed;
+      /* Convert to Kbps */
+      changes.link_speed = link_info.speed * 1000;
       cd->speed = link_info.speed;
     }
 
@@ -385,7 +402,7 @@ oct_validate_config_promisc_mode (vnet_dev_port_t *port, int enable)
   oct_device_t *cd = vnet_dev_get_data (dev);
   struct roc_nix *nix = cd->nix;
 
-  if (roc_nix_is_vf_or_sdp (nix))
+  if (roc_nix_is_sdp (nix) || roc_nix_is_lbk (nix))
     return VNET_DEV_ERR_UNSUPPORTED_DEVICE;
 
   return VNET_DEV_OK;
@@ -404,6 +421,9 @@ oct_op_config_promisc_mode (vlib_main_t *vm, vnet_dev_port_t *port, int enable)
     {
       return oct_roc_err (dev, rv, "roc_nix_npc_promisc_ena_dis failed");
     }
+
+  if (!roc_nix_is_pf (nix))
+    return VNET_DEV_OK;
 
   rv = roc_nix_mac_promisc_mode_enable (nix, enable);
   if (rv)
