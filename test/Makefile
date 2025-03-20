@@ -74,12 +74,13 @@ V=0
 endif
 
 PYTHON_VERSION=$(shell $(PYTHON_INTERP) -c 'import sys; print(sys.version_info.major)')
-PIP_VERSION=24.0
+PIP_VERSION=24.2
 # Keep in sync with requirements.txt
 PIP_TOOLS_VERSION=7.4.1
-PIP_SETUPTOOLS_VERSION=69.2.0
+PIP_SETUPTOOLS_VERSION=71.1.0
 PYTHON_DEPENDS=requirements-$(PYTHON_VERSION).txt
 SCAPY_SOURCE=$(shell find $(VENV_PATH)/lib/python* -name site-packages)
+SCAPY_VERSION=$(shell grep scapy $(TEST_DIR)/requirements.txt | cut -d'=' -f3 | cut -d';' -f1)
 BUILD_COV_DIR=$(BR)/test-coverage
 
 PIP_TOOLS_INSTALL_DONE=$(VENV_RUN_DIR)/pip-tools-install-$(PYTHON_VERSION)-$(PIP_TOOLS_VERSION).done
@@ -118,7 +119,7 @@ $(PIP_INSTALL_DONE): $(PIP_TOOLS_INSTALL_DONE) $(PYTHON_DEPENDS)
 $(PIP_PATCH_DONE): $(PIP_INSTALL_DONE)
 	@echo --- patching ---
 	@sleep 1 # Ensure python recompiles patched *.py files -> *.pyc
-	for f in $(CURDIR)/patches/scapy-2.4.3/*.patch ; do \
+	for f in $(CURDIR)/patches/scapy-$(SCAPY_VERSION)/*.patch ; do \
 		echo Applying patch: $$(basename $$f) ; \
 		patch --forward -p1 -d $(SCAPY_SOURCE) < $$f ; \
 		retCode=$$?; \
@@ -387,24 +388,32 @@ COV_REM_TODO_NO_TEST="*/vpp-api/client/*" "*/plugins/prom/*" \
 					 "*/vnet/ipsec/esp_format.c" "*/vnet/ethernet/sfp.c" \
 					 "*/vnet/ethernet/ethernet_format_fns.h" \
 					 "*/plugins/ikev2/ikev2_format.c" "*/vnet/bier/bier_types.c"
+ifeq ($(HS_TEST),1)
+COV_REM_HST_UNUSED_FEAT= "*/plugins/ping/*" "*/plugins/unittest/mpcap_node.c" "*/vnet/bfd/*" \
+			                 "*/vnet/bier/*" "*/vnet/bonding/*" "*/vnet/classify/*" \
+					 "*/vnet/gso/*" "*/vnet/ipfix-export/*" "*/vnet/ipip/*" \
+					 "*/vnet/ipsec/*" "*/vnet/l2/*" "*/vnet/mpls/*" \
+					 "*/vnet/pg/*" "*/vnet/policer/*" "*/vnet/snap/*" \
+					 "*/vnet/span/*" "*/vnet/srv6/*" "*/vnet/teib/*" \
+					 "*/vnet/tunnel/*" "*/vpp-api/vapi/*" "*/vpp/app/vpe_cli.c" \
+					 "*/vppinfra/pcap.c" "*/vppinfra/pcap_funcs.h"
+endif
 
-COV_REM_ALT_TEST="*/plugins/hs_apps/*" "*/plugins/builtinurl/*" \
-				 "*/plugins/http/*.h"
 .PHONY: cov-post
 cov-post: wipe-cov $(BUILD_COV_DIR)
-	@lcov --capture \
+	@lcov --ignore-errors unused,empty,mismatch,gcov --capture \
 		--directory $(VPP_BUILD_DIR) \
 		--output-file $(BUILD_COV_DIR)/coverage$(HS_TEST).info
 	@test -z "$(EXTERN_COV_DIR)" || \
-		lcov --capture \
+		lcov --ignore-errors unused,empty,mismatch,gcov --capture \
 		--directory $(EXTERN_COV_DIR) \
 		--output-file $(BUILD_COV_DIR)/extern-coverage$(HS_TEST).info
-	@lcov --remove $(BUILD_COV_DIR)/coverage$(HS_TEST).info \
+	@lcov --ignore-errors unused,empty,mismatch,gcov --remove $(BUILD_COV_DIR)/coverage$(HS_TEST).info \
 		$(COV_REM_NOT_CODE) \
 		$(COV_REM_DRIVERS)  \
 		$(COV_REM_TODO_NO_TEST) \
 		$(COV_REM_UNUSED_FEAT) \
-		$(COV_REM_ALT_TEST) \
+		$(COV_REM_HST_UNUSED_FEAT) \
 		-o $(BUILD_COV_DIR)/coverage-filtered$(HS_TEST).info
 	@genhtml $(BUILD_COV_DIR)/coverage-filtered$(HS_TEST).info \
 		--output-directory $(BUILD_COV_DIR)/html

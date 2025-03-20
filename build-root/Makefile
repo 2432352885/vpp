@@ -317,7 +317,7 @@ endif
 
 BUILD_ENV =										\
     export CCACHE_DIR=$(CCACHE_DIR) ;					\
-    export PATH=$(wildcard /usr/lib*/ccache):$(TOOL_INSTALL_DIR)/bin:$${PATH} ;		\
+    export PATH=$$(echo $(wildcard /usr/lib*/ccache) | tr ' ' ':'):$(TOOL_INSTALL_DIR)/bin:$${PATH} ;		\
     $(if $(call configure_var_fn,PATH), export PATH=$${PATH}:$(call configure_var_fn,PATH);,)	\
     export PATH="`echo $${PATH} | sed -e s/[.]://`" ;					\
     $(if $(not_native),export CONFIG_SITE=$(MU_BUILD_ROOT_DIR)/config.site ;,)	\
@@ -667,7 +667,7 @@ MAKE_PARALLEL_FLAGS ?= $(if $($(PACKAGE)_make_parallel_fails),,-j $(MAKE_PARALLE
 
 # Make command shorthand for packages & tools.
 PACKAGE_MAKE =					\
-  $(MAKE)					\
+  $(MAKE) CC=$(CC)				\
     -C $(PACKAGE_BUILD_DIR)			\
     $($(PACKAGE)_make_args)			\
     $(MAKE_PARALLEL_FLAGS)

@@ -99,8 +99,8 @@ udp_connection_free (udp_connection_t * uc)
 static void
 udp_connection_cleanup (udp_connection_t * uc)
 {
-  transport_release_local_endpoint (TRANSPORT_PROTO_UDP, &uc->c_lcl_ip,
-				    uc->c_lcl_port);
+  transport_release_local_endpoint (TRANSPORT_PROTO_UDP, uc->c_fib_index,
+				    &uc->c_lcl_ip, uc->c_lcl_port);
   udp_connection_unregister_port (uc->c_lcl_port, uc->c_is_ip4);
   udp_connection_free (uc);
 }
@@ -434,8 +434,8 @@ udp_open_connection (transport_endpoint_cfg_t * rmt)
       /* If specific source port was requested abort */
       if (rmt->peer.port)
 	{
-	  transport_release_local_endpoint (TRANSPORT_PROTO_UDP, &lcl_addr,
-					    lcl_port);
+	  transport_release_local_endpoint (
+	    TRANSPORT_PROTO_UDP, rmt->fib_index, &lcl_addr, lcl_port);
 	  return SESSION_E_PORTINUSE;
 	}
 
@@ -443,8 +443,8 @@ udp_open_connection (transport_endpoint_cfg_t * rmt)
       while (udp_connection_port_used_extern (clib_net_to_host_u16 (lcl_port),
 					      rmt->is_ip4))
 	{
-	  transport_release_local_endpoint (TRANSPORT_PROTO_UDP, &lcl_addr,
-					    lcl_port);
+	  transport_release_local_endpoint (
+	    TRANSPORT_PROTO_UDP, rmt->fib_index, &lcl_addr, lcl_port);
 	  lcl_port =
 	    transport_alloc_local_port (TRANSPORT_PROTO_UDP, &lcl_addr, rmt);
 	  if ((int) lcl_port < 1)
@@ -467,16 +467,7 @@ udp_open_connection (transport_endpoint_cfg_t * rmt)
   uc->mss = rmt->mss ? rmt->mss : udp_default_mtu (um, uc->c_is_ip4);
   if (rmt->peer.sw_if_index != ENDPOINT_INVALID_INDEX)
     uc->sw_if_index = rmt->peer.sw_if_index;
-  uc->flags |= UDP_CONN_F_OWNS_PORT;
-  if (rmt->transport_flags & TRANSPORT_CFG_F_CONNECTED)
-    {
-      uc->flags |= UDP_CONN_F_CONNECTED;
-    }
-  else
-    {
-      clib_spinlock_init (&uc->rx_lock);
-      uc->c_flags |= TRANSPORT_CONNECTION_F_CLESS;
-    }
+  uc->flags |= UDP_CONN_F_OWNS_PORT | UDP_CONN_F_CONNECTED;
   if (!um->csum_offload)
     uc->cfg_flags |= UDP_CFG_F_NO_CSUM_OFFLOAD;
   uc->next_node_index = rmt->next_node_index;

@@ -1,11 +1,13 @@
 import unittest
 import socket
 import struct
+import re
+import os
 
 from scapy.layers.inet import IP, ICMP, TCP, UDP
 from scapy.layers.ipsec import SecurityAssociation, ESP
 from scapy.layers.l2 import Ether
-from scapy.packet import raw, Raw
+from scapy.packet import raw, Raw, Padding
 from scapy.layers.inet6 import (
     IPv6,
     ICMPv6EchoRequest,
@@ -13,6 +15,8 @@ from scapy.layers.inet6 import (
     IPv6ExtHdrFragment,
     IPv6ExtHdrDestOpt,
 )
+
+from scapy.layers.isakmp import ISAKMP
 
 
 from framework import VppTestCase
@@ -22,8 +26,6 @@ from vpp_papi import VppEnum
 
 from vpp_ipsec import VppIpsecSpd, VppIpsecSpdEntry, VppIpsecSpdItfBinding
 from ipaddress import ip_address
-from re import search
-from os import popen
 from config import config
 
 
@@ -1938,7 +1940,7 @@ class IpsecTra6(object):
             Ether(src=sw_intf.remote_mac, dst=sw_intf.local_mac)
             / IPv6(src=src, dst=dst)
             / IPv6ExtHdrHopByHop()
-            / IPv6ExtHdrFragment(id=2, offset=200)
+            / IPv6ExtHdrFragment(id=2, offset=0)
             / Raw(b"\xff" * 200)
             for i in range(count)
         ]
@@ -1985,7 +1987,7 @@ class IpsecTra6(object):
         tx = (
             Ether(src=self.pg2.remote_mac, dst=self.pg2.local_mac)
             / IPv6(src=self.tra_if.local_ip6, dst=self.tra_if.remote_ip6)
-            / IPv6ExtHdrFragment(id=2, offset=200)
+            / IPv6ExtHdrFragment(id=2, offset=0)
             / Raw(b"\xff" * 200)
         )
 
@@ -2004,7 +2006,7 @@ class IpsecTra6(object):
             Ether(src=self.pg2.remote_mac, dst=self.pg2.local_mac)
             / IPv6(src=self.tra_if.local_ip6, dst=self.tra_if.remote_ip6)
             / IPv6ExtHdrHopByHop()
-            / IPv6ExtHdrFragment(id=2, offset=200)
+            / IPv6ExtHdrFragment(id=2, offset=0)
             / Raw(b"\xff" * 200)
         )
 
@@ -2021,7 +2023,7 @@ class IpsecTra6(object):
             Ether(src=self.pg2.remote_mac, dst=self.pg2.local_mac)
             / IPv6(src=self.tra_if.local_ip6, dst=self.tra_if.remote_ip6)
             / IPv6ExtHdrHopByHop()
-            / IPv6ExtHdrFragment(id=2, offset=200)
+            / IPv6ExtHdrFragment(id=2, offset=0)
             / IPv6ExtHdrDestOpt()
             / Raw(b"\xff" * 200)
         )
@@ -3246,11 +3248,22 @@ class IPSecIPv6Fwd(VppTestCase):
             payload = self.info_to_payload(info)
             # create the packet itself
             p = (
-                Ether(dst=src_if.local_mac, src=src_if.remote_mac)
-                / IPv6(src=src_if.remote_ip6, dst=dst_if.remote_ip6)
-                / UDP(sport=src_prt, dport=dst_prt)
-                / Raw(payload)
+                (
+                    Ether(dst=src_if.local_mac, src=src_if.remote_mac)
+                    / IPv6(src=src_if.remote_ip6, dst=dst_if.remote_ip6)
+                    / UDP(sport=src_prt, dport=dst_prt)
+                    / ISAKMP()
+                    / Raw(payload)
+                )
+                if (src_prt == 500 or src_prt == 4500)
+                else (
+                    Ether(dst=src_if.local_mac, src=src_if.remote_mac)
+                    / IPv6(src=src_if.remote_ip6, dst=dst_if.remote_ip6)
+                    / UDP(sport=src_prt, dport=dst_prt)
+                    / Raw(payload)
+                )
             )
+
             # store a copy of the packet in the packet info
             info.data = p.copy()
             # append the packet to the list

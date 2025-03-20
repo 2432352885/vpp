@@ -119,6 +119,7 @@ burstiness
 busybox
 BV
 bvi
+bytecode
 byteswap
 cacheline
 callees
@@ -805,6 +806,7 @@ operationalize
 Optimisations
 optimised
 os
+osi
 outacl
 packagecloud
 papi
@@ -867,6 +869,7 @@ Pollable
 portranges
 poweroff
 ppc
+ppp
 pppoe
 pps
 pre
@@ -902,6 +905,9 @@ pthreads
 pton
 pushingapatch
 putatively
+pvti
+PVTI
+Pvti
 pwait
 py
 pypi
@@ -1003,6 +1009,7 @@ screenshot
 scrollbar
 scrollbars
 sctp
+sdl
 sealert
 seatbelt
 seg
@@ -1075,6 +1082,7 @@ strongswan
 strongSwan
 Strongswan
 struct
+structs
 su
 subdirectories
 subdirectory
@@ -1373,3 +1381,5 @@ zoomout
 zx
 µs
 oflags
+sflow
+sFlow

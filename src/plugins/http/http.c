@@ -13,84 +13,123 @@
  * limitations under the License.
  */
 
+#include <vpp/app/version.h>
+#include <vnet/session/application_interface.h>
+#include <vnet/session/application.h>
+
 #include <http/http.h>
-#include <vnet/session/session.h>
+#include <http/http_private.h>
 #include <http/http_timer.h>
 
 static http_main_t http_main;
-
-#define HTTP_FIFO_THRESH (16 << 10)
-#define CONTENT_LEN_STR	 "Content-Length: "
-
-/* HTTP state machine result */
-typedef enum http_sm_result_t_
-{
-  HTTP_SM_STOP = 0,
-  HTTP_SM_CONTINUE = 1,
-  HTTP_SM_ERROR = -1,
-} http_sm_result_t;
-
-const char *http_status_code_str[] = {
-#define _(c, s, str) str,
-  foreach_http_status_code
-#undef _
-};
-
-const char *http_content_type_str[] = {
-#define _(s, ext, str) str,
-  foreach_http_content_type
-#undef _
-};
+static http_engine_vft_t *http_vfts;
 
 const http_buffer_type_t msg_to_buf_type[] = {
   [HTTP_MSG_DATA_INLINE] = HTTP_BUFFER_FIFO,
   [HTTP_MSG_DATA_PTR] = HTTP_BUFFER_PTR,
 };
 
-u8 *
-format_http_state (u8 *s, va_list *va)
+void
+http_register_engine (const http_engine_vft_t *vft, http_version_t version)
 {
-  http_state_t state = va_arg (*va, http_state_t);
+  vec_validate (http_vfts, version);
+  http_vfts[version] = *vft;
+}
+
+always_inline http_version_t
+http_version_from_handle (http_conn_handle_t hc_handle)
+{
+  /* the first 3 bits are http version */
+  return hc_handle >> 29;
+}
+
+always_inline u32
+http_conn_index_from_handle (http_conn_handle_t hc_handle)
+{
+  return hc_handle & 0x1FFFFFFF;
+}
+
+always_inline http_conn_handle_t
+http_make_handle (u32 hc_index, http_version_t version)
+{
+  ASSERT (hc_index <= 0x1FFFFFFF);
+  return (version << 29) | hc_index;
+}
+
+int
+http_v_find_index (u8 *vec, u32 offset, u32 num, char *str)
+{
+  int start_index = offset;
+  u32 slen = (u32) strnlen_s_inline (str, 16);
+  u32 vlen = vec_len (vec);
+
+  ASSERT (slen > 0);
+
+  if (vlen <= slen)
+    return -1;
+
+  int end_index = vlen - slen;
+  if (num)
+    {
+      if (num < slen)
+	return -1;
+      end_index = clib_min (end_index, offset + num - slen);
+    }
+
+  for (; start_index <= end_index; start_index++)
+    {
+      if (!memcmp (vec + start_index, str, slen))
+	return start_index;
+    }
+
+  return -1;
+}
+
+u8 *
+format_http_req_state (u8 *s, va_list *va)
+{
+  http_req_state_t state = va_arg (*va, http_req_state_t);
+  u8 *t = 0;
 
   switch (state)
     {
-    case HTTP_STATE_IDLE:
-      return format (s, "idle");
-    case HTTP_STATE_WAIT_APP_METHOD:
-      return format (s, "wait app method");
-    case HTTP_STATE_WAIT_SERVER_REPLY:
-      return format (s, "wait server reply");
-    case HTTP_STATE_CLIENT_IO_MORE_DATA:
-      return format (s, "client io more data");
-    case HTTP_STATE_WAIT_CLIENT_METHOD:
-      return format (s, "wait client method");
-    case HTTP_STATE_WAIT_APP_REPLY:
-      return format (s, "wait app reply");
-    case HTTP_STATE_APP_IO_MORE_DATA:
-      return format (s, "app io more data");
-    default:
-      break;
+#define _(n, s, str)                                                          \
+  case HTTP_REQ_STATE_##s:                                                    \
+    t = (u8 *) str;                                                           \
+    break;
+      foreach_http_req_state
+#undef _
+	default : return format (s, "unknown");
     }
-  return format (s, "unknown");
+  return format (s, "%s", t);
 }
 
-#define http_state_change(_hc, _state)                                        \
-  do                                                                          \
-    {                                                                         \
-      HTTP_DBG (1, "changing http state %U -> %U", format_http_state,         \
-		(_hc)->http_state, format_http_state, _state);                \
-      (_hc)->http_state = _state;                                             \
-    }                                                                         \
-  while (0)
-
-static inline int
-http_state_is_tx_valid (http_conn_t *hc)
+u8 *
+format_http_conn_state (u8 *s, va_list *args)
 {
-  http_state_t state = hc->http_state;
-  return (state == HTTP_STATE_APP_IO_MORE_DATA ||
-	  state == HTTP_STATE_CLIENT_IO_MORE_DATA ||
-	  state == HTTP_STATE_WAIT_APP_REPLY ||
-	  state == HTTP_STATE_WAIT_APP_METHOD);
+  http_conn_t *hc = va_arg (*args, http_conn_t *);
+  u8 *t = 0;
+
+  switch (hc->state)
+    {
+#define _(s, str)                                                             \
+  case HTTP_CONN_STATE_##s:                                                   \
+    t = (u8 *) str;                                                           \
+    break;
+      foreach_http_conn_state
+#undef _
+	default : return format (s, "unknown");
+    }
+  return format (s, "%s", t);
+}
+
+u8 *
+format_http_time_now (u8 *s, va_list *args)
+{
+  http_conn_t __clib_unused *hc = va_arg (*args, http_conn_t *);
+  http_main_t *hm = &http_main;
+  f64 now = clib_timebase_now (&hm->timebase);
+  return format (s, "%U", format_clib_timebase_time, now);
 }
 
 static inline http_worker_t *
@@ -111,6 +150,7 @@ http_conn_alloc_w_thread (u32 thread_index)
   hc->h_hc_index = hc - wrk->conn_pool;
   hc->h_pa_session_handle = SESSION_INVALID_HANDLE;
   hc->h_tc_session_handle = SESSION_INVALID_HANDLE;
+  hc->version = HTTP_VERSION_NA;
   return hc->h_hc_index;
 }
 
@@ -121,11 +161,98 @@ http_conn_get_w_thread (u32 hc_index, u32 thread_index)
   return pool_elt_at_index (wrk->conn_pool, hc_index);
 }
 
-void
+static inline http_conn_t *
+http_conn_get_w_thread_if_valid (u32 hc_index, u32 thread_index)
+{
+  http_worker_t *wrk = http_worker_get (thread_index);
+  if (pool_is_free_index (wrk->conn_pool, hc_index))
+    return 0;
+  return pool_elt_at_index (wrk->conn_pool, hc_index);
+}
+
+static void
 http_conn_free (http_conn_t *hc)
 {
   http_worker_t *wrk = http_worker_get (hc->c_thread_index);
+  if (CLIB_DEBUG)
+    memset (hc, 0xba, sizeof (*hc));
   pool_put (wrk->conn_pool, hc);
+}
+
+static void
+http_add_postponed_ho_cleanups (u32 ho_hc_index)
+{
+  http_main_t *hm = &http_main;
+  vec_add1 (hm->postponed_ho_free, ho_hc_index);
+}
+
+static inline http_conn_t *
+http_ho_conn_get (u32 ho_hc_index)
+{
+  http_main_t *hm = &http_main;
+  return pool_elt_at_index (hm->ho_conn_pool, ho_hc_index);
+}
+
+static void
+http_ho_conn_free (http_conn_t *ho_hc)
+{
+  http_main_t *hm = &http_main;
+  if (CLIB_DEBUG)
+    memset (ho_hc, 0xba, sizeof (*ho_hc));
+  pool_put (hm->ho_conn_pool, ho_hc);
+}
+
+static void
+http_ho_try_free (u32 ho_hc_index)
+{
+  http_conn_t *ho_hc;
+  HTTP_DBG (1, "half open: %x", ho_hc_index);
+  ho_hc = http_ho_conn_get (ho_hc_index);
+  if (!(ho_hc->flags & HTTP_CONN_F_HO_DONE))
+    {
+      HTTP_DBG (1, "postponed cleanup");
+      ho_hc->h_tc_session_handle = SESSION_INVALID_HANDLE;
+      http_add_postponed_ho_cleanups (ho_hc_index);
+      return;
+    }
+  if (!(ho_hc->flags & HTTP_CONN_F_NO_APP_SESSION))
+    session_half_open_delete_notify (&ho_hc->connection);
+  http_ho_conn_free (ho_hc);
+}
+
+static void
+http_flush_postponed_ho_cleanups ()
+{
+  http_main_t *hm = &http_main;
+  u32 *ho_indexp, *tmp;
+
+  tmp = hm->postponed_ho_free;
+  hm->postponed_ho_free = hm->ho_free_list;
+  hm->ho_free_list = tmp;
+
+  vec_foreach (ho_indexp, hm->ho_free_list)
+    http_ho_try_free (*ho_indexp);
+
+  vec_reset_length (hm->ho_free_list);
+}
+
+static inline u32
+http_ho_conn_alloc (void)
+{
+  http_main_t *hm = &http_main;
+  http_conn_t *hc;
+
+  if (vec_len (hm->postponed_ho_free))
+    http_flush_postponed_ho_cleanups ();
+
+  pool_get_aligned_safe (hm->ho_conn_pool, hc, CLIB_CACHE_LINE_BYTES);
+  clib_memset (hc, 0, sizeof (*hc));
+  hc->h_hc_index = hc - hm->ho_conn_pool;
+  hc->h_pa_session_handle = SESSION_INVALID_HANDLE;
+  hc->h_tc_session_handle = SESSION_INVALID_HANDLE;
+  hc->timeout = HTTP_CONN_TIMEOUT;
+  hc->version = HTTP_VERSION_NA;
+  return hc->h_hc_index;
 }
 
 static u32
@@ -135,17 +262,19 @@ http_listener_alloc (void)
   http_conn_t *lhc;
 
   pool_get_zero (hm->listener_pool, lhc);
-  lhc->c_c_index = lhc - hm->listener_pool;
-  return lhc->c_c_index;
+  lhc->h_hc_index = lhc - hm->listener_pool;
+  lhc->timeout = HTTP_CONN_TIMEOUT;
+  lhc->version = HTTP_VERSION_NA;
+  return lhc->h_hc_index;
 }
 
-http_conn_t *
+static http_conn_t *
 http_listener_get (u32 lhc_index)
 {
   return pool_elt_at_index (http_main.listener_pool, lhc_index);
 }
 
-void
+static void
 http_listener_free (http_conn_t *lhc)
 {
   http_main_t *hm = &http_main;
@@ -170,6 +299,115 @@ http_disconnect_transport (http_conn_t *hc)
     clib_warning ("disconnect returned");
 }
 
+http_status_code_t
+http_sc_by_u16 (u16 status_code)
+{
+  http_main_t *hm = &http_main;
+  return hm->sc_by_u16[status_code];
+}
+
+u8 *
+http_get_app_header_list (http_conn_t *hc, http_msg_t *msg)
+{
+  http_main_t *hm = &http_main;
+  session_t *as;
+  u8 *app_headers;
+  int rv;
+
+  as = session_get_from_handle (hc->h_pa_session_handle);
+
+  if (msg->data.type == HTTP_MSG_DATA_PTR)
+    {
+      uword app_headers_ptr;
+      rv = svm_fifo_dequeue (as->tx_fifo, sizeof (app_headers_ptr),
+			     (u8 *) &app_headers_ptr);
+      ASSERT (rv == sizeof (app_headers_ptr));
+      app_headers = uword_to_pointer (app_headers_ptr, u8 *);
+    }
+  else
+    {
+      app_headers = hm->app_header_lists[hc->c_thread_index];
+      rv = svm_fifo_dequeue (as->tx_fifo, msg->data.headers_len, app_headers);
+      ASSERT (rv == msg->data.headers_len);
+    }
+
+  return app_headers;
+}
+
+u8 *
+http_get_app_target (http_req_t *req, http_msg_t *msg)
+{
+  session_t *as;
+  u8 *target;
+  int rv;
+
+  as = session_get_from_handle (req->app_session_handle);
+
+  if (msg->data.type == HTTP_MSG_DATA_PTR)
+    {
+      uword target_ptr;
+      rv = svm_fifo_dequeue (as->tx_fifo, sizeof (target_ptr),
+			     (u8 *) &target_ptr);
+      ASSERT (rv == sizeof (target_ptr));
+      target = uword_to_pointer (target_ptr, u8 *);
+    }
+  else
+    {
+      vec_reset_length (req->target);
+      vec_validate (req->target, msg->data.target_path_len - 1);
+      rv =
+	svm_fifo_dequeue (as->tx_fifo, msg->data.target_path_len, req->target);
+      ASSERT (rv == msg->data.target_path_len);
+      target = req->target;
+    }
+  return target;
+}
+
+u8 *
+http_get_tx_buf (http_conn_t *hc)
+{
+  http_main_t *hm = &http_main;
+  u8 *buf = hm->tx_bufs[hc->c_thread_index];
+  vec_reset_length (buf);
+  return buf;
+}
+
+u8 *
+http_get_rx_buf (http_conn_t *hc)
+{
+  http_main_t *hm = &http_main;
+  u8 *buf = hm->rx_bufs[hc->c_thread_index];
+  vec_reset_length (buf);
+  return buf;
+}
+
+void
+http_req_tx_buffer_init (http_req_t *req, http_msg_t *msg)
+{
+  session_t *as = session_get_from_handle (req->app_session_handle);
+  http_buffer_init (&req->tx_buf, msg_to_buf_type[msg->data.type], as->tx_fifo,
+		    msg->data.body_len);
+}
+
+static void
+http_conn_invalidate_timer_cb (u32 hs_handle)
+{
+  http_conn_t *hc;
+
+  hc =
+    http_conn_get_w_thread_if_valid (hs_handle & 0x00FFFFFF, hs_handle >> 24);
+
+  HTTP_DBG (1, "hc [%u]%x", hs_handle >> 24, hs_handle & 0x00FFFFFF);
+  if (!hc)
+    {
+      HTTP_DBG (1, "already deleted");
+      return;
+    }
+
+  hc->timer_handle = HTTP_TIMER_HANDLE_INVALID;
+  hc->flags |= HTTP_CONN_F_PENDING_TIMER;
+}
+
 static void
 http_conn_timeout_cb (void *hc_handlep)
 {
@@ -177,17 +415,29 @@ http_conn_timeout_cb (void *hc_handlep)
   uword hs_handle;
 
   hs_handle = pointer_to_uword (hc_handlep);
-  hc = http_conn_get_w_thread (hs_handle & 0x00FFFFFF, hs_handle >> 24);
+  hc =
+    http_conn_get_w_thread_if_valid (hs_handle & 0x00FFFFFF, hs_handle >> 24);
 
-  HTTP_DBG (1, "terminate thread %d index %d hs %llx", hs_handle >> 24,
-	    hs_handle & 0x00FFFFFF, hc);
+  HTTP_DBG (1, "hc [%u]%x", hs_handle >> 24, hs_handle & 0x00FFFFFF);
   if (!hc)
-    return;
+    {
+      HTTP_DBG (1, "already deleted");
+      return;
+    }
 
-  hc->timer_handle = ~0;
+  if (!(hc->flags & HTTP_CONN_F_PENDING_TIMER))
+    {
+      HTTP_DBG (1, "timer not pending");
+      return;
+    }
+
   session_transport_closing_notify (&hc->connection);
   http_disconnect_transport (hc);
 }
+
+/*************************/
+/* session VFT callbacks */
+/*************************/
 
 int
 http_ts_accept_callback (session_t *ts)
@@ -204,17 +454,18 @@ http_ts_accept_callback (session_t *ts)
   hc_index = http_conn_alloc_w_thread (ts->thread_index);
   hc = http_conn_get_w_thread (hc_index, ts->thread_index);
   clib_memcpy_fast (hc, lhc, sizeof (*lhc));
+  hc->timer_handle = HTTP_TIMER_HANDLE_INVALID;
   hc->c_thread_index = ts->thread_index;
   hc->h_hc_index = hc_index;
 
   hc->h_tc_session_handle = session_handle (ts);
   hc->c_flags |= TRANSPORT_CONNECTION_F_NO_LOOKUP;
-
   hc->state = HTTP_CONN_STATE_ESTABLISHED;
-  http_state_change (hc, HTTP_STATE_WAIT_CLIENT_METHOD);
 
   ts->session_state = SESSION_STATE_READY;
-  ts->opaque = hc_index;
+  /* TODO: TLS set by ALPN result, TCP: first try HTTP/1 */
+  hc->version = HTTP_VERSION_1;
+  ts->opaque = http_make_handle (hc_index, hc->version);
 
   /*
    * Alloc session and initialize
@@ -223,7 +474,7 @@ http_ts_accept_callback (session_t *ts)
   hc->c_s_index = as->session_index;
 
   as->app_wrk_index = hc->h_pa_wrk_index;
-  as->connection_index = hc->c_c_index;
+  as->connection_index = hc->h_hc_index;
   as->session_state = SESSION_STATE_ACCEPTING;
 
   asl = listen_session_get_from_handle (lhc->h_pa_session_handle);
@@ -236,6 +487,7 @@ http_ts_accept_callback (session_t *ts)
   if ((rv = app_worker_init_accepted (as)))
     {
       HTTP_DBG (1, "failed to allocate fifos");
+      hc->h_pa_session_handle = SESSION_INVALID_HANDLE;
       session_free (as);
       return rv;
     }
@@ -277,13 +529,14 @@ http_ts_connected_callback (u32 http_app_index, u32 ho_hc_index, session_t *ts,
   app_worker_t *app_wrk;
   int rv;
 
-  ho_hc = http_conn_get_w_thread (ho_hc_index, 0);
+  ho_hc = http_ho_conn_get (ho_hc_index);
   ASSERT (ho_hc->state == HTTP_CONN_STATE_CONNECTING);
 
   if (err)
     {
       clib_warning ("half-open hc index %d, error: %U", ho_hc_index,
 		    format_session_error, err);
+      ho_hc->flags |= HTTP_CONN_F_HO_DONE;
       app_wrk = app_worker_get_if_valid (ho_hc->h_pa_wrk_index);
       if (app_wrk)
 	app_worker_connect_notify (app_wrk, 0, err, ho_hc->h_pa_app_api_ctx);
@@ -295,29 +548,32 @@ http_ts_connected_callback (u32 http_app_index, u32 ho_hc_index, session_t *ts,
 
   clib_memcpy_fast (hc, ho_hc, sizeof (*hc));
 
+  /* in chain with TLS there is race on half-open cleanup */
+  __atomic_fetch_or (&ho_hc->flags, HTTP_CONN_F_HO_DONE, __ATOMIC_RELEASE);
+
+  hc->timer_handle = HTTP_TIMER_HANDLE_INVALID;
   hc->c_thread_index = ts->thread_index;
   hc->h_tc_session_handle = session_handle (ts);
-  hc->c_c_index = new_hc_index;
+  hc->h_hc_index = new_hc_index;
   hc->c_flags |= TRANSPORT_CONNECTION_F_NO_LOOKUP;
   hc->state = HTTP_CONN_STATE_ESTABLISHED;
-  http_state_change (hc, HTTP_STATE_WAIT_APP_METHOD);
-
   ts->session_state = SESSION_STATE_READY;
-  ts->opaque = new_hc_index;
+  /* TODO: TLS set by ALPN result, TCP: prior knowledge (set in ho) */
+  ts->opaque = http_make_handle (new_hc_index, hc->version);
 
   /* allocate app session and initialize */
 
   as = session_alloc (hc->c_thread_index);
   hc->c_s_index = as->session_index;
-  as->connection_index = hc->c_c_index;
+  as->connection_index = new_hc_index;
   as->app_wrk_index = hc->h_pa_wrk_index;
   as->session_state = SESSION_STATE_READY;
   as->opaque = hc->h_pa_app_api_ctx;
   as->session_type = session_type_from_proto_and_ip (
     TRANSPORT_PROTO_HTTP, session_type_is_ip4 (ts->session_type));
 
-  HTTP_DBG (1, "half-open hc index %d,  hc index %d", ho_hc_index,
-	    new_hc_index);
+  HTTP_DBG (1, "half-open hc index %x,  hc [%u]%x", ho_hc_index,
+	    ts->thread_index, new_hc_index);
 
   app_wrk = app_worker_get (hc->h_pa_wrk_index);
   if (!app_wrk)
@@ -343,970 +599,52 @@ static void
 http_ts_disconnect_callback (session_t *ts)
 {
   http_conn_t *hc;
+  u32 hc_index = http_conn_index_from_handle (ts->opaque);
 
-  hc = http_conn_get_w_thread (ts->opaque, ts->thread_index);
+  HTTP_DBG (1, "hc [%u]%x", ts->thread_index, hc_index);
+
+  hc = http_conn_get_w_thread (hc_index, ts->thread_index);
 
   if (hc->state < HTTP_CONN_STATE_TRANSPORT_CLOSED)
     hc->state = HTTP_CONN_STATE_TRANSPORT_CLOSED;
 
-  /* Nothing more to rx, propagate to app */
-  if (!svm_fifo_max_dequeue_cons (ts->rx_fifo))
-    session_transport_closing_notify (&hc->connection);
+  http_vfts[hc->version].transport_close_callback (hc);
 }
 
 static void
 http_ts_reset_callback (session_t *ts)
 {
   http_conn_t *hc;
+  u32 hc_index = http_conn_index_from_handle (ts->opaque);
 
-  hc = http_conn_get_w_thread (ts->opaque, ts->thread_index);
+  HTTP_DBG (1, "hc [%u]%x", ts->thread_index, hc_index);
+
+  hc = http_conn_get_w_thread (hc_index, ts->thread_index);
 
   hc->state = HTTP_CONN_STATE_CLOSED;
-  http_buffer_free (&hc->tx_buf);
-  http_state_change (hc, HTTP_STATE_WAIT_CLIENT_METHOD);
   session_transport_reset_notify (&hc->connection);
 
   http_disconnect_transport (hc);
-}
-
-/**
- * http error boilerplate
- */
-static const char *http_error_template = "HTTP/1.1 %s\r\n"
-					 "Date: %U GMT\r\n"
-					 "Content-Type: text/html\r\n"
-					 "Connection: close\r\n"
-					 "Pragma: no-cache\r\n"
-					 "Content-Length: 0\r\n\r\n";
-
-static const char *http_redirect_template = "HTTP/1.1 %s\r\n";
-
-/**
- * http response boilerplate
- */
-static const char *http_response_template = "HTTP/1.1 %s\r\n"
-					    "Date: %U GMT\r\n"
-					    "Expires: %U GMT\r\n"
-					    "Server: %v\r\n"
-					    "Content-Type: %s\r\n"
-					    "Content-Length: %lu\r\n\r\n";
-
-static const char *http_request_template = "GET %s HTTP/1.1\r\n"
-					   "User-Agent: %v\r\n"
-					   "Accept: */*\r\n\r\n";
-
-static u32
-http_send_data (http_conn_t *hc, u8 *data, u32 length, u32 offset)
-{
-  const u32 max_burst = 64 << 10;
-  session_t *ts;
-  u32 to_send;
-  int sent;
-
-  ts = session_get_from_handle (hc->h_tc_session_handle);
-
-  to_send = clib_min (length - offset, max_burst);
-  sent = svm_fifo_enqueue (ts->tx_fifo, to_send, data + offset);
-
-  if (sent <= 0)
-    return offset;
-
-  if (svm_fifo_set_event (ts->tx_fifo))
-    session_send_io_evt_to_thread (ts->tx_fifo, SESSION_IO_EVT_TX);
-
-  return (offset + sent);
-}
-
-static void
-http_send_error (http_conn_t *hc, http_status_code_t ec)
-{
-  http_main_t *hm = &http_main;
-  u8 *data;
-  f64 now;
-
-  if (ec >= HTTP_N_STATUS)
-    ec = HTTP_STATUS_INTERNAL_ERROR;
-
-  now = clib_timebase_now (&hm->timebase);
-  data = format (0, http_error_template, http_status_code_str[ec],
-		 format_clib_timebase_time, now);
-  http_send_data (hc, data, vec_len (data), 0);
-  vec_free (data);
-}
-
-static int
-http_read_message (http_conn_t *hc)
-{
-  u32 max_deq, cursize;
-  session_t *ts;
-  int n_read;
-
-  ts = session_get_from_handle (hc->h_tc_session_handle);
-
-  cursize = vec_len (hc->rx_buf);
-  max_deq = svm_fifo_max_dequeue (ts->rx_fifo);
-  if (PREDICT_FALSE (max_deq == 0))
-    return -1;
-
-  vec_validate (hc->rx_buf, cursize + max_deq - 1);
-  n_read = svm_fifo_dequeue (ts->rx_fifo, max_deq, hc->rx_buf + cursize);
-  ASSERT (n_read == max_deq);
-
-  if (svm_fifo_is_empty (ts->rx_fifo))
-    svm_fifo_unset_event (ts->rx_fifo);
-
-  vec_set_len (hc->rx_buf, cursize + n_read);
-  return 0;
-}
-
-/**
- * @brief Find the first occurrence of the string in the vector.
- *
- * @param vec The vector to be scanned.
- * @param offset Search offset in the vector.
- * @param num Maximum number of characters to be searched if non-zero.
- * @param str The string to be searched.
- *
- * @return @c -1 if the string is not found within the vector; index otherwise.
- */
-static inline int
-v_find_index (u8 *vec, u32 offset, u32 num, char *str)
-{
-  int start_index = offset;
-  u32 slen = (u32) strnlen_s_inline (str, 16);
-  u32 vlen = vec_len (vec);
-
-  ASSERT (slen > 0);
-
-  if (vlen <= slen)
-    return -1;
-
-  int end_index = vlen - slen;
-  if (num)
-    {
-      if (num < slen)
-	return -1;
-      end_index = clib_min (end_index, offset + num - slen);
-    }
-
-  for (; start_index <= end_index; start_index++)
-    {
-      if (!memcmp (vec + start_index, str, slen))
-	return start_index;
-    }
-
-  return -1;
-}
-
-static void
-http_identify_optional_query (http_conn_t *hc)
-{
-  u32 pos = vec_search (hc->rx_buf, '?');
-  if (~0 != pos)
-    {
-      hc->target_query_offset = pos + 1;
-      hc->target_query_len =
-	hc->target_path_offset + hc->target_path_len - hc->target_query_offset;
-      hc->target_path_len = hc->target_path_len - hc->target_query_len - 1;
-    }
-}
-
-static int
-http_get_target_form (http_conn_t *hc)
-{
-  int i;
-
-  /* "*" */
-  if ((hc->rx_buf[hc->target_path_offset] == '*') &&
-      (hc->target_path_len == 1))
-    {
-      hc->target_form = HTTP_TARGET_ASTERISK_FORM;
-      return 0;
-    }
-
-  /* 1*( "/" segment ) [ "?" query ] */
-  if (hc->rx_buf[hc->target_path_offset] == '/')
-    {
-      /* drop leading slash */
-      hc->target_path_len--;
-      hc->target_path_offset++;
-      hc->target_form = HTTP_TARGET_ORIGIN_FORM;
-      http_identify_optional_query (hc);
-      return 0;
-    }
-
-  /* scheme "://" host [ ":" port ] *( "/" segment ) [ "?" query ] */
-  i = v_find_index (hc->rx_buf, hc->target_path_offset, hc->target_path_len,
-		    "://");
-  if (i > 0)
-    {
-      hc->target_form = HTTP_TARGET_ABSOLUTE_FORM;
-      http_identify_optional_query (hc);
-      return 0;
-    }
-
-  /* host ":" port */
-  for (i = hc->target_path_offset;
-       i < (hc->target_path_offset + hc->target_path_len); i++)
-    {
-      if ((hc->rx_buf[i] == ':') && (isdigit (hc->rx_buf[i + 1])))
-	{
-	  hc->target_form = HTTP_TARGET_AUTHORITY_FORM;
-	  return 0;
-	}
-    }
-
-  return -1;
-}
-
-static int
-http_parse_request_line (http_conn_t *hc, http_status_code_t *ec)
-{
-  int i, target_len;
-  u32 next_line_offset;
-
-  /* request-line = method SP request-target SP HTTP-version CRLF */
-  i = v_find_index (hc->rx_buf, 0, 0, "\r\n");
-  if (i < 0)
-    {
-      clib_warning ("request line incomplete");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  HTTP_DBG (0, "request line length: %d", i);
-  next_line_offset = i + 2;
-
-  /* there should be at least one more CRLF */
-  if (vec_len (hc->rx_buf) < (next_line_offset + 2))
-    {
-      clib_warning ("malformed message, too short");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-
-  /* parse method */
-  if ((i = v_find_index (hc->rx_buf, 0, next_line_offset, "GET ")) >= 0)
-    {
-      HTTP_DBG (0, "GET method");
-      hc->method = HTTP_REQ_GET;
-      hc->target_path_offset = i + 4;
-    }
-  else if ((i = v_find_index (hc->rx_buf, 0, next_line_offset, "POST ")) >= 0)
-    {
-      HTTP_DBG (0, "POST method");
-      hc->method = HTTP_REQ_POST;
-      hc->target_path_offset = i + 5;
-    }
-  else
-    {
-      clib_warning ("method not implemented: %8v", hc->rx_buf);
-      *ec = HTTP_STATUS_NOT_IMPLEMENTED;
-      return -1;
-    }
-
-  /* find version */
-  i = v_find_index (hc->rx_buf, next_line_offset - 11, 11, " HTTP/");
-  if (i < 0)
-    {
-      clib_warning ("HTTP version not present");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  /* verify major version */
-  if (isdigit (hc->rx_buf[i + 6]))
-    {
-      if (hc->rx_buf[i + 6] != '1')
-	{
-	  clib_warning ("HTTP major version '%c' not supported",
-			hc->rx_buf[i + 6]);
-	  *ec = HTTP_STATUS_HTTP_VERSION_NOT_SUPPORTED;
-	  return -1;
-	}
-    }
-  else
-    {
-      clib_warning ("HTTP major version '%c' is not digit", hc->rx_buf[i + 6]);
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-
-  /* parse request-target */
-  target_len = i - hc->target_path_offset;
-  if (target_len < 1)
-    {
-      clib_warning ("request-target not present");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  hc->target_path_len = target_len;
-  hc->target_query_offset = 0;
-  hc->target_query_len = 0;
-  if (http_get_target_form (hc))
-    {
-      clib_warning ("invalid target");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  HTTP_DBG (0, "request-target path length: %u", hc->target_path_len);
-  HTTP_DBG (0, "request-target path offset: %u", hc->target_path_offset);
-  HTTP_DBG (0, "request-target query length: %u", hc->target_query_len);
-  HTTP_DBG (0, "request-target query offset: %u", hc->target_query_offset);
-
-  /* set buffer offset to nex line start */
-  hc->rx_buf_offset = next_line_offset;
-
-  return 0;
-}
-
-static int
-http_identify_headers (http_conn_t *hc, http_status_code_t *ec)
-{
-  int i;
-
-  /* check if we have any header */
-  if ((hc->rx_buf[hc->rx_buf_offset] == '\r') &&
-      (hc->rx_buf[hc->rx_buf_offset + 1] == '\n'))
-    {
-      /* just another CRLF -> no headers */
-      HTTP_DBG (0, "no headers");
-      hc->headers_len = 0;
-      return 0;
-    }
-
-  /* find empty line indicating end of header section */
-  i = v_find_index (hc->rx_buf, hc->rx_buf_offset, 0, "\r\n\r\n");
-  if (i < 0)
-    {
-      clib_warning ("cannot find header section end");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  hc->headers_offset = hc->rx_buf_offset;
-  hc->headers_len = i - hc->rx_buf_offset + 2;
-  HTTP_DBG (0, "headers length: %u", hc->headers_len);
-  HTTP_DBG (0, "headers offset: %u", hc->headers_offset);
-
-  return 0;
-}
-
-static int
-http_identify_message_body (http_conn_t *hc, http_status_code_t *ec)
-{
-  unformat_input_t input;
-  int i, len;
-  u8 *line;
-
-  hc->body_len = 0;
-
-  if (hc->headers_len == 0)
-    {
-      HTTP_DBG (0, "no header, no message-body");
-      return 0;
-    }
-
-  /* TODO check for chunked transfer coding */
-
-  /* try to find Content-Length header */
-  i = v_find_index (hc->rx_buf, hc->headers_offset, hc->headers_len,
-		    "Content-Length:");
-  if (i < 0)
-    {
-      HTTP_DBG (0, "Content-Length header not present, no message-body");
-      return 0;
-    }
-  hc->rx_buf_offset = i + 15;
-
-  i = v_find_index (hc->rx_buf, hc->rx_buf_offset, hc->headers_len, "\r\n");
-  if (i < 0)
-    {
-      clib_warning ("end of line missing");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  len = i - hc->rx_buf_offset;
-  if (len < 1)
-    {
-      clib_warning ("invalid header, content length value missing");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-
-  line = vec_new (u8, len);
-  clib_memcpy (line, hc->rx_buf + hc->rx_buf_offset, len);
-  HTTP_DBG (0, "%v", line);
-
-  unformat_init_vector (&input, line);
-  if (!unformat (&input, "%lu", &hc->body_len))
-    {
-      clib_warning ("failed to unformat content length value");
-      *ec = HTTP_STATUS_BAD_REQUEST;
-      return -1;
-    }
-  unformat_free (&input);
-
-  hc->body_offset = hc->headers_offset + hc->headers_len + 2;
-  HTTP_DBG (0, "body length: %u", hc->body_len);
-  HTTP_DBG (0, "body offset: %u", hc->body_offset);
-
-  return 0;
-}
-
-static int
-http_parse_header (http_conn_t *hc, int *content_length)
-{
-  unformat_input_t input;
-  int i, len;
-  u8 *line;
-
-  i = v_find_index (hc->rx_buf, hc->rx_buf_offset, 0, CONTENT_LEN_STR);
-  if (i < 0)
-    {
-      clib_warning ("cannot find '%s' in the header!", CONTENT_LEN_STR);
-      return -1;
-    }
-
-  hc->rx_buf_offset = i;
-
-  i = v_find_index (hc->rx_buf, hc->rx_buf_offset, 0, "\n");
-  if (i < 0)
-    {
-      clib_warning ("end of line missing; incomplete data");
-      return -1;
-    }
-
-  len = i - hc->rx_buf_offset;
-  line = vec_new (u8, len);
-  clib_memcpy (line, hc->rx_buf + hc->rx_buf_offset, len);
-
-  unformat_init_vector (&input, line);
-  if (!unformat (&input, CONTENT_LEN_STR "%d", content_length))
-    {
-      clib_warning ("failed to unformat content length!");
-      return -1;
-    }
-  unformat_free (&input);
-
-  /* skip rest of the header */
-  hc->rx_buf_offset += len;
-  i = v_find_index (hc->rx_buf, hc->rx_buf_offset, 0, "<html>");
-  if (i < 0)
-    {
-      clib_warning ("<html> tag not found");
-      return -1;
-    }
-  hc->rx_buf_offset = i;
-
-  return 0;
-}
-
-static http_sm_result_t
-http_state_wait_server_reply (http_conn_t *hc, transport_send_params_t *sp)
-{
-  int i, rv, content_length;
-  http_msg_t msg = {};
-  app_worker_t *app_wrk;
-  session_t *as;
-
-  rv = http_read_message (hc);
-
-  /* Nothing yet, wait for data or timer expire */
-  if (rv)
-    {
-      HTTP_DBG (1, "no data to deq");
-      return HTTP_SM_STOP;
-    }
-
-  if (vec_len (hc->rx_buf) < 8)
-    {
-      clib_warning ("response buffer too short");
-      goto error;
-    }
-
-  if ((i = v_find_index (hc->rx_buf, 0, 0, "200 OK")) >= 0)
-    {
-      msg.type = HTTP_MSG_REPLY;
-      msg.content_type = HTTP_CONTENT_TEXT_HTML;
-      msg.code = HTTP_STATUS_OK;
-      msg.data.type = HTTP_MSG_DATA_INLINE;
-      msg.data.len = 0;
-
-      rv = http_parse_header (hc, &content_length);
-      if (rv)
-	{
-	  clib_warning ("failed to parse http reply");
-	  goto error;
-	}
-      msg.data.len = content_length;
-      u32 dlen = vec_len (hc->rx_buf) - hc->rx_buf_offset;
-      as = session_get_from_handle (hc->h_pa_session_handle);
-      svm_fifo_seg_t segs[2] = { { (u8 *) &msg, sizeof (msg) },
-				 { &hc->rx_buf[hc->rx_buf_offset], dlen } };
-
-      rv = svm_fifo_enqueue_segments (as->rx_fifo, segs, 2,
-				      0 /* allow partial */);
-      if (rv < 0)
-	{
-	  clib_warning ("error enqueue");
-	  return HTTP_SM_ERROR;
-	}
-
-      hc->rx_buf_offset += dlen;
-      hc->to_recv = content_length - dlen;
-
-      if (hc->rx_buf_offset == vec_len (hc->rx_buf))
-	{
-	  vec_reset_length (hc->rx_buf);
-	  hc->rx_buf_offset = 0;
-	}
-
-      if (hc->to_recv == 0)
-	{
-	  hc->rx_buf_offset = 0;
-	  vec_reset_length (hc->rx_buf);
-	  http_state_change (hc, HTTP_STATE_WAIT_APP_METHOD);
-	}
-      else
-	{
-	  http_state_change (hc, HTTP_STATE_CLIENT_IO_MORE_DATA);
-	}
-
-      app_wrk = app_worker_get_if_valid (as->app_wrk_index);
-      if (app_wrk)
-	app_worker_rx_notify (app_wrk, as);
-      return HTTP_SM_STOP;
-    }
-  else
-    {
-      clib_warning ("Unknown http method %v", hc->rx_buf);
-      goto error;
-    }
-
-error:
-  session_transport_closing_notify (&hc->connection);
-  session_transport_closed_notify (&hc->connection);
-  http_disconnect_transport (hc);
-  return HTTP_SM_ERROR;
-}
-
-static http_sm_result_t
-http_state_wait_client_method (http_conn_t *hc, transport_send_params_t *sp)
-{
-  http_status_code_t ec;
-  app_worker_t *app_wrk;
-  http_msg_t msg;
-  session_t *as;
-  int rv;
-  u32 len;
-
-  rv = http_read_message (hc);
-
-  /* Nothing yet, wait for data or timer expire */
-  if (rv)
-    return HTTP_SM_STOP;
-
-  HTTP_DBG (0, "%v", hc->rx_buf);
-
-  if (vec_len (hc->rx_buf) < 8)
-    {
-      ec = HTTP_STATUS_BAD_REQUEST;
-      goto error;
-    }
-
-  rv = http_parse_request_line (hc, &ec);
-  if (rv)
-    goto error;
-
-  rv = http_identify_headers (hc, &ec);
-  if (rv)
-    goto error;
-
-  rv = http_identify_message_body (hc, &ec);
-  if (rv)
-    goto error;
-
-  len = vec_len (hc->rx_buf);
-
-  msg.type = HTTP_MSG_REQUEST;
-  msg.method_type = hc->method;
-  msg.content_type = HTTP_CONTENT_TEXT_HTML;
-  msg.data.type = HTTP_MSG_DATA_INLINE;
-  msg.data.len = len;
-  msg.data.target_form = hc->target_form;
-  msg.data.target_path_offset = hc->target_path_offset;
-  msg.data.target_path_len = hc->target_path_len;
-  msg.data.target_query_offset = hc->target_query_offset;
-  msg.data.target_query_len = hc->target_query_len;
-  msg.data.headers_offset = hc->headers_offset;
-  msg.data.headers_len = hc->headers_len;
-  msg.data.body_offset = hc->body_offset;
-  msg.data.body_len = hc->body_len;
-
-  svm_fifo_seg_t segs[2] = { { (u8 *) &msg, sizeof (msg) },
-			     { hc->rx_buf, len } };
-
-  as = session_get_from_handle (hc->h_pa_session_handle);
-  rv = svm_fifo_enqueue_segments (as->rx_fifo, segs, 2, 0 /* allow partial */);
-  if (rv < 0 || rv != sizeof (msg) + len)
-    {
-      clib_warning ("failed app enqueue");
-      /* This should not happen as we only handle 1 request per session,
-       * and fifo is allocated, but going forward we should consider
-       * rescheduling */
-      return HTTP_SM_ERROR;
-    }
-
-  vec_free (hc->rx_buf);
-  http_state_change (hc, HTTP_STATE_WAIT_APP_REPLY);
-
-  app_wrk = app_worker_get_if_valid (as->app_wrk_index);
-  if (app_wrk)
-    app_worker_rx_notify (app_wrk, as);
-
-  return HTTP_SM_STOP;
-
-error:
-
-  http_send_error (hc, ec);
-  session_transport_closing_notify (&hc->connection);
-  http_disconnect_transport (hc);
-
-  return HTTP_SM_ERROR;
-}
-
-static http_sm_result_t
-http_state_wait_app_reply (http_conn_t *hc, transport_send_params_t *sp)
-{
-  http_main_t *hm = &http_main;
-  u8 *header;
-  u32 offset;
-  f64 now;
-  session_t *as;
-  http_status_code_t sc;
-  http_msg_t msg;
-  int rv;
-
-  as = session_get_from_handle (hc->h_pa_session_handle);
-
-  rv = svm_fifo_dequeue (as->tx_fifo, sizeof (msg), (u8 *) &msg);
-  ASSERT (rv == sizeof (msg));
-
-  if (msg.data.type > HTTP_MSG_DATA_PTR)
-    {
-      clib_warning ("no data");
-      sc = HTTP_STATUS_INTERNAL_ERROR;
-      goto error;
-    }
-
-  if (msg.type != HTTP_MSG_REPLY)
-    {
-      clib_warning ("unexpected message type %d", msg.type);
-      sc = HTTP_STATUS_INTERNAL_ERROR;
-      goto error;
-    }
-
-  http_buffer_init (&hc->tx_buf, msg_to_buf_type[msg.data.type], as->tx_fifo,
-		    msg.data.len);
-
-  /*
-   * Add headers. For now:
-   * - current time
-   * - expiration time
-   * - server name
-   * - content type
-   * - data length
-   */
-  now = clib_timebase_now (&hm->timebase);
-
-  switch (msg.code)
-    {
-    case HTTP_STATUS_NOT_FOUND:
-    case HTTP_STATUS_METHOD_NOT_ALLOWED:
-    case HTTP_STATUS_BAD_REQUEST:
-    case HTTP_STATUS_INTERNAL_ERROR:
-    case HTTP_STATUS_FORBIDDEN:
-    case HTTP_STATUS_OK:
-      header =
-	format (0, http_response_template, http_status_code_str[msg.code],
-		/* Date */
-		format_clib_timebase_time, now,
-		/* Expires */
-		format_clib_timebase_time, now + 600.0,
-		/* Server */
-		hc->app_name,
-		/* Content type */
-		http_content_type_str[msg.content_type],
-		/* Length */
-		msg.data.len);
-      break;
-    case HTTP_STATUS_MOVED:
-      header =
-	format (0, http_redirect_template, http_status_code_str[msg.code]);
-      /* Location: http(s)://new-place already queued up as data */
-      break;
-    default:
-      clib_warning ("unsupported status code: %d", msg.code);
-      return HTTP_SM_ERROR;
-    }
-
-  offset = http_send_data (hc, header, vec_len (header), 0);
-  if (offset != vec_len (header))
-    {
-      clib_warning ("couldn't send response header!");
-      sc = HTTP_STATUS_INTERNAL_ERROR;
-      vec_free (header);
-      goto error;
-    }
-  vec_free (header);
-
-  /* Start sending the actual data */
-  http_state_change (hc, HTTP_STATE_APP_IO_MORE_DATA);
-
-  ASSERT (sp->max_burst_size >= offset);
-  sp->max_burst_size -= offset;
-  return HTTP_SM_CONTINUE;
-
-error:
-  clib_warning ("unexpected msg type from app %u", msg.type);
-  http_send_error (hc, sc);
-  http_state_change (hc, HTTP_STATE_WAIT_CLIENT_METHOD);
-  session_transport_closing_notify (&hc->connection);
-  http_disconnect_transport (hc);
-  return HTTP_SM_STOP;
-}
-
-static http_sm_result_t
-http_state_wait_app_method (http_conn_t *hc, transport_send_params_t *sp)
-{
-  http_msg_t msg;
-  session_t *as;
-  u8 *buf = 0, *request;
-  u32 offset;
-  int rv;
-
-  as = session_get_from_handle (hc->h_pa_session_handle);
-
-  rv = svm_fifo_dequeue (as->tx_fifo, sizeof (msg), (u8 *) &msg);
-  ASSERT (rv == sizeof (msg));
-
-  if (msg.data.type > HTTP_MSG_DATA_PTR)
-    {
-      clib_warning ("no data");
-      goto error;
-    }
-
-  if (msg.type != HTTP_MSG_REQUEST)
-    {
-      clib_warning ("unexpected message type %d", msg.type);
-      goto error;
-    }
-
-  /* currently we support only GET method */
-  if (msg.method_type != HTTP_REQ_GET)
-    {
-      clib_warning ("unsupported method %d", msg.method_type);
-      goto error;
-    }
-
-  vec_validate (buf, msg.data.len - 1);
-  rv = svm_fifo_dequeue (as->tx_fifo, msg.data.len, buf);
-  ASSERT (rv == msg.data.len);
-
-  request = format (0, http_request_template, buf, hc->app_name);
-  offset = http_send_data (hc, request, vec_len (request), 0);
-  if (offset != vec_len (request))
-    {
-      clib_warning ("sending request failed!");
-      goto error;
-    }
-
-  http_state_change (hc, HTTP_STATE_WAIT_SERVER_REPLY);
-
-  vec_free (buf);
-  vec_free (request);
-
-  return HTTP_SM_STOP;
-
-error:
-  svm_fifo_dequeue_drop_all (as->tx_fifo);
-  session_transport_closing_notify (&hc->connection);
-  session_transport_closed_notify (&hc->connection);
-  http_disconnect_transport (hc);
-  return HTTP_SM_ERROR;
-}
-
-static http_sm_result_t
-http_state_client_io_more_data (http_conn_t *hc, transport_send_params_t *sp)
-{
-  session_t *as, *ts;
-  app_worker_t *app_wrk;
-  svm_fifo_seg_t _seg, *seg = &_seg;
-  u32 max_len, max_deq, max_enq, n_segs = 1;
-  int rv, len;
-
-  as = session_get_from_handle (hc->h_pa_session_handle);
-  ts = session_get_from_handle (hc->h_tc_session_handle);
-
-  max_deq = svm_fifo_max_dequeue (ts->rx_fifo);
-  if (max_deq == 0)
-    {
-      HTTP_DBG (1, "no data to deq");
-      return HTTP_SM_STOP;
-    }
-
-  max_enq = svm_fifo_max_enqueue (as->rx_fifo);
-  if (max_enq == 0)
-    {
-      HTTP_DBG (1, "app's rx fifo full");
-      svm_fifo_add_want_deq_ntf (as->rx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
-      return HTTP_SM_STOP;
-    }
-
-  max_len = clib_min (max_enq, max_deq);
-  len = svm_fifo_segments (ts->rx_fifo, 0, seg, &n_segs, max_len);
-  if (len < 0)
-    {
-      HTTP_DBG (1, "svm_fifo_segments() len %d", len);
-      return HTTP_SM_STOP;
-    }
-
-  rv = svm_fifo_enqueue_segments (as->rx_fifo, seg, 1, 0 /* allow partial */);
-  if (rv < 0)
-    {
-      clib_warning ("data enqueue failed, rv: %d", rv);
-      return HTTP_SM_ERROR;
-    }
-
-  svm_fifo_dequeue_drop (ts->rx_fifo, rv);
-  if (rv > hc->to_recv)
-    {
-      clib_warning ("http protocol error: received more data than expected");
-      session_transport_closing_notify (&hc->connection);
-      http_disconnect_transport (hc);
-      http_state_change (hc, HTTP_STATE_WAIT_APP_METHOD);
-      return HTTP_SM_ERROR;
-    }
-  hc->to_recv -= rv;
-  HTTP_DBG (1, "drained %d from ts; remains %d", rv, hc->to_recv);
-
-  if (hc->to_recv == 0)
-    {
-      hc->rx_buf_offset = 0;
-      vec_reset_length (hc->rx_buf);
-      http_state_change (hc, HTTP_STATE_WAIT_APP_METHOD);
-    }
-
-  app_wrk = app_worker_get_if_valid (as->app_wrk_index);
-  if (app_wrk)
-    app_worker_rx_notify (app_wrk, as);
-
-  if (svm_fifo_max_dequeue_cons (ts->rx_fifo))
-    session_enqueue_notify (ts);
-
-  return HTTP_SM_STOP;
-}
-
-static http_sm_result_t
-http_state_app_io_more_data (http_conn_t *hc, transport_send_params_t *sp)
-{
-  u32 max_send = 64 << 10, n_segs;
-  http_buffer_t *hb = &hc->tx_buf;
-  svm_fifo_seg_t *seg;
-  session_t *ts;
-  int sent = 0;
-
-  max_send = clib_min (max_send, sp->max_burst_size);
-  ts = session_get_from_handle (hc->h_tc_session_handle);
-  if ((seg = http_buffer_get_segs (hb, max_send, &n_segs)))
-    sent = svm_fifo_enqueue_segments (ts->tx_fifo, seg, n_segs,
-				      1 /* allow partial */);
-
-  if (sent > 0)
-    {
-      /* Ask scheduler to notify app of deq event if needed */
-      sp->bytes_dequeued += http_buffer_drain (hb, sent);
-      sp->max_burst_size -= sent;
-    }
-
-  /* Not finished sending all data */
-  if (!http_buffer_is_drained (hb))
-    {
-      if (sent && svm_fifo_set_event (ts->tx_fifo))
-	session_send_io_evt_to_thread (ts->tx_fifo, SESSION_IO_EVT_TX);
-
-      if (svm_fifo_max_enqueue (ts->tx_fifo) < HTTP_FIFO_THRESH)
-	{
-	  /* Deschedule http session and wait for deq notification if
-	   * underlying ts tx fifo almost full */
-	  svm_fifo_add_want_deq_ntf (ts->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
-	  transport_connection_deschedule (&hc->connection);
-	  sp->flags |= TRANSPORT_SND_F_DESCHED;
-	}
-    }
-  else
-    {
-      if (sent && svm_fifo_set_event (ts->tx_fifo))
-	session_send_io_evt_to_thread (ts->tx_fifo, SESSION_IO_EVT_TX_FLUSH);
-
-      /* Finished transaction, back to HTTP_STATE_WAIT_METHOD */
-      http_state_change (hc, HTTP_STATE_WAIT_CLIENT_METHOD);
-      http_buffer_free (&hc->tx_buf);
-    }
-
-  return HTTP_SM_STOP;
-}
-
-typedef http_sm_result_t (*http_sm_handler) (http_conn_t *,
-					     transport_send_params_t *sp);
-
-static http_sm_handler state_funcs[HTTP_N_STATES] = {
-  0, /* idle state */
-  http_state_wait_app_method,
-  http_state_wait_client_method,
-  http_state_wait_server_reply,
-  http_state_wait_app_reply,
-  http_state_client_io_more_data,
-  http_state_app_io_more_data,
-};
-
-static void
-http_req_run_state_machine (http_conn_t *hc, transport_send_params_t *sp)
-{
-  http_sm_result_t res;
-
-  do
-    {
-      res = state_funcs[hc->http_state](hc, sp);
-      if (res == HTTP_SM_ERROR)
-	{
-	  HTTP_DBG (1, "error in state machine %d", res);
-	  return;
-	}
-    }
-  while (res == HTTP_SM_CONTINUE);
-
-  /* Reset the session expiration timer */
-  http_conn_timer_update (hc);
 }
 
 static int
 http_ts_rx_callback (session_t *ts)
 {
   http_conn_t *hc;
+  u32 hc_index = http_conn_index_from_handle (ts->opaque);
 
-  hc = http_conn_get_w_thread (ts->opaque, ts->thread_index);
-  if (!hc)
-    {
-      clib_warning ("http connection not found (ts %d)", ts->opaque);
-      return -1;
-    }
+  HTTP_DBG (1, "hc [%u]%x", ts->thread_index, hc_index);
+
+  hc = http_conn_get_w_thread (hc_index, ts->thread_index);
 
   if (hc->state == HTTP_CONN_STATE_CLOSED)
     {
-      svm_fifo_dequeue_drop_all (ts->tx_fifo);
+      HTTP_DBG (1, "conn closed");
+      svm_fifo_dequeue_drop_all (ts->rx_fifo);
       return 0;
     }
 
-  http_req_run_state_machine (hc, 0);
+  http_vfts[http_version_from_handle (ts->opaque)].transport_rx_callback (hc);
 
   if (hc->state == HTTP_CONN_STATE_TRANSPORT_CLOSED)
     {
@@ -1321,7 +659,9 @@ http_ts_builtin_tx_callback (session_t *ts)
 {
   http_conn_t *hc;
 
-  hc = http_conn_get_w_thread (ts->opaque, ts->thread_index);
+  hc = http_conn_get_w_thread (http_conn_index_from_handle (ts->opaque),
+			       ts->thread_index);
+  HTTP_DBG (1, "transport connection reschedule");
   transport_connection_reschedule (&hc->connection);
 
   return 0;
@@ -1331,24 +671,44 @@ static void
 http_ts_cleanup_callback (session_t *ts, session_cleanup_ntf_t ntf)
 {
   http_conn_t *hc;
+  http_req_t *req;
+  u32 hc_index;
 
   if (ntf == SESSION_CLEANUP_TRANSPORT)
     return;
 
-  hc = http_conn_get_w_thread (ts->opaque, ts->thread_index);
-  if (!hc)
+  hc_index = http_conn_index_from_handle (ts->opaque);
+  hc = http_conn_get_w_thread (hc_index, ts->thread_index);
+
+  HTTP_DBG (1, "going to free hc [%u]%x", ts->thread_index, hc_index);
+
+  pool_foreach (req, hc->req_pool)
     {
-      clib_warning ("no http connection for %u", ts->session_index);
-      return;
+      vec_free (req->headers);
+      vec_free (req->target);
+      http_buffer_free (&req->tx_buf);
     }
+  pool_free (hc->req_pool);
 
-  vec_free (hc->rx_buf);
-
-  http_buffer_free (&hc->tx_buf);
-  http_conn_timer_stop (hc);
+  if (!(hc->flags & HTTP_CONN_F_PENDING_TIMER))
+    http_conn_timer_stop (hc);
 
   session_transport_delete_notify (&hc->connection);
+
+  if (!(hc->flags & HTTP_CONN_F_IS_SERVER))
+    {
+      vec_free (hc->app_name);
+      vec_free (hc->host);
+    }
   http_conn_free (hc);
+}
+
+static void
+http_ts_ho_cleanup_callback (session_t *ts)
+{
+  u32 ho_hc_index = http_conn_index_from_handle (ts->opaque);
+  HTTP_DBG (1, "half open: %x", ho_hc_index);
+  http_ho_try_free (ho_hc_index);
 }
 
 int
@@ -1370,19 +730,26 @@ static session_cb_vft_t http_app_cb_vft = {
   .session_connected_callback = http_ts_connected_callback,
   .session_reset_callback = http_ts_reset_callback,
   .session_cleanup_callback = http_ts_cleanup_callback,
+  .half_open_cleanup_callback = http_ts_ho_cleanup_callback,
   .add_segment_callback = http_add_segment_callback,
   .del_segment_callback = http_del_segment_callback,
   .builtin_app_rx_callback = http_ts_rx_callback,
   .builtin_app_tx_callback = http_ts_builtin_tx_callback,
 };
 
+/*********************************/
+/* transport proto VFT callbacks */
+/*********************************/
+
 static clib_error_t *
 http_transport_enable (vlib_main_t *vm, u8 is_en)
 {
+  vlib_thread_main_t *vtm = vlib_get_thread_main ();
   vnet_app_detach_args_t _da, *da = &_da;
   vnet_app_attach_args_t _a, *a = &_a;
   u64 options[APP_OPTIONS_N_OPTIONS];
   http_main_t *hm = &http_main;
+  u32 num_threads, i;
 
   if (!is_en)
     {
@@ -1391,6 +758,8 @@ http_transport_enable (vlib_main_t *vm, u8 is_en)
       vnet_application_detach (da);
       return 0;
     }
+
+  num_threads = 1 /* main thread */ + vtm->n_threads;
 
   clib_memset (a, 0, sizeof (*a));
   clib_memset (options, 0, sizeof (options));
@@ -1416,12 +785,25 @@ http_transport_enable (vlib_main_t *vm, u8 is_en)
   if (hm->is_init)
     return 0;
 
-  vec_validate (hm->wrk, vlib_num_workers ());
+  vec_validate (hm->wrk, num_threads - 1);
+  vec_validate (hm->rx_bufs, num_threads - 1);
+  vec_validate (hm->tx_bufs, num_threads - 1);
+  vec_validate (hm->app_header_lists, num_threads - 1);
+  for (i = 0; i < num_threads; i++)
+    {
+      vec_validate (hm->rx_bufs[i],
+		    HTTP_UDP_PAYLOAD_MAX_LEN +
+		      HTTP_UDP_PROXY_DATAGRAM_CAPSULE_OVERHEAD);
+      vec_validate (hm->tx_bufs[i],
+		    HTTP_UDP_PAYLOAD_MAX_LEN +
+		      HTTP_UDP_PROXY_DATAGRAM_CAPSULE_OVERHEAD);
+      vec_validate (hm->app_header_lists[i], 32 << 10);
+    }
 
   clib_timebase_init (&hm->timebase, 0 /* GMT */, CLIB_TIMEBASE_DAYLIGHT_NONE,
 		      &vm->clib_time /* share the system clock */);
 
-  http_timers_init (vm, http_conn_timeout_cb);
+  http_timers_init (vm, http_conn_timeout_cb, http_conn_invalidate_timer_cb);
   hm->is_init = 1;
 
   return 0;
@@ -1437,6 +819,8 @@ http_transport_connect (transport_endpoint_cfg_t *tep)
   http_conn_t *hc;
   int error;
   u32 hc_index;
+  session_t *ho;
+  transport_endpt_ext_cfg_t *ext_cfg;
   app_worker_t *app_wrk = app_worker_get (sep->app_wrk_index);
 
   clib_memset (cargs, 0, sizeof (*cargs));
@@ -1446,22 +830,56 @@ http_transport_connect (transport_endpoint_cfg_t *tep)
   app = application_get (app_wrk->app_index);
   cargs->sep_ext.ns_index = app->ns_index;
 
-  hc_index = http_conn_alloc_w_thread (0 /* ts->thread_index */);
-  hc = http_conn_get_w_thread (hc_index, 0);
+  hc_index = http_ho_conn_alloc ();
+  hc = http_ho_conn_get (hc_index);
   hc->h_pa_wrk_index = sep->app_wrk_index;
   hc->h_pa_app_api_ctx = sep->opaque;
   hc->state = HTTP_CONN_STATE_CONNECTING;
+  /* TODO: set to HTTP_VERSION_NA in case of TLS (when supported) */
+  hc->version = HTTP_VERSION_1;
   cargs->api_context = hc_index;
+
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_HTTP);
+  if (ext_cfg)
+    {
+      transport_endpt_cfg_http_t *http_cfg =
+	(transport_endpt_cfg_http_t *) ext_cfg->data;
+      HTTP_DBG (1, "app set timeout %u", http_cfg->timeout);
+      hc->timeout = http_cfg->timeout;
+    }
+
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (ext_cfg)
+    {
+      HTTP_DBG (1, "app set tls");
+      cargs->sep.transport_proto = TRANSPORT_PROTO_TLS;
+    }
 
   if (vec_len (app->name))
     hc->app_name = vec_dup (app->name);
   else
     hc->app_name = format (0, "VPP HTTP client");
 
+  if (sep->is_ip4)
+    hc->host = format (0, "%U:%d", format_ip4_address, &sep->ip.ip4,
+		       clib_net_to_host_u16 (sep->port));
+  else
+    hc->host = format (0, "%U:%d", format_ip6_address, &sep->ip.ip6,
+		       clib_net_to_host_u16 (sep->port));
+
   HTTP_DBG (1, "hc ho_index %x", hc_index);
 
   if ((error = vnet_connect (cargs)))
     return error;
+
+  ho = session_alloc_for_half_open (&hc->connection);
+  ho->app_wrk_index = app_wrk->wrk_index;
+  ho->ho_index = app_worker_add_half_open (app_wrk, session_handle (ho));
+  ho->opaque = sep->opaque;
+  ho->session_type =
+    session_type_from_proto_and_ip (TRANSPORT_PROTO_HTTP, sep->is_ip4);
+  hc->h_tc_session_handle = cargs->sh;
+  hc->c_s_index = ho->session_index;
 
   return 0;
 }
@@ -1474,11 +892,12 @@ http_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
   http_main_t *hm = &http_main;
   session_endpoint_cfg_t *sep;
   app_worker_t *app_wrk;
-  transport_proto_t tp;
+  transport_proto_t tp = TRANSPORT_PROTO_TCP;
   app_listener_t *al;
   application_t *app;
   http_conn_t *lhc;
   u32 lhc_index;
+  transport_endpt_ext_cfg_t *ext_cfg;
 
   sep = (session_endpoint_cfg_t *) tep;
 
@@ -1488,7 +907,13 @@ http_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
   args->app_index = hm->app_index;
   args->sep_ext = *sep;
   args->sep_ext.ns_index = app->ns_index;
-  tp = sep->ext_cfg ? TRANSPORT_PROTO_TLS : TRANSPORT_PROTO_TCP;
+
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (ext_cfg)
+    {
+      HTTP_DBG (1, "app set tls");
+      tp = TRANSPORT_PROTO_TLS;
+    }
   args->sep_ext.transport_proto = tp;
 
   if (vnet_listen (args))
@@ -1496,6 +921,16 @@ http_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
 
   lhc_index = http_listener_alloc ();
   lhc = http_listener_get (lhc_index);
+
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_HTTP);
+  if (ext_cfg && ext_cfg->opaque)
+    {
+      transport_endpt_cfg_http_t *http_cfg =
+	(transport_endpt_cfg_http_t *) ext_cfg->data;
+      HTTP_DBG (1, "app set timeout %u", http_cfg->timeout);
+      lhc->timeout = http_cfg->timeout;
+      lhc->udp_tunnel_mode = http_cfg->udp_tunnel_mode;
+    }
 
   /* Grab transport connection listener and link to http listener */
   lhc->h_tc_session_handle = args->handle;
@@ -1509,6 +944,8 @@ http_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
   lhc->h_pa_session_handle = listen_session_get_handle (app_listener);
   lhc->c_s_index = app_listener_index;
   lhc->c_flags |= TRANSPORT_CONNECTION_F_NO_LOOKUP;
+
+  lhc->flags |= HTTP_CONN_F_IS_SERVER;
 
   if (vec_len (app->name))
     lhc->app_name = vec_dup (app->name);
@@ -1543,10 +980,9 @@ http_stop_listen (u32 listener_index)
 static void
 http_transport_close (u32 hc_index, u32 thread_index)
 {
-  session_t *as;
   http_conn_t *hc;
 
-  HTTP_DBG (1, "App disconnecting %x", hc_index);
+  HTTP_DBG (1, "App disconnecting [%u]%x", thread_index, hc_index);
 
   hc = http_conn_get_w_thread (hc_index, thread_index);
   if (hc->state == HTTP_CONN_STATE_CONNECTING)
@@ -1560,19 +996,25 @@ http_transport_close (u32 hc_index, u32 thread_index)
       HTTP_DBG (1, "nothing to do, already closed");
       return;
     }
-  as = session_get_from_handle (hc->h_pa_session_handle);
 
-  /* Nothing more to send, confirm close */
-  if (!svm_fifo_max_dequeue_cons (as->tx_fifo))
+  http_vfts[hc->version].app_close_callback (hc);
+}
+
+static void
+http_transport_reset (u32 hc_index, u32 thread_index)
+{
+  http_conn_t *hc;
+
+  HTTP_DBG (1, "App disconnecting [%u]%x", thread_index, hc_index);
+
+  hc = http_conn_get_w_thread (hc_index, thread_index);
+  if (hc->state == HTTP_CONN_STATE_CLOSED)
     {
-      session_transport_closed_notify (&hc->connection);
-      http_disconnect_transport (hc);
+      HTTP_DBG (1, "nothing to do, already closed");
+      return;
     }
-  else
-    {
-      /* Wait for all data to be written to ts */
-      hc->state = HTTP_CONN_STATE_APP_CLOSED;
-    }
+
+  http_vfts[hc->version].app_reset_callback (hc);
 }
 
 static transport_connection_t *
@@ -1596,14 +1038,13 @@ http_app_tx_callback (void *session, transport_send_params_t *sp)
   u32 max_burst_sz, sent;
   http_conn_t *hc;
 
-  HTTP_DBG (1, "app session conn index %x", as->connection_index);
+  HTTP_DBG (1, "hc [%u]%x", as->thread_index, as->connection_index);
 
   hc = http_conn_get_w_thread (as->connection_index, as->thread_index);
-  if (!http_state_is_tx_valid (hc))
+
+  if (hc->state == HTTP_CONN_STATE_CLOSED)
     {
-      if (hc->state != HTTP_CONN_STATE_CLOSED)
-	clib_warning ("app data req state '%U' session state %u",
-		      format_http_state, hc->http_state, hc->state);
+      HTTP_DBG (1, "conn closed");
       svm_fifo_dequeue_drop_all (as->tx_fifo);
       return 0;
     }
@@ -1611,17 +1052,31 @@ http_app_tx_callback (void *session, transport_send_params_t *sp)
   max_burst_sz = sp->max_burst_size * TRANSPORT_PACER_MIN_MSS;
   sp->max_burst_size = max_burst_sz;
 
-  http_req_run_state_machine (hc, sp);
+  http_vfts[hc->version].app_tx_callback (hc, sp);
 
   if (hc->state == HTTP_CONN_STATE_APP_CLOSED)
     {
       if (!svm_fifo_max_dequeue_cons (as->tx_fifo))
-	http_disconnect_transport (hc);
+	{
+	  session_transport_closed_notify (&hc->connection);
+	  http_disconnect_transport (hc);
+	}
     }
 
   sent = max_burst_sz - sp->max_burst_size;
 
   return sent > 0 ? clib_max (sent / TRANSPORT_PACER_MIN_MSS, 1) : 0;
+}
+
+static int
+http_app_rx_evt_cb (transport_connection_t *tc)
+{
+  http_conn_t *hc = (http_conn_t *) tc;
+  HTTP_DBG (1, "hc [%u]%x", vlib_get_thread_index (), hc->h_hc_index);
+
+  http_vfts[hc->version].app_rx_evt_callback (hc);
+
+  return 0;
 }
 
 static void
@@ -1666,36 +1121,6 @@ format_http_listener (u8 *s, va_list *args)
 }
 
 static u8 *
-format_http_conn_state (u8 *s, va_list *args)
-{
-  http_conn_t *hc = va_arg (*args, http_conn_t *);
-
-  switch (hc->state)
-    {
-    case HTTP_CONN_STATE_LISTEN:
-      s = format (s, "LISTEN");
-      break;
-    case HTTP_CONN_STATE_CONNECTING:
-      s = format (s, "CONNECTING");
-      break;
-    case HTTP_CONN_STATE_ESTABLISHED:
-      s = format (s, "ESTABLISHED");
-      break;
-    case HTTP_CONN_STATE_TRANSPORT_CLOSED:
-      s = format (s, "TRANSPORT_CLOSED");
-      break;
-    case HTTP_CONN_STATE_APP_CLOSED:
-      s = format (s, "APP_CLOSED");
-      break;
-    case HTTP_CONN_STATE_CLOSED:
-      s = format (s, "CLOSED");
-      break;
-    }
-
-  return s;
-}
-
-static u8 *
 format_http_transport_connection (u8 *s, va_list *args)
 {
   u32 tc_index = va_arg (*args, u32);
@@ -1732,18 +1157,68 @@ format_http_transport_listener (u8 *s, va_list *args)
   return s;
 }
 
+static u8 *
+format_http_transport_half_open (u8 *s, va_list *args)
+{
+  u32 ho_index = va_arg (*args, u32);
+  u32 __clib_unused thread_index = va_arg (*args, u32);
+  u32 __clib_unused verbose = va_arg (*args, u32);
+  http_conn_t *ho_hc;
+  session_t *tcp_ho;
+
+  ho_hc = http_ho_conn_get (ho_index);
+  tcp_ho = session_get_from_handle (ho_hc->h_tc_session_handle);
+
+  s = format (s, "[%d:%d][H] half-open app_wrk %u ts %d:%d",
+	      ho_hc->c_thread_index, ho_hc->c_s_index, ho_hc->h_pa_wrk_index,
+	      tcp_ho->thread_index, tcp_ho->session_index);
+  return s;
+}
+
+static transport_connection_t *
+http_transport_get_ho (u32 ho_hc_index)
+{
+  http_conn_t *ho_hc;
+
+  HTTP_DBG (1, "half open: %x", ho_hc_index);
+  ho_hc = http_ho_conn_get (ho_hc_index);
+  return &ho_hc->connection;
+}
+
+static void
+http_transport_cleanup_ho (u32 ho_hc_index)
+{
+  http_conn_t *ho_hc;
+
+  HTTP_DBG (1, "half open: %x", ho_hc_index);
+  ho_hc = http_ho_conn_get (ho_hc_index);
+  if (ho_hc->h_tc_session_handle == SESSION_INVALID_HANDLE)
+    {
+      HTTP_DBG (1, "already pending cleanup");
+      ho_hc->flags |= HTTP_CONN_F_NO_APP_SESSION;
+      return;
+    }
+  session_cleanup_half_open (ho_hc->h_tc_session_handle);
+  http_ho_conn_free (ho_hc);
+}
+
 static const transport_proto_vft_t http_proto = {
   .enable = http_transport_enable,
   .connect = http_transport_connect,
   .start_listen = http_start_listen,
   .stop_listen = http_stop_listen,
   .close = http_transport_close,
+  .reset = http_transport_reset,
+  .cleanup_ho = http_transport_cleanup_ho,
   .custom_tx = http_app_tx_callback,
+  .app_rx_evt = http_app_rx_evt_cb,
   .get_connection = http_transport_get_connection,
   .get_listener = http_transport_get_listener,
+  .get_half_open = http_transport_get_ho,
   .get_transport_endpoint = http_transport_get_endpoint,
   .format_connection = format_http_transport_connection,
   .format_listener = format_http_transport_listener,
+  .format_half_open = format_http_transport_half_open,
   .transport_options = {
     .name = "http",
     .short_name = "H",
@@ -1756,6 +1231,7 @@ static clib_error_t *
 http_transport_init (vlib_main_t *vm)
 {
   http_main_t *hm = &http_main;
+  int i;
 
   transport_register_protocol (TRANSPORT_PROTO_HTTP, &http_proto,
 			       FIB_PROTOCOL_IP4, ~0);
@@ -1767,7 +1243,26 @@ http_transport_init (vlib_main_t *vm)
   hm->first_seg_size = 32 << 20;
   hm->fifo_size = 512 << 10;
 
-  return 0;
+  /* Setup u16 to http_status_code_t map */
+  /* Unrecognized status code is equivalent to the x00 status */
+  vec_validate (hm->sc_by_u16, 599);
+  for (i = 100; i < 200; i++)
+    hm->sc_by_u16[i] = HTTP_STATUS_CONTINUE;
+  for (i = 200; i < 300; i++)
+    hm->sc_by_u16[i] = HTTP_STATUS_OK;
+  for (i = 300; i < 400; i++)
+    hm->sc_by_u16[i] = HTTP_STATUS_MULTIPLE_CHOICES;
+  for (i = 400; i < 500; i++)
+    hm->sc_by_u16[i] = HTTP_STATUS_BAD_REQUEST;
+  for (i = 500; i < 600; i++)
+    hm->sc_by_u16[i] = HTTP_STATUS_INTERNAL_ERROR;
+
+    /* Registered status codes */
+#define _(c, s, str) hm->sc_by_u16[c] = HTTP_STATUS_##s;
+  foreach_http_status_code
+#undef _
+
+    return 0;
 }
 
 VLIB_INIT_FUNCTION (http_transport_init);

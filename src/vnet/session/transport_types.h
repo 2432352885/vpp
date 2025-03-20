@@ -171,7 +171,7 @@ STATIC_ASSERT (sizeof (transport_connection_t) <= 128,
 #define foreach_transport_proto                                               \
   _ (TCP, "tcp", "T")                                                         \
   _ (UDP, "udp", "U")                                                         \
-  _ (NONE, "ct", "C")                                                         \
+  _ (CT, "ct", "C")                                                           \
   _ (TLS, "tls", "J")                                                         \
   _ (QUIC, "quic", "Q")                                                       \
   _ (DTLS, "dtls", "D")                                                       \
@@ -185,6 +185,8 @@ typedef enum _transport_proto
 #undef _
 } transport_proto_t;
 
+#define TRANSPORT_PROTO_NONE TRANSPORT_PROTO_CT
+
 u8 *format_transport_proto (u8 * s, va_list * args);
 u8 *format_transport_proto_short (u8 * s, va_list * args);
 u8 *format_transport_flags (u8 *s, va_list *args);
@@ -194,6 +196,7 @@ u8 *format_transport_half_open_connection (u8 * s, va_list * args);
 
 uword unformat_transport_proto (unformat_input_t * input, va_list * args);
 u8 *format_transport_protos (u8 * s, va_list * args);
+u8 *format_transport_state (u8 *s, va_list *args);
 
 #define foreach_transport_endpoint_fields				\
   _(ip46_address_t, ip) /**< ip address in net order */			\
@@ -257,7 +260,8 @@ typedef enum transport_endpt_attr_flag_
   _ (u64, next_output_node, NEXT_OUTPUT_NODE)                                 \
   _ (u16, mss, MSS)                                                           \
   _ (u8, flags, FLAGS)                                                        \
-  _ (u8, cc_algo, CC_ALGO)
+  _ (u8, cc_algo, CC_ALGO)                                                    \
+  _ (transport_endpoint_t, ext_endpt, EXT_ENDPT)
 
 typedef enum transport_endpt_attr_type_
 {
@@ -281,6 +285,7 @@ typedef enum transport_endpt_ext_cfg_type_
 {
   TRANSPORT_ENDPT_EXT_CFG_NONE,
   TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+  TRANSPORT_ENDPT_EXT_CFG_HTTP,
 } transport_endpt_ext_cfg_type_t;
 
 typedef struct transport_endpt_crypto_cfg_
@@ -297,9 +302,26 @@ typedef struct transport_endpt_ext_cfg_
   union
   {
     transport_endpt_crypto_cfg_t crypto;
+    u32 opaque; /**< For general use */
     u8 data[0];
   };
 } transport_endpt_ext_cfg_t;
+
+#define TRANSPORT_ENDPT_EXT_CFG_HEADER_SIZE 4
+
+typedef struct transport_endpt_ext_cfgs_
+{
+  u32 len;	   /**< length of config data chunk */
+  u32 tail_offset; /**< current tail in config data chunk */
+  u8 *data;	   /**< start of config data chunk */
+} transport_endpt_ext_cfgs_t;
+
+#define TRANSPORT_ENDPT_EXT_CFGS_CHUNK_SIZE 512
+
+#define TRANSPORT_ENDPT_EXT_CFGS_NULL                                         \
+  {                                                                           \
+    .len = 0, .tail_offset = 0, .data = 0,                                    \
+  }
 
 typedef clib_bihash_24_8_t transport_endpoint_table_t;
 

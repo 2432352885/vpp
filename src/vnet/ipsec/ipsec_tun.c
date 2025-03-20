@@ -23,6 +23,7 @@
 #include <vnet/adj/adj_midchain.h>
 #include <vnet/teib/teib.h>
 #include <vnet/mpls/mpls.h>
+#include <vnet/interface.h>
 
 /* instantiate the bihash functions */
 #include <vppinfra/bihash_8_16.h>
@@ -469,6 +470,7 @@ ipsec_tun_protect_set_crypto_addr (ipsec_tun_protect_t * itp)
 	if (!(itp->itp_flags & IPSEC_PROTECT_ITF))
 	  {
 	    ipsec_sa_set_IS_PROTECT (sa);
+	    ipsec_sa_update_runtime (sa);
 	    itp->itp_flags |= IPSEC_PROTECT_ENCAPED;
 	  }
       }
@@ -496,7 +498,11 @@ ipsec_tun_protect_config (ipsec_main_t * im,
   ipsec_sa_lock (itp->itp_out_sa);
 
   if (itp->itp_flags & IPSEC_PROTECT_ITF)
-    ipsec_sa_set_NO_ALGO_NO_DROP (ipsec_sa_get (itp->itp_out_sa));
+    {
+      ipsec_sa_t *sa = ipsec_sa_get (itp->itp_out_sa);
+      ipsec_sa_set_NO_ALGO_NO_DROP (sa);
+      ipsec_sa_update_runtime (sa);
+    }
 
   FOR_EACH_IPSEC_PROTECT_INPUT_SAI(itp, sai,
   ({
@@ -522,12 +528,16 @@ ipsec_tun_protect_unconfig (ipsec_main_t * im, ipsec_tun_protect_t * itp)
   FOR_EACH_IPSEC_PROTECT_INPUT_SA(itp, sa,
   ({
     ipsec_sa_unset_IS_PROTECT (sa);
+    ipsec_sa_update_runtime (sa);
   }));
 
   ipsec_tun_protect_rx_db_remove (im, itp);
   ipsec_tun_protect_tx_db_remove (itp);
 
-  ipsec_sa_unset_NO_ALGO_NO_DROP (ipsec_sa_get (itp->itp_out_sa));
+  sa = ipsec_sa_get (itp->itp_out_sa);
+  ipsec_sa_unset_NO_ALGO_NO_DROP (sa);
+  ipsec_sa_update_runtime (sa);
+
   ipsec_sa_unlock(itp->itp_out_sa);
 
   FOR_EACH_IPSEC_PROTECT_INPUT_SAI(itp, sai,
@@ -704,22 +714,13 @@ out:
   return (rv);
 }
 
-int
-ipsec_tun_protect_del (u32 sw_if_index, const ip_address_t * nh)
+static int
+ipsec_tun_protect_del_by_idx (index_t itpi)
 {
   ipsec_tun_protect_t *itp;
   ipsec_main_t *im;
-  index_t itpi;
-
-  ITP_DBG2 ("delete: %U/%U",
-	    format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
-	    format_ip_address, nh);
 
   im = &ipsec_main;
-  if (NULL == nh)
-    nh = &IP_ADDR_ALL_0;
-
-  itpi = ipsec_tun_protect_find (sw_if_index, nh);
 
   if (INDEX_INVALID == itpi)
     return (VNET_API_ERROR_NO_SUCH_ENTRY);
@@ -736,6 +737,22 @@ ipsec_tun_protect_del (u32 sw_if_index, const ip_address_t * nh)
   return (0);
 }
 
+int
+ipsec_tun_protect_del (u32 sw_if_index, const ip_address_t *nh)
+{
+  index_t itpi;
+
+  ITP_DBG2 ("delete: %U/%U", format_vnet_sw_if_index_name, vnet_get_main (),
+	    sw_if_index, format_ip_address, nh);
+
+  if (NULL == nh)
+    nh = &IP_ADDR_ALL_0;
+
+  itpi = ipsec_tun_protect_find (sw_if_index, nh);
+
+  return ipsec_tun_protect_del_by_idx (itpi);
+}
+
 void
 ipsec_tun_protect_walk (ipsec_tun_protect_walk_cb_t fn, void *ctx)
 {
@@ -746,6 +763,26 @@ ipsec_tun_protect_walk (ipsec_tun_protect_walk_cb_t fn, void *ctx)
     fn (itpi, ctx);
   }
 }
+
+walk_rc_t
+ipsec_tun_interface_cleanup (index_t itpi, void *ctx)
+{
+  ipsec_tun_protect_del_by_idx (itpi);
+  return WALK_CONTINUE;
+}
+
+static clib_error_t *
+ipsec_tun_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
+{
+  if (is_add)
+  return 0;
+
+  ipsec_tun_protect_walk_itf (sw_if_index, ipsec_tun_interface_cleanup, 0);
+
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (ipsec_tun_interface_add_del);
 
 void
 ipsec_tun_protect_walk_itf (u32 sw_if_index,

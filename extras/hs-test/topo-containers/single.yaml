@@ -28,13 +28,21 @@ containers:
     image: "hs-test/nginx-http3"
     is-optional: true
 
+  - name: "nginx-server"
+    volumes:
+      - <<: *shared-vol
+        container-dir: "/tmp/nginx"
+        is-default-work-dir: true
+    image: "hs-test/nginx-server"
+    is-optional: true
+
   - name: "ab"
-    image: "jordi/ab"
+    image: "hs-test/ab"
     is-optional: true
     run-detached: false
 
   - name: "wrk"
-    image: "skandyla/wrk"
+    image: "hs-test/wrk"
     is-optional: true
     run-detached: false
 

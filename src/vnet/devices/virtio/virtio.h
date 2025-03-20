@@ -140,6 +140,7 @@ typedef struct
   vnet_virtio_vring_t *txq_vrings;
   int gso_enabled;
   int csum_offload_enabled;
+  int rss_enabled;
   union
   {
     int *tap_fds;
@@ -212,6 +213,7 @@ typedef struct
   };
   const virtio_pci_func_t *virtio_pci_func;
   int is_packed;
+  u8 consistent_qp : 1;
 } virtio_if_t;
 
 typedef struct

@@ -20,14 +20,14 @@ Anatomy of a test case
 **Prerequisites**:
 
 * Install hs-test dependencies with ``make install-deps``
-* Tests use *hs-test*'s own docker image, so building it before starting tests is a prerequisite. Run ``make build[-debug]`` to do so
-* Docker has to be installed and Go has to be in path of both the running user and root
+* `Install Go <https://go.dev/doc/install>`_, it has to be in path of both the running user (follow instructions on Go installation page) and root (run ``sudo visudo`` and edit ``secure_path`` line, run ``sudo go version`` to verify)
 * Root privileges are required to run tests as it uses Linux ``ip`` command for configuring topology
+* Tests use *hs-test*'s own docker image, they are rebuild automatically when needed, you can run ``make build[-debug]`` to do so or use ``FORCE_BUILD=true`` make parameter
 
 **Action flow when running a test case**:
 
 #. It starts with running ``make test``. Optional arguments are VERBOSE, PERSIST (topology configuration isn't cleaned up after test run, use ``make cleanup-hst`` to clean up),
-   TEST=<test-name> to run a specific test and PARALLEL=[n-cpus].
+   TEST=<test-name> to run a specific test and PARALLEL=[n-cpus]. If you want to run multiple specific tests, separate their names with a comma.
 #. ``make list-tests`` (or ``make help``) shows all tests.
 #. ``Ginkgo`` looks for a spec suite in the current directory and then compiles it to a .test binary.
 #. The Ginkgo test framework runs each function that was registered manually using ``Register[SuiteName]Test()``. Each of these functions correspond to a suite.
@@ -68,6 +68,10 @@ For adding a new suite, please see `Modifying the framework`_ below.
 Assumed are two docker containers, each with its own VPP instance running. One VPP then pings the other.
 This can be put in file ``extras/hs-test/my_test.go`` and run with command ``make test TEST=MyTest``.
 
+To add a multi-worker test, name it ``[name]MTTest``. Doing this, the framework will allocate 3 CPUs to a VPP container, no matter what ``CPUS`` is set to.
+Only a single multi-worker VPP container is supported for now. Please register multi-worker tests as Solo tests to avoid reusing the same cores
+when running in parallel.
+
 ::
 
         package main
@@ -77,17 +81,22 @@ This can be put in file ``extras/hs-test/my_test.go`` and run with command ``mak
         )
 
         func init(){
-                RegisterMySuiteTest(MyTest)
+                RegisterMySuiteTests(MyTest)
+                RegisterSoloMySuiteTests(MyMTTest)
+        }
+
+        func MyMTTest(s *MySuite){
+                MyTest(s)
         }
 
         func MyTest(s *MySuite) {
-                clientVpp := s.GetContainerByName("client-vpp").VppInstance
+                clientVpp := s.Containers.ClientVpp.VppInstance
 
-                serverVethAddress := s.NetInterfaces["server-iface"].Ip4AddressString()
+                serverVethAddress := s.Interfaces.Server.Ip4AddressString()
 
                 result := clientVpp.Vppctl("ping " + serverVethAddress)
-                s.Log(result)
                 s.AssertNotNil(result)
+                s.Log(result)
         }
 
 
@@ -100,6 +109,7 @@ The framework allows us to filter test cases in a few different ways, using ``ma
         * File name
         * Test name
         * All of the above as long as they are ordered properly, e.g. ``make test TEST=VethsSuite.http_test.go.HeaderServerTest``
+        * Multiple tests/suites: ``make test TEST=HttpClient,LdpSuite``
 
 **Names are case sensitive!**
 
@@ -128,8 +138,10 @@ Modifying the framework
 
 #. To add a new suite, create a new file in the ``infra/`` folder. Naming convention for the suite files is ``suite_[name].go``.
 
-#. Make a ``struct``, in the suite file, with at least ``HstSuite`` struct as its member.
-   HstSuite provides functionality that can be shared for all suites, like starting containers
+#. Make a ``struct``, in the suite file, with at least ``HstSuite``, ``Interfaces`` and ``Containers`` structs as its members.
+   HstSuite provides functionality that can be shared for all suites, like starting containers. ``Interfaces`` and ``Containers`` structs
+   are used to provide simpler access to interfaces and containers respectively. ``s.GetInterfaceByName([name])`` or ``s.GetContainerByName([name])``
+   should only be used to initialize interface and container struct fields within ``SetupSuite``.
 
 #. Create a new map that will contain a file name where a test is located and test functions with a pointer to the suite's struct: ``var myTests = map[string][]func(s *MySuite){}``
 
@@ -139,6 +151,16 @@ Modifying the framework
 
                 type MySuite struct {
                         HstSuite
+                        Interfaces struct {
+		                Server *NetInterface
+		                Client *NetInterface
+                                ...
+	                        }
+	                Containers struct {
+		                ServerVpp *Container
+		                ClientVpp *Container
+		                ...
+	                        }
                 }
 
 
@@ -153,12 +175,13 @@ Modifying the framework
 
 #. In suite file, implement ``SetupSuite`` method which Ginkgo runs once before starting any of the tests.
    It's important here to call ``ConfigureNetworkTopology()`` method,
-   pass the topology name to the function in a form of file name of one of the *yaml* files in ``topo-network`` folder.
-   Without the extension. In this example, *myTopology* corresponds to file ``extras/hs-test/topo-network/myTopology.yaml``
+   pass the topology name to the function in a form of file name of one of the *yaml* files in ``topo-network`` folder
+   without the extension. In this example, *myTopology* corresponds to file ``extras/hs-test/topo-network/myTopology.yaml``
    This will ensure network topology, such as network interfaces and namespaces, will be created.
    Another important method to call is ``LoadContainerTopology()`` which will load
    containers and shared volumes used by the suite. This time the name passed to method corresponds
-   to file in ``extras/hs-test/topo-containers`` folder
+   to file in ``extras/hs-test/topo-containers`` folder. Lastly, initialize ``Interfaces`` and ``Containers`` struct fields
+   using ``s.GetInterfaceByName("interfaceName")`` and ``s.GetContainerByName("containerName")``. Use the names that are defined in ``.yaml`` files
 
         ::
 
@@ -167,8 +190,11 @@ Modifying the framework
 
                         // Add custom setup code here
 
-                        s.ConfigureNetworkTopology("myTopology")
-                        s.LoadContainerTopology("2peerVeth")
+                        s.ConfigureNetworkTopology("myNetworkTopology")
+                        s.LoadContainerTopology("myContainerTopology")
+                        s.Interfaces.Server = s.GetInterfaceByName("interfaceName")
+                        s.Containers.ServerVpp = s.GetContainerByName("containerName")
+                        ...
                 }
 
 #. In suite file, implement ``SetupTest`` method which gets executed before each test. Starting containers and
@@ -216,7 +242,7 @@ Modifying the framework
         			It(testName, func(ctx SpecContext) {
         				s.Log(testName + ": BEGIN")
         				test(&s)
-        			}, SpecTimeout(SuiteTimeout))
+        			}, SpecTimeout(TestTimeout))
         		}
         	}
                 })
@@ -237,7 +263,7 @@ Modifying the framework
                         It(testName, Label("SOLO"), func(ctx SpecContext) {
                                 s.Log(testName + ": BEGIN")
 			        test(&s)
-		        }, SpecTimeout(time.Minute*5))
+		        }, SpecTimeout(TestTimeout))
                 })
 
 #. Next step is to add test cases to the suite. For that, see section `Adding a test case`_ above
@@ -293,7 +319,29 @@ Alternatively copy the executable from host system to the Docker image, similarl
 However the tests currently run under test suites which set up topology and containers before actual test is run. For the reason of saving
 test run time it is not advisable to use aforementioned skip methods and instead, just don't register the test.
 
-**Debugging a test**
+**External dependencies**
+
+* Linux tools ``ip``, ``brctl``
+* Standalone programs ``wget``, ``iperf3`` - since these are downloaded when Docker image is made,
+  they are reasonably up-to-date automatically
+* Programs in Docker images  - ``envoyproxy/envoy-contrib`` and ``nginx``
+* ``http_server`` - homegrown application that listens on specified port and sends a test file in response
+* Non-standard Go libraries - see ``extras/hs-test/go.mod``
+
+Generally, these will be updated on a per-need basis, for example when a bug is discovered
+or a new version incompatibility issue occurs.
+
+Debugging a test
+----------------
+
+DRYRUN
+^^^^^^
+
+``make test TEST=[name] DRYRUN=true`` will setup and start most of the containers, but won't run any tests or start VPP. VPP and interfaces will be
+configured automatically once you start VPP with the generated startup.conf file.
+
+GDB
+^^^
 
 It is possible to debug VPP by attaching ``gdb`` before test execution by adding ``DEBUG=true`` like follows:
 
@@ -307,18 +355,70 @@ It is possible to debug VPP by attaching ``gdb`` before test execution by adding
 
 If a test consists of more VPP instances then this is done for each of them.
 
+Utility methods
+^^^^^^^^^^^^^^^
 
-**Eternal dependencies**
+**Packet Capture**
 
-* Linux tools ``ip``, ``brctl``
-* Standalone programs ``wget``, ``iperf3`` - since these are downloaded when Docker image is made,
-  they are reasonably up-to-date automatically
-* Programs in Docker images  - ``envoyproxy/envoy-contrib`` and ``nginx``
-* ``http_server`` - homegrown application that listens on specified port and sends a test file in response
-* Non-standard Go libraries - see ``extras/hs-test/go.mod``
+It is possible to use VPP pcap trace to capture received and sent packets.
+You just need to add ``EnablePcapTrace`` to ``SetupTest`` method in test suite and ``CollectPcapTrace`` to ``TearDownTest``.
+This way pcap trace is enabled on all interfaces and to capture maximum 10000 packets.
+Your pcap file will be located in the test execution directory.
 
-Generally, these will be updated on a per-need basis, for example when a bug is discovered
-or a new version incompatibility issue occurs.
+**Event Logger**
+
+``clib_warning`` is a handy way to add debugging output, but in some cases it's not appropriate for per-packet use in data plane code.
+In this case VPP event logger is better option, for example you can enable it for TCP or session layer in build time.
+To collect traces when test ends you just need to add ``CollectEventLogs`` method to ``TearDownTest`` in the test suite.
+Your event logger file will be located in the test execution directory.
+To view events you can use :ref:`G2 graphical event viewer <eventviewer>` or ``convert_evt`` tool, located in ``src/scripts/host-stack/``,
+which convert event logs to human readable text.
+
+Memory leak testing
+^^^^^^^^^^^^^^^^^^^
+
+It is possible to use VPP memory traces to diagnose if and where memory leaks happen by comparing of two traces at different point in time.
+You can do it by test like following:
+
+::
+
+    func MemLeakTest(s *NoTopoSuite) {
+    	s.SkipUnlessLeakCheck()  // test is excluded from usual test run
+    	vpp := s.Containers.Vpp.VppInstance
+    	/* do your configuration here */
+    	vpp.Disconnect()  // no goVPP less noise
+    	vpp.EnableMemoryTrace()  // enable memory traces
+    	traces1, err := vpp.GetMemoryTrace()  // get first sample
+    	s.AssertNil(err, fmt.Sprint(err))
+    	vpp.Vppctl("test mem-leak")  // execute some action
+    	traces2, err := vpp.GetMemoryTrace()  // get second sample
+    	s.AssertNil(err, fmt.Sprint(err))
+    	vpp.MemLeakCheck(traces1, traces2)  // compare samples and generate report
+    }
+
+To get your memory leak report run following command:
+
+::
+
+    $ make test-leak TEST=MemLeakTest
+    ...
+    NoTopoSuiteSolo mem_leak_test.go/MemLeakTest [SOLO]
+    /home/matus/vpp/extras/hs-test/infra/suite_no_topo.go:113
+
+      Report Entries >>
+
+      SUMMARY: 112 byte(s) leaked in 1 allocation(s)
+       - /home/matus/vpp/extras/hs-test/infra/vppinstance.go:624 @ 07/19/24 15:53:33.539
+
+        leak of 112 byte(s) in 1 allocation(s) from:
+            #0 clib_mem_heap_alloc_aligned + 0x31
+            #1 _vec_alloc_internal + 0x113
+            #2 _vec_validate + 0x81
+            #3 leak_memory_fn + 0x4f
+            #4 0x7fc167815ac3
+            #5 0x7fc1678a7850
+      << Report Entries
+    ------------------------------
 
 
 .. _ginkgo: https://onsi.github.io/ginkgo/

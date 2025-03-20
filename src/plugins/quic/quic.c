@@ -250,7 +250,6 @@ quic_init_crypto_context (crypto_context_t * crctx, quic_ctx_t * ctx)
   ptls_ctx->cipher_suites = qm->quic_ciphers[ctx->crypto_engine];
   ptls_ctx->certificates.list = NULL;
   ptls_ctx->certificates.count = 0;
-  ptls_ctx->esni = NULL;
   ptls_ctx->on_client_hello = NULL;
   ptls_ctx->emit_certificate = NULL;
   ptls_ctx->sign_certificate = NULL;
@@ -508,8 +507,7 @@ quic_set_udp_tx_evt (session_t * udp_session)
 {
   int rv = 0;
   if (svm_fifo_set_event (udp_session->tx_fifo))
-    rv = session_send_io_evt_to_thread (udp_session->tx_fifo,
-					SESSION_IO_EVT_TX);
+    rv = session_program_tx_io_evt (udp_session->handle, SESSION_IO_EVT_TX);
   if (PREDICT_FALSE (rv))
     clib_warning ("Event enqueue errored %d", rv);
 }
@@ -718,7 +716,6 @@ quic_send_packets (quic_ctx_t * ctx)
   session_t *udp_session;
   quicly_conn_t *conn;
   size_t num_packets, i, max_packets;
-  quicly_address_t dest, src;
   u32 n_sent = 0;
   int err = 0;
 
@@ -744,17 +741,16 @@ quic_send_packets (quic_ctx_t * ctx)
 	break;
 
       num_packets = max_packets;
-      if ((err = quicly_send (conn, &dest, &src, packets, &num_packets, buf,
-			      sizeof (buf))))
+      if ((err = quicly_send (conn, &ctx->rmt_ip, &ctx->lcl_ip, packets,
+			      &num_packets, buf, sizeof (buf))))
 	goto quicly_error;
 
       for (i = 0; i != num_packets; ++i)
 	{
 
-	  if ((err =
-		 quic_send_datagram (udp_session, &packets[i], &dest, &src)))
-	    goto quicly_error;
-
+	  if ((err = quic_send_datagram (udp_session, &packets[i],
+					 &ctx->rmt_ip, &ctx->lcl_ip)))
+	  goto quicly_error;
 	}
       n_sent += num_packets;
     }
@@ -1157,10 +1153,10 @@ quic_update_timer (quic_ctx_t * ctx)
 	  quic_session = session_get (ctx->c_s_index, ctx->c_thread_index);
 	  if (svm_fifo_set_event (quic_session->tx_fifo))
 	    {
-	      rv = session_send_io_evt_to_thread_custom (
-		quic_session, quic_session->thread_index, SESSION_IO_EVT_TX);
-	      if (PREDICT_FALSE (rv))
-		QUIC_ERR ("Failed to enqueue builtin_tx %d", rv);
+	    rv = session_program_tx_io_evt (quic_session->handle,
+					    SESSION_IO_EVT_TX);
+	    if (PREDICT_FALSE (rv))
+	      QUIC_ERR ("Failed to enqueue builtin_tx %d", rv);
 	    }
 	  return;
 	}
@@ -1332,14 +1328,16 @@ quic_connect_connection (session_endpoint_cfg_t * sep)
   quic_ctx_t *ctx;
   app_worker_t *app_wrk;
   application_t *app;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int error;
 
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (!ext_cfg)
     return SESSION_E_NOEXTCFG;
 
   /* Use pool on thread 1 if we have workers because of UDP */
   thread_index = transport_cl_thread ();
-  ccfg = &sep->ext_cfg->crypto;
+  ccfg = &ext_cfg->crypto;
 
   clib_memset (cargs, 0, sizeof (*cargs));
   ctx_index = quic_ctx_alloc (thread_index);
@@ -1475,13 +1473,15 @@ quic_start_listen (u32 quic_listen_session_index,
   quic_ctx_t *lctx;
   u32 lctx_index;
   app_listener_t *app_listener;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
 
   sep = (session_endpoint_cfg_t *) tep;
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (!ext_cfg)
     return SESSION_E_NOEXTCFG;
 
-  ccfg = &sep->ext_cfg->crypto;
+  ccfg = &ext_cfg->crypto;
   app_wrk = app_worker_get (sep->app_wrk_index);
   app = application_get (app_wrk->app_index);
   QUIC_DBG (2, "Called quic_start_listen for app %d", app_wrk->app_index);
@@ -1844,10 +1844,10 @@ quic_udp_session_connected_callback (u32 quic_app_index, u32 ctx_index,
   quic_build_sockaddr (sa, &salen, &tc->rmt_ip, tc->rmt_port, tc->is_ip4);
 
   quicly_ctx = quic_get_quicly_ctx_from_ctx (ctx);
-  ret = quicly_connect (&ctx->conn, quicly_ctx, (char *) ctx->srv_hostname,
-			sa, NULL, &quic_main.wrk_ctx[thread_index].next_cid,
+  ret = quicly_connect (&ctx->conn, quicly_ctx, (char *) ctx->srv_hostname, sa,
+			NULL, &quic_main.wrk_ctx[thread_index].next_cid,
 			ptls_iovec_init (NULL, 0), &quic_main.hs_properties,
-			NULL);
+			NULL, NULL);
   ++quic_main.wrk_ctx[thread_index].next_cid.master_id;
   /*  Save context handle in quicly connection */
   quic_store_conn_ctx (ctx->conn, ctx);
@@ -2099,10 +2099,9 @@ quic_accept_connection (quic_rx_packet_ctx_t * pctx)
     }
 
   quicly_ctx = quic_get_quicly_ctx_from_ctx (ctx);
-  if ((rv = quicly_accept (&conn, quicly_ctx, NULL, &pctx->sa,
-			   &pctx->packet, NULL,
-			   &quic_main.wrk_ctx[pctx->thread_index].next_cid,
-			   NULL)))
+  if ((rv = quicly_accept (
+	 &conn, quicly_ctx, NULL, &pctx->sa, &pctx->packet, NULL,
+	 &quic_main.wrk_ctx[pctx->thread_index].next_cid, NULL, NULL)))
     {
       /* Invalid packet, pass */
       assert (conn == NULL);
@@ -2188,12 +2187,8 @@ quic_reset_connection (u64 udp_session_handle, quic_rx_packet_ctx_t * pctx)
   packet.iov_len = payload_len;
   packet.iov_base = payload;
 
-  struct _st_quicly_conn_public_t *conn =
-    (struct _st_quicly_conn_public_t *) qctx->conn;
-
   udp_session = session_get_from_handle (udp_session_handle);
-  rv = quic_send_datagram (udp_session, &packet, &conn->remote.address,
-			   &conn->local.address);
+  rv = quic_send_datagram (udp_session, &packet, &qctx->rmt_ip, &qctx->lcl_ip);
   quic_set_udp_tx_evt (udp_session);
   return rv;
 }

@@ -418,7 +418,7 @@ create_sl (ip6_sr_policy_t *sr_policy, ip6_address_t *sl,
     {
       plugin =
 	pool_elt_at_index (sm->policy_plugin_functions,
-			   sr_policy->plugin - SR_BEHAVIOR_LAST);
+			   sr_policy->plugin - SR_BEHAVIOR_CURRENT_LAST);
 
       segment_list->plugin = sr_policy->plugin;
       segment_list->plugin_mem = sr_policy->plugin_mem;
@@ -503,8 +503,9 @@ update_lb (ip6_sr_policy_t * sr_policy)
       };
 
       /* Add FIB entry for BSID */
-      fhc = fib_table_get_flow_hash_config (sr_policy->fib_table,
-					    FIB_PROTOCOL_IP6);
+      fhc = fib_table_get_flow_hash_config (
+	fib_table_find (FIB_PROTOCOL_IP6, sr_policy->fib_table),
+	FIB_PROTOCOL_IP6);
 
       dpo_set (&sr_policy->bsid_dpo, DPO_LOAD_BALANCE, DPO_PROTO_IP6,
 	       load_balance_create (0, DPO_PROTO_IP6, fhc));
@@ -828,7 +829,7 @@ sr_policy_del (ip6_address_t * bsid, u32 index)
 
       plugin =
 	pool_elt_at_index (sm->policy_plugin_functions,
-			   sr_policy->plugin - SR_BEHAVIOR_LAST);
+			   sr_policy->plugin - SR_BEHAVIOR_CURRENT_LAST);
 
       plugin->removal (sr_policy);
       sr_policy->plugin = 0;
@@ -3499,7 +3500,7 @@ sr_policy_register_function (vlib_main_t * vm, u8 * fn_name,
   clib_memset (plugin, 0, sizeof (*plugin));
 
   plugin->sr_policy_function_number = (plugin - sm->policy_plugin_functions);
-  plugin->sr_policy_function_number += SR_BEHAVIOR_LAST;
+  plugin->sr_policy_function_number += SR_BEHAVIOR_CURRENT_LAST;
   plugin->prefix_length = prefix_length;
   plugin->ls_format = ls_format;
   plugin->ls_unformat = ls_unformat;

@@ -75,6 +75,8 @@ vcl_mq_epoll_add_evfd (vcl_worker_t * wrk, svm_msg_q_t * mq)
   mqc->mq_fd = mq_fd;
   mqc->mq = mq;
 
+  fcntl (mq_fd, F_SETFL, O_NONBLOCK);
+
   e.events = EPOLLIN;
   e.data.u32 = mqc_index;
   if (epoll_ctl (wrk->mqs_epfd, EPOLL_CTL_ADD, mq_fd, &e) < 0)
@@ -199,17 +201,17 @@ vcl_worker_detach_sessions (vcl_worker_t *wrk)
     {
       if (s->session_state == VCL_STATE_LISTEN)
 	{
-	  s->session_state = VCL_STATE_LISTEN_NO_MQ;
+	  s->flags |= VCL_SESSION_F_LISTEN_NO_MQ;
 	  continue;
 	}
       if ((s->flags & VCL_SESSION_F_IS_VEP) ||
-	  s->session_state == VCL_STATE_LISTEN_NO_MQ ||
 	  s->session_state == VCL_STATE_CLOSED)
 	continue;
 
       hash_set (seg_indices_map, s->tx_fifo->segment_index, 1);
 
       s->session_state = VCL_STATE_DETACHED;
+      s->flags |= VCL_SESSION_F_APP_CLOSING;
       vec_add2 (wrk->unhandled_evts_vector, e, 1);
       e->event_type = SESSION_CTRL_EVT_DISCONNECTED;
       e->session_index = s->session_index;
@@ -219,13 +221,33 @@ vcl_worker_detach_sessions (vcl_worker_t *wrk)
   hash_foreach (seg_index, val, seg_indices_map,
 		({ vec_add1 (seg_indices, seg_index); }));
 
+  /* If multi-threaded apps, wait for all threads to hopefully finish
+   * their blocking operations  */
+  if (wrk->pre_wait_fn)
+    wrk->pre_wait_fn (VCL_INVALID_SESSION_INDEX);
+  sleep (1);
+  if (wrk->post_wait_fn)
+    wrk->post_wait_fn (VCL_INVALID_SESSION_INDEX);
+
   vcl_segment_detach_segments (seg_indices);
 
   /* Detach worker's mqs segment */
   vcl_segment_detach (vcl_vpp_worker_segment_handle (wrk->wrk_index));
 
+  wrk->app_event_queue = 0;
+  wrk->ctrl_mq = 0;
+
   vec_free (seg_indices);
   hash_free (seg_indices_map);
+}
+
+void
+vcl_worker_set_wait_mq_fns (vcl_worker_wait_mq_fn pre_wait,
+			    vcl_worker_wait_mq_fn post_wait)
+{
+  vcl_worker_t *wrk = vcl_worker_get_current ();
+  wrk->pre_wait_fn = pre_wait;
+  wrk->post_wait_fn = post_wait;
 }
 
 vcl_worker_t *
@@ -336,7 +358,7 @@ vcl_session_read_ready (vcl_session_t * s)
 	  max_deq = svm_fifo_max_dequeue_cons (s->rx_fifo);
 	  if (max_deq <= SESSION_CONN_HDR_LEN)
 	    return 0;
-	  if (svm_fifo_peek (s->rx_fifo, 0, sizeof (ph), (u8 *) & ph) < 0)
+	  if (svm_fifo_peek (s->rx_fifo, 0, sizeof (ph), (u8 *) &ph) < 0)
 	    return 0;
 	  if (ph.data_length + SESSION_CONN_HDR_LEN > max_deq)
 	    return 0;
@@ -353,8 +375,41 @@ vcl_session_read_ready (vcl_session_t * s)
     }
   else
     {
-      return (s->session_state == VCL_STATE_DISCONNECT) ?
-	VPPCOM_ECONNRESET : VPPCOM_ENOTCONN;
+      return (s->session_state == VCL_STATE_DISCONNECT) ? VPPCOM_ECONNRESET :
+							  VPPCOM_ENOTCONN;
+    }
+}
+
+/**
+ * Used as alternative to vcl_session_read_ready to avoid peeking udp sessions.
+ * Multi-threaded applications could select the same session from multiple
+ * threads */
+int
+vcl_session_read_ready2 (vcl_session_t *s)
+{
+  if (vcl_session_is_open (s))
+    {
+      if (vcl_session_is_ct (s))
+	return svm_fifo_max_dequeue_cons (s->ct_rx_fifo);
+
+      if (s->is_dgram)
+	{
+	  if (svm_fifo_max_dequeue_cons (s->rx_fifo) <= SESSION_CONN_HDR_LEN)
+	    return 0;
+
+	  /* Return 1 even if not yet sure if a full datagram was received */
+	  return 1;
+	}
+
+      return svm_fifo_max_dequeue_cons (s->rx_fifo);
+    }
+  else if (s->session_state == VCL_STATE_LISTEN)
+    {
+      return clib_fifo_elts (s->accept_evts_fifo);
+    }
+  else
+    {
+      return 1;
     }
 }
 
@@ -556,8 +611,12 @@ vcl_segment_attach_session (uword segment_handle, uword rxf_offset,
 
   if (!is_ct)
     {
+      rxf->vpp_session_index = rxf->shr->master_session_index;
+      txf->vpp_session_index = txf->shr->master_session_index;
       rxf->shr->client_session_index = s->session_index;
       txf->shr->client_session_index = s->session_index;
+      rxf->app_session_index = s->session_index;
+      txf->app_session_index = s->session_index;
       rxf->client_thread_index = vcl_get_worker_index ();
       txf->client_thread_index = vcl_get_worker_index ();
       s->rx_fifo = rxf;
@@ -724,9 +783,6 @@ vcl_session_state_str (vcl_session_state_t state)
       break;
     case VCL_STATE_UPDATED:
       st = "STATE_UPDATED";
-      break;
-    case VCL_STATE_LISTEN_NO_MQ:
-      st = "STATE_LISTEN_NO_MQ";
       break;
     default:
       st = "UNKNOWN_STATE";

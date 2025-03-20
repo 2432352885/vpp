@@ -550,6 +550,9 @@ typedef struct
   /* logging level */
   ikev2_log_level_t log_level;
 
+  /* sleep interval for ikev2_manager_process node, in seconds */
+  f64 sleep_interval;
+
   /* how often a liveness check will be performed */
   u32 liveness_period;
 
@@ -570,6 +573,12 @@ typedef struct
 
   /* punt handle for IPsec NATT IPSEC_PUNT_IP4_SPI_UDP_0 reason */
   vlib_punt_hdl_t punt_hdl;
+
+  /** Worker handoff */
+  u32 handoff_thread;
+  u32 handoff_ip4_fq_index;
+  u32 handoff_ip4_natt_fq_index;
+  u32 handoff_ip6_fq_index;
 
 } ikev2_main_t;
 

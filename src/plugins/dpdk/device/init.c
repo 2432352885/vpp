@@ -227,70 +227,70 @@ dpdk_find_startup_config (struct rte_eth_dev_info *di)
 }
 
 /*
- * Initialise or refresh the xstats counters for a device
+ * Initialise the xstats counters for a device
  */
 void
 dpdk_counters_xstats_init (dpdk_device_t *xd)
 {
   int len, ret, i;
   struct rte_eth_xstat_name *xstats_names = 0;
-  char *name;
-  dpdk_driver_t *dr = xd->driver;
 
-  /* Only support xstats for supported drivers */
-  if (!dr)
-    return;
+  if (vec_len (xd->xstats_symlinks) > 0)
+    {
+      /* xstats already initialized. Reset counters */
+      vec_foreach_index (i, xd->xstats_symlinks)
+	{
+	  vlib_stats_remove_entry (xd->xstats_symlinks[i]);
+	}
+    }
+  else
+    {
+      xd->xstats_counters.stat_segment_name =
+	(char *) format (0, "/if/xstats/%d%c", xd->sw_if_index, 0);
+      xd->xstats_counters.counters = 0;
+    }
 
   len = rte_eth_xstats_get_names (xd->port_id, 0, 0);
   if (len < 0)
     {
-      dpdk_log_err ("[%u] rte_eth_xstats_get_names failed: %d", xd->port_id,
-		    len);
-      return;
-    }
-  /* Counters for this driver is already initialised */
-  if (vec_len (dr->xstats_counters) == len)
-    {
-      vec_foreach_index (i, dr->xstats_counters)
-	{
-	  vlib_validate_simple_counter (&dr->xstats_counters[i],
-					xd->sw_if_index);
-	  vlib_zero_simple_counter (&dr->xstats_counters[i], xd->sw_if_index);
-	}
+      dpdk_log_err ("[%u] rte_eth_xstats_get_names failed: %d. DPDK xstats "
+		    "not configured.",
+		    xd->port_id, len);
       return;
     }
 
-  /* Same driver, different interface, different length of counter array. */
-  ASSERT (vec_len (dr->xstats_counters) == 0);
+  vlib_validate_simple_counter (&xd->xstats_counters, len);
+  vlib_zero_simple_counter (&xd->xstats_counters, len);
 
   vec_validate (xstats_names, len - 1);
+  vec_validate (xd->xstats, len - 1);
+  vec_validate (xd->xstats_symlinks, len - 1);
 
   ret = rte_eth_xstats_get_names (xd->port_id, xstats_names, len);
   if (ret >= 0 && ret <= len)
     {
-      vec_validate (dr->xstats_counters, len - 1);
       vec_foreach_index (i, xstats_names)
 	{
-	  name = (char *) format (0, "/if/%s/%s%c", dr->drivers->name,
-				  xstats_names[i].name, 0);
-
 	  /* There is a bug in the ENA driver where the xstats names are not
 	   * unique. */
-	  if (vlib_stats_find_entry_index (name) != STAT_SEGMENT_INDEX_INVALID)
+	  xd->xstats_symlinks[i] = vlib_stats_add_symlink (
+	    xd->xstats_counters.stats_entry_index, i, "/interfaces/%U/%s%c",
+	    format_vnet_sw_if_index_name, vnet_get_main (), xd->sw_if_index,
+	    xstats_names[i].name, 0);
+	  if (xd->xstats_symlinks[i] == STAT_SEGMENT_INDEX_INVALID)
 	    {
-	      vec_free (name);
-	      name = (char *) format (0, "/if/%s/%s_%d%c", dr->drivers->name,
-				      xstats_names[i].name, i, 0);
+	      xd->xstats_symlinks[i] = vlib_stats_add_symlink (
+		xd->xstats_counters.stats_entry_index, i,
+		"/interfaces/%U/%s_%d%c", format_vnet_sw_if_index_name,
+		vnet_get_main (), xd->sw_if_index, xstats_names[i].name, i, 0);
 	    }
-
-	  dr->xstats_counters[i].name = name;
-	  dr->xstats_counters[i].stat_segment_name = name;
-	  dr->xstats_counters[i].counters = 0;
-	  vlib_validate_simple_counter (&dr->xstats_counters[i],
-					xd->sw_if_index);
-	  vlib_zero_simple_counter (&dr->xstats_counters[i], xd->sw_if_index);
-	  vec_free (name);
 	}
+    }
+  else
+    {
+      dpdk_log_err ("[%u] rte_eth_xstats_get_names failed: %d. DPDK xstats "
+		    "not configured.",
+		    xd->port_id, ret);
     }
   vec_free (xstats_names);
 }
@@ -390,6 +390,8 @@ dpdk_lib_init (dpdk_main_t * dm)
 	    dpdk_device_flag_set (xd, DPDK_DEVICE_FLAG_INTEL_PHDR_CKSUM, 1);
 	  if (dr->int_unmaskable)
 	    dpdk_device_flag_set (xd, DPDK_DEVICE_FLAG_INT_UNMASKABLE, 1);
+	  if (dr->need_tx_prepare)
+	    dpdk_device_flag_set (xd, DPDK_DEVICE_FLAG_TX_PREPARE, 1);
 	}
       else
 	dpdk_log_warn ("[%u] unknown driver '%s'", port_id, di.driver_name);
@@ -503,6 +505,14 @@ dpdk_lib_init (dpdk_main_t * dm)
       else if (dr && dr->n_tx_desc)
 	xd->conf.n_tx_desc = dr->n_tx_desc;
 
+      if (xd->conf.n_tx_desc > di.tx_desc_lim.nb_max)
+	{
+	  dpdk_log_warn ("[%u] Configured number of TX descriptors (%u) is "
+			 "bigger than maximum supported (%u)",
+			 port_id, xd->conf.n_tx_desc, di.tx_desc_lim.nb_max);
+	  xd->conf.n_tx_desc = di.tx_desc_lim.nb_max;
+	}
+
       dpdk_log_debug (
 	"[%u] n_rx_queues: %u n_tx_queues: %u n_rx_desc: %u n_tx_desc: %u",
 	port_id, xd->conf.n_rx_queues, xd->conf.n_tx_queues,
@@ -587,6 +597,9 @@ dpdk_lib_init (dpdk_main_t * dm)
 
       if (devconf->max_lro_pkt_size)
 	xd->conf.max_lro_pkt_size = devconf->max_lro_pkt_size;
+
+      if (devconf->disable_rxq_int)
+	xd->conf.enable_rxq_int = 0;
 
       dpdk_device_setup (xd);
 
@@ -729,7 +742,8 @@ dpdk_bind_devices_to_uio (dpdk_config_main_t * conf)
       ;
     /* Cisco VIC */
     else if (d->vendor_id == 0x1137 &&
-        (d->device_id == 0x0043 || d->device_id == 0x0071))
+	     (d->device_id == 0x0043 || d->device_id == 0x0071 ||
+	      d->device_id == 0x02b7))
       ;
     /* Chelsio T4/T5 */
     else if (d->vendor_id == 0x1425 && (d->device_id & 0xe000) == 0x4000)
@@ -1006,6 +1020,10 @@ dpdk_device_config (dpdk_config_main_t *conf, void *addr,
 	  if (error)
 	    break;
 	}
+      else if (unformat (input, "no-rx-interrupts"))
+	{
+	  devconf->disable_rxq_int = 1;
+	}
       else if (unformat (input, "tso on"))
 	{
 	  devconf->tso = DPDK_DEVICE_TSO_ON;
@@ -1122,6 +1140,7 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
 #ifdef __linux
   vlib_thread_main_t *tm = vlib_get_thread_main ();
   uword default_hugepage_sz, x;
+  u8 file_prefix = 0;
 #endif /* __linux__ */
   u8 *s, *tmp = 0;
   int ret, i;
@@ -1129,7 +1148,6 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
   int eal_no_hugetlb = 0;
   u8 no_pci = 0;
   u8 no_vmbus = 0;
-  u8 file_prefix = 0;
   u8 *socket_mem = 0;
   u32 vendor, device, domain, bus, func;
   void *fmt_func;
@@ -1289,6 +1307,7 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
         }
       foreach_eal_double_hyphen_predicate_arg
 #undef _
+#ifdef __linux__
 #define _(a)                                          \
 	else if (unformat(input, #a " %s", &s))	      \
 	  {					      \
@@ -1304,6 +1323,7 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
 	  }
 	foreach_eal_double_hyphen_arg
 #undef _
+#endif /* __linux__ */
 #define _(a,b)						\
 	  else if (unformat(input, #a " %s", &s))	\
 	    {						\
@@ -1502,10 +1522,12 @@ dpdk_update_link_state (dpdk_device_t * xd, f64 now)
   struct rte_eth_link prev_link = xd->link;
   u32 hw_flags = 0;
   u8 hw_flags_chg = 0;
+  int __clib_unused rv;
 
   xd->time_last_link_update = now ? now : xd->time_last_link_update;
   clib_memset (&xd->link, 0, sizeof (xd->link));
-  rte_eth_link_get_nowait (xd->port_id, &xd->link);
+  rv = rte_eth_link_get_nowait (xd->port_id, &xd->link);
+  ASSERT (rv == 0);
 
   if (LINK_STATE_ELOGS)
     {

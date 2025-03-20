@@ -16,6 +16,8 @@
 #include <vnet/session/application_interface.h>
 #include <vnet/session/session.h>
 #include <http/http.h>
+#include <http/http_content_types.h>
+#include <http/http_status_codes.h>
 
 #define HCC_DEBUG 0
 
@@ -32,14 +34,13 @@ typedef struct
   u32 thread_index;
   u32 rx_offset;
   u32 vpp_session_index;
-  u32 to_recv;
+  u64 to_recv;
   u8 is_closed;
 } hcc_session_t;
 
 typedef struct
 {
   hcc_session_t *sessions;
-  u8 *rx_buf;
   u32 thread_index;
 } hcc_worker_t;
 
@@ -61,6 +62,8 @@ typedef struct
   u8 *http_response;
   u8 *appns_id;
   u64 appns_secret;
+  u32 ckpair_index;
+  u8 need_crypto;
 } hcc_main_t;
 
 typedef enum
@@ -96,10 +99,10 @@ hcc_session_get (u32 hs_index, u32 thread_index)
 }
 
 static void
-hcc_session_free (u32 thread_index, hcc_session_t *hs)
+hcc_ho_session_free (u32 hs_index)
 {
-  hcc_worker_t *wrk = hcc_worker_get (thread_index);
-  pool_put (wrk->sessions, hs);
+  hcc_worker_t *wrk = hcc_worker_get (0);
+  pool_put_index (wrk->sessions, hs_index);
 }
 
 static int
@@ -128,9 +131,12 @@ hcc_ts_connected_callback (u32 app_index, u32 hc_index, session_t *as,
   hcc_session_t *hs, *new_hs;
   hcc_worker_t *wrk;
   http_msg_t msg;
+  u8 *headers_buf = 0;
+  u32 new_hs_index;
   int rv;
+  http_headers_ctx_t headers;
 
-  HCC_DBG ("hc_index: %d", hc_index);
+  HCC_DBG ("ho hc_index: %d", hc_index);
 
   if (err)
     {
@@ -141,32 +147,51 @@ hcc_ts_connected_callback (u32 app_index, u32 hc_index, session_t *as,
       return -1;
     }
 
-  /* TODO delete half open session once the support is added in http layer */
   hs = hcc_session_get (hc_index, 0);
   wrk = hcc_worker_get (as->thread_index);
   new_hs = hcc_session_alloc (wrk);
+  new_hs_index = new_hs->session_index;
   clib_memcpy_fast (new_hs, hs, sizeof (*hs));
+  new_hs->session_index = new_hs_index;
+  new_hs->thread_index = as->thread_index;
+  new_hs->vpp_session_index = as->session_index;
+  HCC_DBG ("new hc_index: %d", new_hs->session_index);
+  as->opaque = new_hs_index;
 
-  hs->vpp_session_index = as->session_index;
+  vec_validate (headers_buf, 63);
+  http_init_headers_ctx (&headers, headers_buf, vec_len (headers_buf));
+  http_add_header (&headers, HTTP_HEADER_ACCEPT,
+		   http_content_type_token (HTTP_CONTENT_TEXT_HTML));
 
   msg.type = HTTP_MSG_REQUEST;
   msg.method_type = HTTP_REQ_GET;
-  msg.content_type = HTTP_CONTENT_TEXT_HTML;
+  /* request target */
+  msg.data.target_path_offset = 0;
+  msg.data.target_path_len = vec_len (hcm->http_query);
+  /* custom headers */
+  msg.data.headers_offset = msg.data.target_path_len;
+  msg.data.headers_len = headers.tail_offset;
+  /* request body */
+  msg.data.body_len = 0;
+  /* data type and total length */
   msg.data.type = HTTP_MSG_DATA_INLINE;
-  msg.data.len = vec_len (hcm->http_query);
+  msg.data.len =
+    msg.data.target_path_len + msg.data.headers_len + msg.data.body_len;
 
-  svm_fifo_seg_t segs[2] = { { (u8 *) &msg, sizeof (msg) },
-			     { hcm->http_query, vec_len (hcm->http_query) } };
+  svm_fifo_seg_t segs[3] = { { (u8 *) &msg, sizeof (msg) },
+			     { hcm->http_query, vec_len (hcm->http_query) },
+			     { headers_buf, msg.data.headers_len } };
 
-  rv = svm_fifo_enqueue_segments (as->tx_fifo, segs, 2, 0 /* allow partial */);
-  if (rv < 0 || rv != sizeof (msg) + vec_len (hcm->http_query))
+  rv = svm_fifo_enqueue_segments (as->tx_fifo, segs, 3, 0 /* allow partial */);
+  vec_free (headers_buf);
+  if (rv < 0 || rv != sizeof (msg) + msg.data.len)
     {
       clib_warning ("failed app enqueue");
       return -1;
     }
 
   if (svm_fifo_set_event (as->tx_fifo))
-    session_send_io_evt_to_thread (as->tx_fifo, SESSION_IO_EVT_TX);
+    session_program_tx_io_evt (as->handle, SESSION_IO_EVT_TX);
 
   return 0;
 }
@@ -221,23 +246,32 @@ hcc_ts_rx_callback (session_t *ts)
 
   if (hs->to_recv == 0)
     {
+      /* read the http message header */
       rv = svm_fifo_dequeue (ts->rx_fifo, sizeof (msg), (u8 *) &msg);
       ASSERT (rv == sizeof (msg));
 
-      if (msg.type != HTTP_MSG_REPLY || msg.code != HTTP_STATUS_OK)
+      if (msg.type != HTTP_MSG_REPLY)
 	{
 	  clib_warning ("unexpected msg type %d", msg.type);
 	  return 0;
 	}
-      vec_validate (hcm->http_response, msg.data.len - 1);
+      /* drop everything up to body */
+      svm_fifo_dequeue_drop (ts->rx_fifo, msg.data.body_offset);
+      hs->to_recv = msg.data.body_len;
+      if (msg.code != HTTP_STATUS_OK && hs->to_recv == 0)
+	{
+	  hcm->http_response = format (0, "request failed, response code: %U",
+				       format_http_status_code, msg.code);
+	  goto done;
+	}
+      vec_validate (hcm->http_response, msg.data.body_len - 1);
       vec_reset_length (hcm->http_response);
-      hs->to_recv = msg.data.len;
     }
 
   u32 max_deq = svm_fifo_max_dequeue (ts->rx_fifo);
 
   u32 n_deq = clib_min (hs->to_recv, max_deq);
-  u32 curr = vec_len (hcm->http_response);
+  u64 curr = vec_len (hcm->http_response);
   rv = svm_fifo_dequeue (ts->rx_fifo, n_deq, hcm->http_response + curr);
   if (rv < 0)
     {
@@ -251,28 +285,18 @@ hcc_ts_rx_callback (session_t *ts)
   vec_set_len (hcm->http_response, curr + n_deq);
   ASSERT (hs->to_recv >= rv);
   hs->to_recv -= rv;
-  HCC_DBG ("app rcvd %d, remains %d", rv, hs->to_recv);
+  HCC_DBG ("app rcvd %d, remains %llu", rv, hs->to_recv);
 
+done:
   if (hs->to_recv == 0)
     {
+      HCC_DBG ("all data received, going to disconnect");
       hcc_session_disconnect (ts);
       vlib_process_signal_event_mt (hcm->vlib_main, hcm->cli_node_index,
 				    HCC_REPLY_RECEIVED, 0);
     }
 
   return 0;
-}
-
-static void
-hcc_ts_cleanup_callback (session_t *s, session_cleanup_ntf_t ntf)
-{
-  hcc_session_t *hs;
-
-  hs = hcc_session_get (s->thread_index, s->opaque);
-  if (!hs)
-    return;
-
-  hcc_session_free (s->thread_index, hs);
 }
 
 static void
@@ -286,6 +310,13 @@ hcc_ts_transport_closed (session_t *s)
 				HCC_TRANSPORT_CLOSED, 0);
 }
 
+static void
+hcc_ho_cleanup_callback (session_t *ts)
+{
+  HCC_DBG ("ho hc_index: %d:", ts->opaque);
+  hcc_ho_session_free (ts->opaque);
+}
+
 static session_cb_vft_t hcc_session_cb_vft = {
   .session_accept_callback = hcc_ts_accept_callback,
   .session_disconnect_callback = hcc_ts_disconnect_callback,
@@ -293,8 +324,8 @@ static session_cb_vft_t hcc_session_cb_vft = {
   .builtin_app_rx_callback = hcc_ts_rx_callback,
   .builtin_app_tx_callback = hcc_ts_tx_callback,
   .session_reset_callback = hcc_ts_reset_callback,
-  .session_cleanup_callback = hcc_ts_cleanup_callback,
   .session_transport_closed_callback = hcc_ts_transport_closed,
+  .half_open_cleanup_callback = hcc_ho_cleanup_callback,
 };
 
 static clib_error_t *
@@ -304,6 +335,7 @@ hcc_attach ()
   vnet_app_attach_args_t _a, *a = &_a;
   u64 options[18];
   u32 segment_size = 128 << 20;
+  vnet_app_add_cert_key_pair_args_t _ck_pair, *ck_pair = &_ck_pair;
   int rv;
 
   if (hcm->private_segment_size)
@@ -324,6 +356,7 @@ hcc_attach ()
     hcm->fifo_size ? hcm->fifo_size : 32 << 10;
   a->options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
   a->options[APP_OPTIONS_PREALLOC_FIFO_PAIRS] = hcm->prealloc_fifos;
+  a->options[APP_OPTIONS_TLS_ENGINE] = CRYPTO_ENGINE_OPENSSL;
   if (hcm->appns_id)
     {
       a->namespace_id = hcm->appns_id;
@@ -336,6 +369,15 @@ hcc_attach ()
   hcm->app_index = a->app_index;
   vec_free (a->name);
   hcm->test_client_attached = 1;
+
+  clib_memset (ck_pair, 0, sizeof (*ck_pair));
+  ck_pair->cert = (u8 *) test_srv_crt_rsa;
+  ck_pair->key = (u8 *) test_srv_key_rsa;
+  ck_pair->cert_len = test_srv_crt_rsa_len;
+  ck_pair->key_len = test_srv_key_rsa_len;
+  vnet_app_add_cert_key_pair (ck_pair);
+  hcm->ckpair_index = ck_pair->index;
+
   return 0;
 }
 
@@ -349,6 +391,7 @@ hcc_connect_rpc (void *rpc_args)
   if (rv)
     clib_warning (0, "connect returned: %U", format_session_error, rv);
 
+  session_endpoint_free_ext_cfgs (&a->sep_ext);
   vec_free (a);
   return rv;
 }
@@ -367,12 +410,27 @@ hcc_connect ()
   hcc_main_t *hcm = &hcc_main;
   hcc_worker_t *wrk;
   hcc_session_t *hs;
+  transport_endpt_ext_cfg_t *ext_cfg;
 
   vec_validate (a, 0);
   clib_memset (a, 0, sizeof (a[0]));
 
   clib_memcpy (&a->sep_ext, &hcm->connect_sep, sizeof (hcm->connect_sep));
   a->app_index = hcm->app_index;
+
+  /* set http (response) timeout to 10 seconds */
+  transport_endpt_cfg_http_t http_cfg = { 10, 0 };
+  ext_cfg = session_endpoint_add_ext_cfg (
+    &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
+  clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
+
+  if (hcm->need_crypto)
+    {
+      ext_cfg = session_endpoint_add_ext_cfg (
+	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	sizeof (transport_endpt_crypto_cfg_t));
+      ext_cfg->crypto.ckpair_index = hcm->ckpair_index;
+    }
 
   /* allocate http session on main thread */
   wrk = hcc_worker_get (0);
@@ -394,7 +452,7 @@ hcc_run (vlib_main_t *vm, int print_output)
   hcc_worker_t *wrk;
 
   num_threads = 1 /* main thread */ + vtm->n_threads;
-  vec_validate (hcm->wrk, num_threads);
+  vec_validate (hcm->wrk, num_threads - 1);
   vec_foreach (wrk, hcm->wrk)
     {
       wrk->thread_index = wrk - hcm->wrk;
@@ -423,7 +481,6 @@ hcc_run (vlib_main_t *vm, int print_output)
     case HCC_REPLY_RECEIVED:
       if (print_output)
 	vlib_cli_output (vm, "%v", hcm->http_response);
-      vec_free (hcm->http_response);
       break;
     case HCC_TRANSPORT_CLOSED:
       err = clib_error_return (0, "error, transport closed");
@@ -458,6 +515,28 @@ hcc_detach ()
   hcm->app_index = ~0;
 
   return rv;
+}
+
+static void
+hcc_worker_cleanup (hcc_worker_t *wrk)
+{
+  pool_free (wrk->sessions);
+}
+
+static void
+hcc_cleanup ()
+{
+  hcc_main_t *hcm = &hcc_main;
+  hcc_worker_t *wrk;
+
+  vec_foreach (wrk, hcm->wrk)
+    hcc_worker_cleanup (wrk);
+
+  vec_free (hcm->uri);
+  vec_free (hcm->http_query);
+  vec_free (hcm->http_response);
+  vec_free (hcm->appns_id);
+  vec_free (hcm->wrk);
 }
 
 static clib_error_t *
@@ -509,7 +588,6 @@ hcc_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
     }
 
-  vec_free (hcm->appns_id);
   hcm->appns_id = appns_id;
   hcm->cli_node_index = vlib_get_current_process (vm)->node_runtime.node_index;
 
@@ -524,9 +602,14 @@ hcc_command_fn (vlib_main_t *vm, unformat_input_t *input,
       err = clib_error_return (0, "Uri parse error: %d", rv);
       goto done;
     }
+  hcm->need_crypto = hcm->connect_sep.transport_proto == TRANSPORT_PROTO_TLS;
+  hcm->connect_sep.transport_proto = TRANSPORT_PROTO_HTTP;
 
+  session_enable_disable_args_t args = { .is_en = 1,
+					 .rt_engine_type =
+					   RT_BACKEND_ENGINE_RULE_TABLE };
   vlib_worker_thread_barrier_sync (vm);
-  vnet_session_enable_disable (vm, 1 /* turn on TCP, etc. */);
+  vnet_session_enable_disable (vm, &args);
   vlib_worker_thread_barrier_release (vm);
 
   err = hcc_run (vm, print_output);
@@ -540,8 +623,7 @@ hcc_command_fn (vlib_main_t *vm, unformat_input_t *input,
     }
 
 done:
-  vec_free (hcm->uri);
-  vec_free (hcm->http_query);
+  hcc_cleanup ();
   unformat_free (line_input);
   return err;
 }

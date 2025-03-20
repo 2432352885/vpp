@@ -291,7 +291,7 @@ done:
   if (n_wrote)
     {
       if (svm_fifo_set_event (us->tx_fifo))
-	session_send_io_evt_to_thread (us->tx_fifo, SESSION_IO_EVT_TX);
+	session_program_tx_io_evt (us->handle, SESSION_IO_EVT_TX);
     }
 
   if (PREDICT_FALSE (ctx->app_closed &&
@@ -538,7 +538,7 @@ srtp_migrate_ctx (void *arg)
   us->opaque = ctx_handle;
   us->flags &= ~SESSION_F_IS_MIGRATING;
   if (svm_fifo_max_dequeue (us->tx_fifo))
-    session_send_io_evt_to_thread (us->tx_fifo, SESSION_IO_EVT_TX);
+    session_program_tx_io_evt (us->handle, SESSION_IO_EVT_TX);
 
   /* Migrate app session as well */
   session_dgram_connect_notify (&ctx->connection, old_thread_index,
@@ -641,10 +641,12 @@ srtp_connect (transport_endpoint_cfg_t *tep)
   application_t *app;
   srtp_tc_t *ctx;
   u32 ctx_index;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
 
   sep = (session_endpoint_cfg_t *) tep;
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_NONE);
+  if (!ext_cfg)
     return SESSION_E_NOEXTCFG;
 
   app_wrk = app_worker_get (sep->app_wrk_index);
@@ -658,7 +660,7 @@ srtp_connect (transport_endpoint_cfg_t *tep)
   ctx->srtp_ctx_handle = ctx_index;
   ctx->c_flags |= TRANSPORT_CONNECTION_F_NO_LOOKUP;
 
-  srtp_init_policy (ctx, (transport_endpt_cfg_srtp_t *) sep->ext_cfg->data);
+  srtp_init_policy (ctx, (transport_endpt_cfg_srtp_t *) ext_cfg->data);
 
   clib_memcpy_fast (&cargs->sep, sep, sizeof (session_endpoint_t));
   cargs->sep.transport_proto = TRANSPORT_PROTO_UDP;
@@ -723,9 +725,11 @@ srtp_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
   app_listener_t *al;
   srtp_tc_t *lctx;
   u32 lctx_index;
+  transport_endpt_ext_cfg_t *ext_cfg;
 
   sep = (session_endpoint_cfg_t *) tep;
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_NONE);
+  if (!ext_cfg)
     return SESSION_E_NOEXTCFG;
 
   app_wrk = app_worker_get (sep->app_wrk_index);
@@ -756,7 +760,7 @@ srtp_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
   lctx->c_s_index = app_listener_index;
   lctx->c_flags |= TRANSPORT_CONNECTION_F_NO_LOOKUP;
 
-  srtp_init_policy (lctx, (transport_endpt_cfg_srtp_t *) sep->ext_cfg->data);
+  srtp_init_policy (lctx, (transport_endpt_cfg_srtp_t *) ext_cfg->data);
 
   SRTP_DBG (1, "Started listening %d", lctx_index);
   return lctx_index;

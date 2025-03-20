@@ -18,7 +18,6 @@
 
 #include <vppinfra/bihash_16_8.h>
 #include <vppinfra/bihash_48_8.h>
-#include <vnet/session/session_rules_table.h>
 
 typedef struct _session_lookup_table
 {
@@ -37,17 +36,17 @@ typedef struct _session_lookup_table
   /**
    * Per fib proto and transport proto session rules tables
    */
-  session_rules_table_t *session_rules;
+  u32 srtg_handle;
 
   /** Flag that indicates if table has local scope */
   u8 is_local;
 
   /** Namespace this table belongs to */
-  u32 appns_index;
+  u32 *appns_index;
 
   /** For global tables only one fib proto is active. This is a
    * byproduct of fib table ids not necessarily being the same for
-   * identical fib idices of v4 and v6 fib protos */
+   * identical fib indices of v4 and v6 fib protos */
   u8 active_fib_proto;
   /* Required for pool_get_aligned(...) */
     CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
@@ -77,6 +76,8 @@ session_table_t *_get_session_tables ();
 
 #define session_table_foreach(VAR, BODY)		\
   pool_foreach (VAR, _get_session_tables ()) BODY
+
+void session_lookup_table_cleanup (u32 fib_proto, u32 fib_index, u32 ns_index);
 
 #endif /* SRC_VNET_SESSION_SESSION_TABLE_H_ */
 /*

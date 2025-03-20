@@ -261,7 +261,7 @@ class VppWgPeer(VppObject):
     def mk_cookie(self, p, tx_itf, is_resp=False, is_ip6=False):
         self.verify_header(p, is_ip6)
 
-        wg_pkt = Wireguard(p[Raw])
+        wg_pkt = Wireguard(bytes(p[Raw]))
 
         if is_resp:
             self._test.assertEqual(wg_pkt[Wireguard].message_type, 2)
@@ -310,7 +310,7 @@ class VppWgPeer(VppObject):
     def consume_cookie(self, p, is_ip6=False):
         self.verify_header(p, is_ip6)
 
-        cookie_reply = Wireguard(p[Raw])
+        cookie_reply = Wireguard(bytes(p[Raw]))
 
         self._test.assertEqual(cookie_reply[Wireguard].message_type, 3)
         self._test.assertEqual(cookie_reply[Wireguard].reserved_zero, 0)
@@ -390,7 +390,7 @@ class VppWgPeer(VppObject):
         self.noise_init(self.itf.public_key)
         self.verify_header(p, is_ip6)
 
-        init = Wireguard(p[Raw])
+        init = Wireguard(bytes(p[Raw]))
 
         self._test.assertEqual(init[Wireguard].message_type, 1)
         self._test.assertEqual(init[Wireguard].reserved_zero, 0)
@@ -438,9 +438,7 @@ class VppWgPeer(VppObject):
 
     def consume_response(self, p, is_ip6=False):
         self.verify_header(p, is_ip6)
-
-        resp = Wireguard(p[Raw])
-
+        resp = Wireguard(bytes(p[Raw]))
         self._test.assertEqual(resp[Wireguard].message_type, 2)
         self._test.assertEqual(resp[Wireguard].reserved_zero, 0)
         self._test.assertEqual(
@@ -456,7 +454,7 @@ class VppWgPeer(VppObject):
     def decrypt_transport(self, p, is_ip6=False):
         self.verify_header(p, is_ip6)
 
-        p = Wireguard(p[Raw])
+        p = Wireguard(bytes(p[Raw]))
         self._test.assertEqual(p[Wireguard].message_type, 4)
         self._test.assertEqual(p[Wireguard].reserved_zero, 0)
         self._test.assertEqual(
@@ -501,9 +499,13 @@ class VppWgPeer(VppObject):
 
 
 def is_handshake_init(p):
-    wg_p = Wireguard(p[Raw])
+    wg_p = Wireguard(bytes(p[Raw]))
 
     return wg_p[Wireguard].message_type == 1
+
+
+def filter_out_misc_and_handshake_init(p):
+    return is_ipv6_misc(p) or is_handshake_init(p)
 
 
 @unittest.skipIf(
@@ -580,15 +582,14 @@ class TestWg(VppTestCase):
     ):
         self.pg_send(intf, pkts)
 
-        def _filter_out_fn(p):
-            return is_ipv6_misc(p) or is_handshake_init(p)
-
         try:
             if not timeout:
                 timeout = 1
             for i in self.pg_interfaces:
                 i.assert_nothing_captured(
-                    timeout=timeout, remark=remark, filter_out_fn=_filter_out_fn
+                    timeout=timeout,
+                    remark=remark,
+                    filter_out_fn=filter_out_misc_and_handshake_init,
                 )
                 timeout = 0.1
         finally:
@@ -683,7 +684,12 @@ class TestWg(VppTestCase):
             # prepare and send a handshake initiation
             # expect the peer to send a handshake response
             init = peer_1.mk_handshake(self.pg1, is_ip6=is_ip6)
-            rxs = self.send_and_expect(self.pg1, [init], self.pg1)
+            rxs = self.send_and_expect(
+                self.pg1,
+                [init],
+                self.pg1,
+                filter_out_fn=filter_out_misc_and_handshake_init,
+            )
         else:
             # wait for the peer to send a handshake initiation
             rxs = self.pg1.get_capture(1, timeout=2)
@@ -709,7 +715,7 @@ class TestWg(VppTestCase):
         self.pg_send(self.pg1, [cookie])
 
         # wait for the peer to send a handshake initiation with mac2 set
-        rxs = self.pg1.get_capture(1, timeout=6)
+        rxs = self.pg1.get_capture(1, timeout=30)
 
         # verify the initiation and its mac2
         peer_1.consume_init(rxs[0], self.pg1, is_ip6=is_ip6, is_mac2=True)
@@ -788,13 +794,17 @@ class TestWg(VppTestCase):
         # expect a cookie reply
         init = peer_1.mk_handshake(self.pg1, is_ip6=is_ip6)
         init.mac2 = b"1234567890"
-        rxs = self.send_and_expect(self.pg1, [init], self.pg1)
+        rxs = self.send_and_expect(
+            self.pg1, [init], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
         peer_1.consume_cookie(rxs[0], is_ip6=is_ip6)
 
         # prepare and send a handshake initiation with correct mac2
         # expect a handshake response
         init = peer_1.mk_handshake(self.pg1, is_ip6=is_ip6)
-        rxs = self.send_and_expect(self.pg1, [init], self.pg1)
+        rxs = self.send_and_expect(
+            self.pg1, [init], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
 
         # verify the response
         peer_1.consume_response(rxs[0], is_ip6=is_ip6)
@@ -860,7 +870,9 @@ class TestWg(VppTestCase):
         # expect a cookie reply
         init = peer_1.mk_handshake(self.pg1)
         init.mac2 = b"1234567890"
-        rxs = self.send_and_expect(self.pg1, [init], self.pg1)
+        rxs = self.send_and_expect(
+            self.pg1, [init], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
         peer_1.consume_cookie(rxs[0])
 
         # sleep till the end of being under load
@@ -871,7 +883,9 @@ class TestWg(VppTestCase):
         # expect a handshake response
         init = peer_1.mk_handshake(self.pg1)
         init.mac2 = b"1234567890"
-        rxs = self.send_and_expect(self.pg1, [init], self.pg1)
+        rxs = self.send_and_expect(
+            self.pg1, [init], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
 
         # verify the response
         peer_1.consume_response(rxs[0])
@@ -1019,7 +1033,12 @@ class TestWg(VppTestCase):
         # (peer_2) prepare and send a handshake initiation
         # expect a cookie reply
         init_2 = peer_2.mk_handshake(self.pg1)
-        rxs = self.send_and_expect(self.pg1, [init_2], self.pg1)
+        rxs = self.send_and_expect(
+            self.pg1,
+            [init_2],
+            self.pg1,
+            filter_out_fn=filter_out_misc_and_handshake_init,
+        )
         peer_2.consume_cookie(rxs[0])
 
         # (peer_1) (peer_2) prepare and send a bunch of handshake initiations with correct mac2
@@ -1120,7 +1139,12 @@ class TestWg(VppTestCase):
             # prepare and send a handshake initiation
             # expect a handshake response sent to the new endpoint
             init = peer_1.mk_handshake(self.pg1, is_ip6=is_ip6)
-            rxs = self.send_and_expect(self.pg1, [init], self.pg1)
+            rxs = self.send_and_expect(
+                self.pg1,
+                [init],
+                self.pg1,
+                filter_out_fn=filter_out_misc_and_handshake_init,
+            )
             # verify the response
             peer_1.consume_response(rxs[0], is_ip6=is_ip6)
         self.assertTrue(peer_1.query_vpp_config())
@@ -1508,7 +1532,9 @@ class TestWg(VppTestCase):
         # send a valid handsake init for which we expect a response
         p = peer_1.mk_handshake(self.pg1)
 
-        rx = self.send_and_expect(self.pg1, [p], self.pg1)
+        rx = self.send_and_expect(
+            self.pg1, [p], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
 
         peer_1.consume_response(rx[0])
 
@@ -1669,7 +1695,9 @@ class TestWg(VppTestCase):
         # send a valid handsake init for which we expect a response
         p = peer_1.mk_handshake(self.pg1, True)
 
-        rx = self.send_and_expect(self.pg1, [p], self.pg1)
+        rx = self.send_and_expect(
+            self.pg1, [p], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
 
         peer_1.consume_response(rx[0], True)
 
@@ -1810,7 +1838,9 @@ class TestWg(VppTestCase):
         # send a valid handsake init for which we expect a response
         p = peer_1.mk_handshake(self.pg1)
 
-        rx = self.send_and_expect(self.pg1, [p], self.pg1)
+        rx = self.send_and_expect(
+            self.pg1, [p], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
 
         peer_1.consume_response(rx[0])
 
@@ -1949,7 +1979,9 @@ class TestWg(VppTestCase):
         # send a valid handsake init for which we expect a response
         p = peer_1.mk_handshake(self.pg1, True)
 
-        rx = self.send_and_expect(self.pg1, [p], self.pg1)
+        rx = self.send_and_expect(
+            self.pg1, [p], self.pg1, filter_out_fn=filter_out_misc_and_handshake_init
+        )
 
         peer_1.consume_response(rx[0], True)
 
@@ -2174,7 +2206,12 @@ class TestWg(VppTestCase):
         for i in range(NUM_IFS):
             # send a valid handsake init for which we expect a response
             p = peers[i].mk_handshake(self.pg1)
-            rx = self.send_and_expect(self.pg1, [p], self.pg1)
+            rx = self.send_and_expect(
+                self.pg1,
+                [p],
+                self.pg1,
+                filter_out_fn=filter_out_misc_and_handshake_init,
+            )
             peers[i].consume_response(rx[0])
 
             # send a data packet from the peer through the tunnel
@@ -2336,7 +2373,12 @@ class TestWg(VppTestCase):
         for i in range(NUM_PEERS):
             # wg0 peers: send a valid handsake init for which we expect a response
             p = peers_0[i].mk_handshake(self.pg1)
-            rx = self.send_and_expect(self.pg1, [p], self.pg1)
+            rx = self.send_and_expect(
+                self.pg1,
+                [p],
+                self.pg1,
+                filter_out_fn=filter_out_misc_and_handshake_init,
+            )
             peers_0[i].consume_response(rx[0])
 
             # wg0 peers: send empty packet, it means successful connection (WIREGUARD_PEER_ESTABLISHED)
@@ -2359,7 +2401,12 @@ class TestWg(VppTestCase):
 
             # wg1 peers: send a valid handsake init for which we expect a response
             p = peers_1[i].mk_handshake(self.pg2)
-            rx = self.send_and_expect(self.pg2, [p], self.pg2)
+            rx = self.send_and_expect(
+                self.pg2,
+                [p],
+                self.pg2,
+                filter_out_fn=filter_out_misc_and_handshake_init,
+            )
             peers_1[i].consume_response(rx[0])
 
             # wg1 peers: send empty packet, it means successful connection (WIREGUARD_PEER_ESTABLISHED)

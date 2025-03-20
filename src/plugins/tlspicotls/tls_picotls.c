@@ -88,14 +88,6 @@ picotls_lctx_get (u32 lctx_index)
   return pool_elt_at_index (picotls_main.lctx_pool, lctx_index);
 }
 
-static u8
-picotls_handshake_is_over (tls_ctx_t * ctx)
-{
-  picotls_ctx_t *ptls_ctx = (picotls_ctx_t *) ctx;
-  assert (ptls_ctx->tls);
-  return ptls_handshake_is_complete (ptls_ctx->tls);
-}
-
 static int
 picotls_try_handshake_write (picotls_ctx_t * ptls_ctx,
 			     session_t * tls_session, ptls_buffer_t * buf)
@@ -194,7 +186,7 @@ picotls_confirm_app_close (tls_ctx_t * ctx)
 static int
 picotls_transport_close (tls_ctx_t * ctx)
 {
-  if (!picotls_handshake_is_over (ctx))
+  if (!(ctx->flags & TLS_CONN_F_HS_DONE))
     {
       picotls_handle_handshake_failure (ctx);
       return 0;
@@ -206,7 +198,7 @@ picotls_transport_close (tls_ctx_t * ctx)
 static int
 picotls_transport_reset (tls_ctx_t *ctx)
 {
-  if (!picotls_handshake_is_over (ctx))
+  if (!(ctx->flags & TLS_CONN_F_HS_DONE))
     {
       picotls_handle_handshake_failure (ctx);
       return 0;
@@ -414,7 +406,8 @@ do_checks:
       if (svm_fifo_needs_deq_ntf (tcp_rx_fifo, read))
 	{
 	  svm_fifo_clear_deq_ntf (tcp_rx_fifo);
-	  session_send_io_evt_to_thread (tcp_rx_fifo, SESSION_IO_EVT_RX);
+	  session_program_transport_io_evt (tcp_rx_fifo->vpp_sh,
+					    SESSION_IO_EVT_RX);
 	}
     }
 
@@ -435,7 +428,7 @@ picotls_ctx_read (tls_ctx_t *ctx, session_t *tcp_session)
   if (PREDICT_FALSE (!ptls_handshake_is_complete (ptls_ctx->tls)))
     {
       picotls_do_handshake (ptls_ctx, tcp_session);
-      if (picotls_handshake_is_over (ctx))
+      if (ctx->flags & TLS_CONN_F_HS_DONE)
 	{
 	  if (ptls_is_server (ptls_ctx->tls))
 	    {
@@ -609,7 +602,7 @@ ptls_app_to_tcp_write (picotls_ctx_t *ptls_ctx, session_t *app_session,
     {
       svm_fifo_enqueue_nocopy (tcp_tx_fifo, wrote);
       if (svm_fifo_set_event (tcp_tx_fifo))
-	session_send_io_evt_to_thread (tcp_tx_fifo, SESSION_IO_EVT_TX);
+	session_program_tx_io_evt (tcp_tx_fifo->vpp_sh, SESSION_IO_EVT_TX);
     }
 
   return wrote;
@@ -750,7 +743,6 @@ const static tls_engine_vft_t picotls_engine = {
   .ctx_free = picotls_ctx_free,
   .ctx_get = picotls_ctx_get,
   .ctx_get_w_thread = picotls_ctx_get_w_thread,
-  .ctx_handshake_is_over = picotls_handshake_is_over,
   .ctx_start_listen = picotls_start_listen,
   .ctx_stop_listen = picotls_stop_listen,
   .ctx_init_server = picotls_ctx_init_server,

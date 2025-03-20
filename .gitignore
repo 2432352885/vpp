@@ -16,7 +16,7 @@
 /build-root/*.tar.xz
 /build-root/*.changes
 /build-root/rpmbuild/
-/build-root/test-coverage/
+/build-root/test-coverage*/
 /build-root/test/
 /build-config.mk
 /build/external/*.tar.gz
@@ -24,6 +24,24 @@
 /build/external/vpp-*
 /build/external/dpdk_mlx_default.sh
 /build/external/downloads/
+/build/external/deb/_build/
+/build/external/deb/debian/changelog
+/build/external/deb/debian/debhelper-build-stamp
+/build/external/deb/debian/tmp/
+/build/external/deb/debian/files/
+/build/external/deb/debian/.debhelper/
+/build/external/deb/debian/vpp-ext-deps*
+/build/optional/downloads/
+/build/optional/*.tar.gz
+/build/optional/*.tar.xz
+/build/optional/vpp-*
+/build/optional/deb/_build/
+/build/optional/deb/debian/changelog
+/build/optional/deb/debian/debhelper-build-stamp
+/build/optional/deb/debian/tmp/
+/build/optional/deb/debian/files/
+/build/optional/deb/debian/.debhelper/
+/build/optional/deb/debian/vpp-ext-deps*
 /path_setup
 /tools/
 # start autotools ignore
@@ -125,7 +143,9 @@ compile_commands.json
 /extras/hs-test/.build.ok
 /extras/hs-test/.build.cov.ok
 /extras/hs-test/.last_hst_ppid
+/extras/hs-test/.goimports.ok
 /extras/hs-test/summary/
+/extras/hs-test/.last_state_hash
 
 # ./configure
 /CMakeFiles
@@ -139,3 +159,5 @@ compile_commands.json
 /cmake_install.cmake
 /startup.conf
 /startup.vpp
+# log file archives
+/archives

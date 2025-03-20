@@ -39,6 +39,7 @@
 #define included_clib_h
 
 #include <stddef.h>
+#include <stdalign.h>
 
 #if __has_include(<vppinfra/config.h>)
 #include <vppinfra/config.h>
@@ -105,6 +106,13 @@
 
 #define CLIB_STRING_ARRAY(...)                                                \
   (char *[]) { __VA_ARGS__, 0 }
+
+#define CLIB_SWAP(a, b)                                                       \
+  {                                                                           \
+    typeof (a) __tmp = a;                                                     \
+    a = b;                                                                    \
+    b = __tmp;                                                                \
+  }
 
 /* sanitizers */
 #ifdef __has_feature

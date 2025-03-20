@@ -38,6 +38,7 @@ class TestPgTun(VppTestCase):
         for i in self.pg_interfaces:
             i.unconfig_ip4()
             i.admin_down()
+            i.remove_vpp_config()
         super(TestPgTun, self).tearDown()
 
     def test_pg_tun(self):
@@ -83,7 +84,7 @@ class TestPgTun(VppTestCase):
 
         rxs = self.send_and_expect(self.pg0, p * N_PKTS, self.pg1)
         for rx in rxs:
-            rx = IP(rx)
+            rx = IP(bytes(rx))
             self.assertFalse(rx.haslayer(Ether))
             self.assertEqual(rx[IP].dst, self.pg1.remote_ip4)
 
@@ -97,7 +98,7 @@ class TestPgTun(VppTestCase):
 
         rxs = self.send_and_expect(self.pg0, p * N_PKTS, self.pg2)
         for rx in rxs:
-            rx = IPv6(rx)
+            rx = IPv6(bytes(rx))
             self.assertFalse(rx.haslayer(Ether))
             self.assertEqual(rx[IPv6].dst, self.pg2.remote_ip6)
 

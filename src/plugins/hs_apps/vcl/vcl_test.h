@@ -124,7 +124,7 @@ typedef struct
 
 typedef struct
 {
-  const vcl_test_proto_vft_t *protos[VPPCOM_PROTO_SRTP + 1];
+  const vcl_test_proto_vft_t *protos[VPPCOM_PROTO_HTTP + 1];
   uint32_t ckpair_index;
   hs_test_cfg_t cfg;
   vcl_test_wrk_t *wrk;
@@ -413,6 +413,39 @@ vcl_test_write (vcl_test_session_t *ts, void *buf, uint32_t nbytes)
   if (tx_bytes < 0)
     {
       vterr ("vpcom_session_write", -errno);
+    }
+  else
+    stats->tx_bytes += tx_bytes;
+
+  return (tx_bytes);
+}
+
+static inline int
+vcl_test_write_ds (vcl_test_session_t *ts)
+{
+  vcl_test_stats_t *stats = &ts->stats;
+  int tx_bytes;
+
+  do
+    {
+      stats->tx_xacts++;
+      if (ts->ds[1].len)
+	tx_bytes = vppcom_session_write_segments (ts->fd, ts->ds, 2);
+      else
+	tx_bytes = vppcom_session_write_segments (ts->fd, ts->ds, 1);
+
+      if (tx_bytes < 0)
+	errno = -tx_bytes;
+      if ((tx_bytes == 0) ||
+	  ((tx_bytes < 0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))))
+	stats->rx_eagain++;
+    }
+  while ((tx_bytes == 0) ||
+	 ((tx_bytes < 0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))));
+
+  if (tx_bytes < 0)
+    {
+      vterr ("vppcom_session_write_segments()", -errno);
     }
   else
     stats->tx_bytes += tx_bytes;

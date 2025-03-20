@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright(c) 2021 Cisco Systems, Inc.
+ * Copyright(c) 2024 Arm Limited
  */
 
 #ifndef __snort_snort_h__
@@ -7,6 +8,7 @@
 
 #include <vppinfra/error.h>
 #include <vppinfra/socket.h>
+#include <vppinfra/file.h>
 #include <vlib/vlib.h>
 #include <snort/daq_vpp.h>
 
@@ -67,19 +69,29 @@ typedef struct
   void *interrupts;
 } snort_per_thread_data_t;
 
+/* Holds snort plugin related information for an interface */
+typedef struct
+{
+  u32 *input_instance_indices;
+  u32 *output_instance_indices;
+} snort_interface_data_t;
+
 typedef struct
 {
   clib_socket_t *listener;
   snort_client_t *clients;
   snort_instance_t *instances;
   uword *instance_by_name;
-  u32 *instance_by_sw_if_index;
+  snort_interface_data_t *interfaces;
   u8 **buffer_pool_base_addrs;
   snort_per_thread_data_t *per_thread_data;
   u32 input_mode;
   u8 *socket_name;
+  /* API message ID base */
+  u16 msg_id_base;
 } snort_main_t;
 
+extern clib_file_main_t file_main;
 extern snort_main_t snort_main;
 extern vlib_node_registration_t snort_enq_node;
 extern vlib_node_registration_t snort_deq_node;
@@ -92,9 +104,11 @@ typedef enum
 
 typedef enum
 {
-  SNORT_INPUT = 1,
-  SNORT_OUTPUT = 2,
-  SNORT_INOUT = 3
+  SNORT_INVALID = 0x00,
+  SNORT_INPUT = 0x01,
+  SNORT_OUTPUT = 0x02,
+  /* SNORT_INOUT === SNORT_INPUT | SNORT_OUTPUT */
+  SNORT_INOUT = 0x03
 } snort_attach_dir_t;
 
 #define SNORT_ENQ_NEXT_NODES                                                  \
@@ -103,13 +117,22 @@ typedef enum
   }
 
 /* functions */
-clib_error_t *snort_instance_create (vlib_main_t *vm, char *name,
-				     u8 log2_queue_sz, u8 drop_on_disconnect);
-clib_error_t *snort_interface_enable_disable (vlib_main_t *vm,
-					      char *instance_name,
-					      u32 sw_if_index, int is_enable,
-					      snort_attach_dir_t dir);
-clib_error_t *snort_set_node_mode (vlib_main_t *vm, u32 mode);
+snort_main_t *snort_get_main ();
+const char *snort_get_direction_name_by_enum (snort_attach_dir_t dir);
+snort_attach_dir_t
+snort_get_instance_direction (u32 instance_index,
+			      snort_interface_data_t *interface);
+snort_instance_t *snort_get_instance_by_index (u32 instance_index);
+snort_instance_t *snort_get_instance_by_name (char *name);
+int snort_instance_create (vlib_main_t *vm, char *name, u8 log2_queue_sz,
+			   u8 drop_on_disconnect);
+int snort_interface_enable_disable (vlib_main_t *vm, char *instance_name,
+				    u32 sw_if_index, int is_enable,
+				    snort_attach_dir_t dir);
+int snort_interface_disable_all (vlib_main_t *vm, u32 sw_if_index);
+int snort_set_node_mode (vlib_main_t *vm, u32 mode);
+int snort_instance_delete (vlib_main_t *vm, u32 instance_index);
+int snort_instance_disconnect (vlib_main_t *vm, u32 instance_index);
 
 always_inline void
 snort_freelist_init (u32 *fl)

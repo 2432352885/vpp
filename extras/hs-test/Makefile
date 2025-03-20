@@ -57,11 +57,18 @@ ifeq ($(ARCH),)
 ARCH=$(shell dpkg --print-architecture)
 endif
 
+ifeq ($(NO_COLOR),)
+VERBOSE=false
+endif
+
+FORCE_BUILD?=true
+
 .PHONY: help
 help:
 	@echo "Make targets:"
 	@echo " test                     - run tests"
 	@echo " test-debug               - run tests (vpp debug image)"
+	@echo " test-leak                - run memory leak tests (vpp debug image)"
 	@echo " build                    - build test infra"
 	@echo " build-cov                - coverage build of VPP and Docker images"
 	@echo " build-debug              - build test infra (vpp debug image)"
@@ -71,28 +78,28 @@ help:
 	@echo " cleanup-hst              - stops and removes all docker contaiers and namespaces"
 	@echo " list-tests               - list all tests"
 	@echo
-	@echo "'make build' arguments:"
+	@echo "'make build' and 'make test' arguments:"
 	@echo " UBUNTU_VERSION           - ubuntu version for docker image"
-	@echo " HST_EXTENDED_TESTS       - build extended tests"
+	@echo " FORCE_BUILD=[true|false] - force docker image building"
 	@echo
-	@echo "'make test' arguments:"
+	@echo "'make test' specific arguments:"
 	@echo " PERSIST=[true|false]     - whether clean up topology and dockers after test"
 	@echo " VERBOSE=[true|false]     - verbose output"
 	@echo " UNCONFIGURE=[true|false] - unconfigure selected test"
 	@echo " DEBUG=[true|false]       - attach VPP to GDB"
-	@echo " TEST=[test-name]         - specific test to run"
+	@echo " TEST=[name1,name2...]    - specific test(s) to run"
+	@echo " SKIP=[name1,name2...]    - specific test(s) to skip"
 	@echo " CPUS=[n-cpus]            - number of cpus to allocate to VPP and containers"
 	@echo " VPPSRC=[path-to-vpp-src] - path to vpp source files (for gdb)"
 	@echo " PARALLEL=[n-cpus]        - number of test processes to spawn to run in parallel"
 	@echo " REPEAT=[n]               - repeat tests up to N times or until a failure occurs"
 	@echo " CPU0=[true|false]        - use cpu0"
-	@echo
-	@echo "List of all tests:"
-	@$(MAKE) list-tests
+	@echo " DRYRUN=[true|false]      - set up containers but don't run tests"
+	@echo " NO_COLOR=[true|false]    - disables colorful Docker and Ginkgo output"
 
 .PHONY: list-tests
 list-tests:
-	@go run github.com/onsi/ginkgo/v2/ginkgo --dry-run -v --no-color --seed=2 | head -n -1 | grep 'Test' | \
+	@go run github.com/onsi/ginkgo/v2/ginkgo --dry-run -v --no-color --seed=2 | head -n -1 | grep 'test.go' | \
 		sed 's/^/* /; s/\(Suite\) /\1\//g'
 
 .PHONY: build-vpp-release
@@ -105,43 +112,51 @@ build-vpp-debug:
 
 .PHONY: build-vpp-gcov
 build-vpp-gcov:
-	@$(MAKE) -C ../.. build-vpp-gcov
+	@$(MAKE) -C ../.. build-gcov
 
 .build.ok: build
 	@touch .build.ok
 
-.build.cov.ok: build-vpp-gcov
-	@touch .build.cov.ok
+.build.cov.ok: build-cov
+	@touch .build.ok
 
 .build_debug.ok: build-debug
 	@touch .build.ok
 
 .PHONY: test
+test: FORCE_BUILD=false
 test: .deps.ok .build.ok
-	@# '-' ignores the exit status, it is set in compress.sh
-	@# necessary so gmake won't skip executing the bash script
-	@-bash ./hs_test.sh --persist=$(PERSIST) --verbose=$(VERBOSE) \
+	@bash ./hs_test.sh --persist=$(PERSIST) --verbose=$(VERBOSE) \
 		--unconfigure=$(UNCONFIGURE) --debug=$(DEBUG) --test=$(TEST) --cpus=$(CPUS) \
-		--vppsrc=$(VPPSRC) --parallel=$(PARALLEL) --repeat=$(REPEAT) --cpu0=$(CPU0)
-	@bash ./script/compress.sh
+		--vppsrc=$(VPPSRC) --parallel=$(PARALLEL) --repeat=$(REPEAT) --cpu0=$(CPU0) \
+		--dryrun=$(DRYRUN) --skip=$(SKIP) --no_color=$(NO_COLOR); \
+		./script/compress.sh $$?
 
 .PHONY: test-debug
+test-debug: FORCE_BUILD=false
 test-debug: .deps.ok .build_debug.ok
-	@# '-' ignores the exit status, it is set in compress.sh
-	@# necessary so gmake won't skip executing the bash script
-	@-bash ./hs_test.sh --persist=$(PERSIST) --verbose=$(VERBOSE) \
+	@bash ./hs_test.sh --persist=$(PERSIST) --verbose=$(VERBOSE) \
 		--unconfigure=$(UNCONFIGURE) --debug=$(DEBUG) --test=$(TEST) --cpus=$(CPUS) \
 		--vppsrc=$(VPPSRC) --parallel=$(PARALLEL) --repeat=$(REPEAT) --debug_build=true \
-		--cpu0=$(CPU0)
-	@bash ./script/compress.sh
+		--cpu0=$(CPU0) --dryrun=$(DRYRUN) --skip=$(SKIP) --no_color=$(NO_COLOR); \
+		./script/compress.sh $$?
+
+.PHONY: wipe-lcov
+wipe-lcov:
+	@lcov --zerocounters --directory $(WS_ROOT)/build-root/build-vpp_gcov-native/vpp
 
 .PHONY: test-cov
-test-cov: .deps.ok .build.cov.ok
-	@-bash ./hs_test.sh --persist=$(PERSIST) --verbose=$(VERBOSE) \
+test-cov: FORCE_BUILD=false
+test-cov: .deps.ok .build.cov.ok wipe-lcov
+	@bash ./hs_test.sh --coverage=true --persist=$(PERSIST) --verbose=$(VERBOSE) \
 		--unconfigure=$(UNCONFIGURE) --debug=$(DEBUG) --test=$(TEST-HS) --cpus=$(CPUS) \
-		--vppsrc=$(VPPSRC) --cpu0=$(CPU0)
-	@$(MAKE) -C ../.. test-cov-post HS_TEST=1
-	@bash ./script/compress.sh
+		--vppsrc=$(VPPSRC) --cpu0=$(CPU0) --dryrun=$(DRYRUN) --skip=$(SKIP) --no_color=$(NO_COLOR); \
+		./script/compress.sh $$?
+	$(MAKE) -C ../.. test-cov-post-standalone HS_TEST=1
+
+.PHONY: test-leak
+test-leak: .deps.ok .build_debug.ok
+	@bash ./hs_test.sh --test=$(TEST) --debug_build=true --leak_check=true --vppsrc=$(VPPSRC)
 
 .PHONY: build-go
 build-go:
@@ -150,58 +165,68 @@ build-go:
 .PHONY: build
 build: .deps.ok build-vpp-release build-go
 	@rm -f .build.ok
-	bash ./script/build_hst.sh release
+	bash ./script/build_hst.sh release $(FORCE_BUILD)
 	@touch .build.ok
 
 .PHONY: build-cov
 build-cov: .deps.ok build-vpp-gcov build-go
 	@rm -f .build.cov.ok
-	bash ./script/build_hst.sh gcov
+	bash ./script/build_hst.sh gcov $(FORCE_BUILD)
 	@touch .build.cov.ok
 
 .PHONY: build-debug
 build-debug: .deps.ok build-vpp-debug build-go
 	@rm -f .build.ok
-	bash ./script/build_hst.sh debug
+	bash ./script/build_hst.sh debug $(FORCE_BUILD)
 	@touch .build.ok
 
 .deps.ok:
-	@sudo $(MAKE) install-deps
+	@$(MAKE) install-deps
 
 .PHONY: install-deps
 install-deps:
 	@rm -f .deps.ok
-	@apt-get update \
-		&& apt-get install -y apt-transport-https ca-certificates curl software-properties-common \
-		apache2-utils wrk bridge-utils gpg
+	@sudo -E apt-get update
+	@sudo -E apt-get install -y apt-transport-https ca-certificates curl software-properties-common \
+		bridge-utils gpg
 	@if [ ! -f /usr/share/keyrings/docker-archive-keyring.gpg ] ; then \
 		curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg; \
 		echo "deb [arch=$(ARCH) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(UBUNTU_CODENAME) stable" \
 			| sudo tee /etc/apt/sources.list.d/docker.list > /dev/null ; \
 		apt-get update; \
 	fi
-	@apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+	@sudo -E apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 	@touch .deps.ok
 
+.goimports.ok:
+	@rm -f .goimports.ok
+	go install golang.org/x/tools/cmd/goimports@v0.25.0
+	@touch .goimports.ok
+
 .PHONY: checkstyle-go
-checkstyle-go:
-	@output=$$(gofmt -d $${WS_ROOT}); \
-    if [ -z "$$output" ]; then \
-        echo "*******************************************************************"; \
-        echo "Checkstyle OK."; \
-        echo "*******************************************************************"; \
+checkstyle-go: .goimports.ok
+	$(eval GOPATH := $(shell go env GOPATH))
+	@output=$$($(GOPATH)/bin/goimports -d $${WS_ROOT}); \
+	status=$$?; \
+	if [ $$status -ne 0 ]; then \
+		exit $$status; \
+    elif [ -z "$$output" ]; then \
+        echo "******************************************************************************"; \
+        echo "* HST Golang Checkstyle OK."; \
+        echo "******************************************************************************"; \
     else \
         echo "$$output"; \
-        echo "*******************************************************************"; \
-        echo "Checkstyle failed. Use 'make fixstyle-go' or fix errors manually."; \
-        echo "*******************************************************************"; \
+        echo "******************************************************************************"; \
+        echo "* HST Golang Checkstyle FAILED. Use 'make fixstyle-go' or fix errors manually."; \
+        echo "******************************************************************************"; \
         exit 1; \
     fi
 
 .PHONY: fixstyle-go
-fixstyle-go:
+fixstyle-go: .goimports.ok
+	$(eval GOPATH := $(shell go env GOPATH))
 	@echo "Modified files:"
-	@gofmt -w -l $(WS_ROOT)
+	@$(GOPATH)/bin/goimports -w -l $(WS_ROOT)
 	@go mod tidy
 	@echo "*******************************************************************"
 	@echo "Fixstyle done."

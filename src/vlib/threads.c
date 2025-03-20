@@ -282,6 +282,11 @@ vlib_thread_init (vlib_main_t * vm)
       tr->first_index = first_index;
       first_index += tr->count;
       n_vlib_mains += (tr->no_data_structure_clone == 0) ? tr->count : 0;
+      if (n_vlib_mains >= FRAME_QUEUE_MAX_NELTS)
+	return clib_error_return (0,
+				  "configured amount of workers %u is"
+				  " greater than VPP_MAX_WORKERS (%u)",
+				  n_vlib_mains, FRAME_QUEUE_MAX_NELTS);
 
       /* construct coremask */
       if (tr->use_pthreads || !tr->count)
@@ -1070,6 +1075,13 @@ vlib_worker_thread_node_refork (void)
 			VLIB_NODE_RUNTIME_DATA_SIZE);
     }
 
+  for (j = vec_len (old_rt);
+       j < vec_len (nm_clone->nodes_by_type[VLIB_NODE_TYPE_INPUT]); j++)
+    {
+      rt = &nm_clone->nodes_by_type[VLIB_NODE_TYPE_INPUT][j];
+      nm_clone->input_node_counts_by_state[rt->state] += 1;
+    }
+
   vec_free (old_rt);
 
   /* re-clone pre-input nodes */
@@ -1292,7 +1304,7 @@ vlib_worker_thread_initial_barrier_sync_and_release (vlib_main_t * vm)
     {
       if ((now = vlib_time_now (vm)) > deadline)
 	{
-	  fformat (stderr, "%s: worker thread deadlock\n", __FUNCTION__);
+	  fformat (stderr, "%s: worker thread deadlock\n", __func__);
 	  os_panic ();
 	}
       CLIB_PAUSE ();
@@ -1397,7 +1409,7 @@ vlib_worker_thread_barrier_sync_int (vlib_main_t * vm, const char *func_name)
     {
       if ((now = vlib_time_now (vm)) > deadline)
 	{
-	  fformat (stderr, "%s: worker thread deadlock\n", __FUNCTION__);
+	  fformat (stderr, "%s: worker thread deadlock\n", __func__);
 	  os_panic ();
 	}
     }
@@ -1473,7 +1485,7 @@ vlib_worker_thread_barrier_release (vlib_main_t * vm)
     {
       if ((now = vlib_time_now (vm)) > deadline)
 	{
-	  fformat (stderr, "%s: worker thread deadlock\n", __FUNCTION__);
+	  fformat (stderr, "%s: worker thread deadlock\n", __func__);
 	  os_panic ();
 	}
     }
@@ -1490,7 +1502,7 @@ vlib_worker_thread_barrier_release (vlib_main_t * vm)
 	  if ((now = vlib_time_now (vm)) > deadline)
 	    {
 	      fformat (stderr, "%s: worker thread refork deadlock\n",
-		       __FUNCTION__);
+		       __func__);
 	      os_panic ();
 	    }
 	}

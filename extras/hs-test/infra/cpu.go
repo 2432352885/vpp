@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	. "github.com/onsi/ginkgo/v2"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
 )
 
 var CgroupPath = "/sys/fs/cgroup/"
@@ -34,17 +35,17 @@ func iterateAndAppend(start int, end int, slice []int) []int {
 
 var cpuAllocator *CpuAllocatorT = nil
 
-func (c *CpuAllocatorT) Allocate(containerCount int, nCpus int) (*CpuContext, error) {
+func (c *CpuAllocatorT) Allocate(containerCount int, nCpus int, offset int) (*CpuContext, error) {
 	var cpuCtx CpuContext
 	// indexes, not actual cores
 	var minCpu, maxCpu int
 
 	if c.runningInCi {
-		minCpu = ((c.buildNumber) * c.maxContainerCount * nCpus)
-		maxCpu = ((c.buildNumber + 1) * c.maxContainerCount * nCpus) - 1
+		minCpu = ((c.buildNumber) * c.maxContainerCount * nCpus) + offset
+		maxCpu = ((c.buildNumber + 1) * c.maxContainerCount * nCpus) - 1 + offset
 	} else {
-		minCpu = ((GinkgoParallelProcess() - 1) * c.maxContainerCount * nCpus)
-		maxCpu = (GinkgoParallelProcess() * c.maxContainerCount * nCpus) - 1
+		minCpu = ((GinkgoParallelProcess() - 1) * c.maxContainerCount * nCpus) + offset
+		maxCpu = (GinkgoParallelProcess() * c.maxContainerCount * nCpus) - 1 + offset
 	}
 
 	if len(c.cpus)-1 < maxCpu {
@@ -92,7 +93,7 @@ func (c *CpuAllocatorT) readCpus() error {
 		c.cpus = iterateAndAppend(first, second, c.cpus)
 		c.cpus = iterateAndAppend(third, fourth, c.cpus)
 	} else if NumaAwareCpuAlloc {
-		var fifth, sixth int
+		var range1, range2 int
 		var tmpCpus []int
 
 		file, err := os.Open("/sys/devices/system/node/online")
@@ -121,26 +122,35 @@ func (c *CpuAllocatorT) readCpus() error {
 			sc := bufio.NewScanner(file)
 			sc.Scan()
 			line := sc.Text()
-			_, err = fmt.Sscanf(line, "%d-%d,%d-%d", &third, &fourth, &fifth, &sixth)
-			if err != nil {
-				return err
-			}
 
-			// get numa node cores from first range
-			tmpCpus = iterateAndAppend(third, fourth, tmpCpus)
+			for _, coreRange := range strings.Split(line, ",") {
+				if strings.IndexRune(coreRange, '-') != -1 {
+					_, err = fmt.Sscanf(coreRange, "%d-%d", &range1, &range2)
+					if err != nil {
+						return err
+					}
+					tmpCpus = iterateAndAppend(range1, range2, tmpCpus)
+				} else {
+					_, err = fmt.Sscanf(coreRange, "%d", &range1)
+					if err != nil {
+						return err
+					}
+					tmpCpus = append(tmpCpus, range1)
+				}
+			}
 
 			// discard cpu 0
 			if tmpCpus[0] == 0 && !*UseCpu0 {
 				tmpCpus = tmpCpus[1:]
 			}
 
-			// get numa node cores from second range
-			tmpCpus = iterateAndAppend(fifth, sixth, tmpCpus)
-
 			// make c.cpus divisible by maxContainerCount * nCpus, so we don't have to check which numa will be used
 			// and we can use offsets
-			count_to_remove := len(tmpCpus) % (c.maxContainerCount * *NConfiguredCpus)
-			c.cpus = append(c.cpus, tmpCpus[:len(tmpCpus)-count_to_remove]...)
+			countToRemove := len(tmpCpus) % (c.maxContainerCount * *NConfiguredCpus)
+			if countToRemove >= len(tmpCpus) {
+				return fmt.Errorf("requested too much CPUs per container (%d) should be no more than %d", *NConfiguredCpus, len(tmpCpus)/c.maxContainerCount)
+			}
+			c.cpus = append(c.cpus, tmpCpus[:len(tmpCpus)-countToRemove]...)
 			tmpCpus = tmpCpus[:0]
 		}
 	} else {

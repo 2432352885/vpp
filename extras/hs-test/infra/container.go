@@ -6,16 +6,20 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
+	"github.com/docker/go-units"
+
+	"github.com/cilium/cilium/pkg/sysctl"
 	containerTypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/go-units"
 	"github.com/edwarnicke/exechelper"
 	. "github.com/onsi/ginkgo/v2"
 )
@@ -179,9 +183,10 @@ func (c *Container) Create() error {
 	resp, err := c.Suite.Docker.ContainerCreate(
 		c.ctx,
 		&containerTypes.Config{
-			Image: c.Image,
-			Env:   c.getEnvVars(),
-			Cmd:   strings.Split(c.ExtraRunningArgs, " "),
+			Hostname: c.Name,
+			Image:    c.Image,
+			Env:      c.getEnvVars(),
+			Cmd:      strings.Split(c.ExtraRunningArgs, " "),
 		},
 		&containerTypes.HostConfig{
 			Resources: containerTypes.Resources{
@@ -209,20 +214,41 @@ func (c *Container) Create() error {
 
 func (c *Container) allocateCpus() {
 	c.Suite.StartedContainers = append(c.Suite.StartedContainers, c)
-	c.AllocatedCpus = c.Suite.AllocateCpus()
+	c.AllocatedCpus = c.Suite.AllocateCpus(c.Name)
 	c.Suite.Log("Allocated CPUs " + fmt.Sprint(c.AllocatedCpus) + " to container " + c.Name)
 }
 
 // Starts a container
 func (c *Container) Start() error {
 	var err error
-	for nTries := 0; nTries < 5; nTries++ {
+	var nTries int
+
+	for nTries = 0; nTries < 5; nTries++ {
 		err = c.Suite.Docker.ContainerStart(c.ctx, c.ID, containerTypes.StartOptions{})
 		if err == nil {
 			continue
 		}
 		c.Suite.Log("Error while starting " + c.Name + ". Retrying...")
 		time.Sleep(1 * time.Second)
+	}
+	if nTries >= 5 {
+		return err
+	}
+
+	// wait for container to start
+	time.Sleep(1 * time.Second)
+
+	// check if container exited right after startup
+	containers, err := c.Suite.Docker.ContainerList(c.ctx, containerTypes.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", c.Name)),
+	})
+	if err != nil {
+		return err
+	}
+	if containers[0].State == "exited" {
+		c.Suite.Log("Container details: " + fmt.Sprint(containers[0]))
+		return fmt.Errorf("Container %s exited: '%s'", c.Name, containers[0].Status)
 	}
 
 	return err
@@ -288,7 +314,7 @@ func (c *Container) Run() {
 
 func (c *Container) addVolume(hostDir string, containerDir string, isDefaultWorkDir bool) {
 	var volume Volume
-	volume.HostDir = hostDir
+	volume.HostDir = strings.Replace(hostDir, "volumes", c.Suite.GetTestId()+"/"+"volumes", 1)
 	volume.ContainerDir = containerDir
 	volume.IsDefaultWorkDir = isDefaultWorkDir
 	c.Volumes[hostDir] = volume
@@ -301,12 +327,28 @@ func (c *Container) getVolumesAsSlice() []string {
 		volumeSlice = append(volumeSlice, fmt.Sprintf("%s:%s", *VppSourceFileDir, *VppSourceFileDir))
 	}
 
+	core_pattern, err := sysctl.Read("kernel.core_pattern")
+	if err == nil {
+		if len(core_pattern) > 0 && core_pattern[0] != '|' {
+			index := strings.LastIndex(core_pattern, "/")
+			if index == -1 {
+				c.Suite.Log("'core_pattern' isn't set to an absolute path. Core dump check will not work.")
+			} else {
+				core_pattern = core_pattern[:index]
+				volumeSlice = append(volumeSlice, c.Suite.getLogDirPath()+":"+core_pattern)
+			}
+		} else {
+			c.Suite.Log(fmt.Sprintf("core_pattern \"%s\" starts with pipe, ignoring", core_pattern))
+		}
+	} else {
+		c.Suite.Log(err)
+	}
+
 	if len(c.Volumes) > 0 {
 		for _, volume := range c.Volumes {
 			volumeSlice = append(volumeSlice, fmt.Sprintf("%s:%s", volume.HostDir, volume.ContainerDir))
 		}
 	}
-
 	return volumeSlice
 }
 
@@ -382,23 +424,51 @@ func (c *Container) CreateFile(destFileName string, content string) error {
 	return nil
 }
 
+func (c *Container) CreateFileInWorkDir(fileName string, contents string) error {
+	file, err := os.Create(c.GetHostWorkDir() + "/" + fileName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write([]byte(contents))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Container) GetFile(sourceFileName, targetFileName string) error {
+	cmd := exec.Command("docker", "cp", c.Name+":"+sourceFileName, targetFileName)
+	return cmd.Run()
+}
+
 /*
  * Executes in detached mode so that the started application can continue to run
  * without blocking execution of test
  */
-func (c *Container) ExecServer(command string, arguments ...any) {
+func (c *Container) ExecServer(useEnvVars bool, command string, arguments ...any) {
+	var envVars string
 	serverCommand := fmt.Sprintf(command, arguments...)
-	containerExecCommand := "docker exec -d" + c.getEnvVarsAsCliOption() +
-		" " + c.Name + " " + serverCommand
+	if useEnvVars {
+		envVars = c.getEnvVarsAsCliOption()
+	} else {
+		envVars = ""
+	}
+	containerExecCommand := fmt.Sprintf("docker exec -d %s %s %s", envVars, c.Name, serverCommand)
 	GinkgoHelper()
 	c.Suite.Log(containerExecCommand)
 	c.Suite.AssertNil(exechelper.Run(containerExecCommand))
 }
 
-func (c *Container) Exec(command string, arguments ...any) string {
-	cliCommand := fmt.Sprintf(command, arguments...)
-	containerExecCommand := "docker exec" + c.getEnvVarsAsCliOption() +
-		" " + c.Name + " " + cliCommand
+func (c *Container) Exec(useEnvVars bool, command string, arguments ...any) string {
+	var envVars string
+	serverCommand := fmt.Sprintf(command, arguments...)
+	if useEnvVars {
+		envVars = c.getEnvVarsAsCliOption()
+	} else {
+		envVars = ""
+	}
+	containerExecCommand := fmt.Sprintf("docker exec %s %s %s", envVars, c.Name, serverCommand)
 	GinkgoHelper()
 	c.Suite.Log(containerExecCommand)
 	byteOutput, err := exechelper.CombinedOutput(containerExecCommand)
@@ -406,21 +476,8 @@ func (c *Container) Exec(command string, arguments ...any) string {
 	return string(byteOutput)
 }
 
-func (c *Container) getLogDirPath() string {
-	testId := c.Suite.GetTestId()
-	testName := c.Suite.GetCurrentTestName()
-	logDirPath := logDir + testName + "/" + testId + "/"
-
-	cmd := exec.Command("mkdir", "-p", logDirPath)
-	if err := cmd.Run(); err != nil {
-		Fail("mkdir error: " + fmt.Sprint(err))
-	}
-
-	return logDirPath
-}
-
 func (c *Container) saveLogs() {
-	testLogFilePath := c.getLogDirPath() + "container-" + c.Name + ".log"
+	testLogFilePath := c.Suite.getLogDirPath() + "container-" + c.Name + ".log"
 
 	logs, err := c.log(0)
 	if err != nil {
@@ -441,7 +498,7 @@ func (c *Container) saveLogs() {
 func (c *Container) log(maxLines int) (string, error) {
 	var logOptions containerTypes.LogsOptions
 	if maxLines == 0 {
-		logOptions = containerTypes.LogsOptions{ShowStdout: true, ShowStderr: true, Details: true}
+		logOptions = containerTypes.LogsOptions{ShowStdout: true, ShowStderr: true, Details: true, Timestamps: true}
 	} else {
 		logOptions = containerTypes.LogsOptions{ShowStdout: true, ShowStderr: true, Details: true, Tail: strconv.Itoa(maxLines)}
 	}
@@ -463,12 +520,11 @@ func (c *Container) log(maxLines int) (string, error) {
 	stdout := stdoutBuf.String()
 	stderr := stderrBuf.String()
 
-	if strings.Contains(stdout, "==> /dev/null <==") {
-		stdout = ""
-	}
-	if strings.Contains(stderr, "tail: cannot open") {
-		stderr = ""
-	}
+	re := regexp.MustCompile("(?m)^.*==> /dev/null <==.*$[\r\n]+")
+	stdout = re.ReplaceAllString(stdout, "")
+
+	re = regexp.MustCompile("(?m)^.*tail: cannot open '' for reading: No such file or directory.*$[\r\n]+")
+	stderr = re.ReplaceAllString(stderr, "")
 
 	return stdout + stderr, err
 }
@@ -477,19 +533,22 @@ func (c *Container) stop() error {
 	if c.VppInstance != nil && c.VppInstance.ApiStream != nil {
 		c.VppInstance.saveLogs()
 		c.VppInstance.Disconnect()
+		c.VppInstance.Stop()
 	}
+	timeout := 0
 	c.VppInstance = nil
 	c.saveLogs()
-
 	c.Suite.Log("Stopping container " + c.Name)
-	timeout := 0
+	if c.Suite.CoverageRun {
+		timeout = 3
+	}
 	if err := c.Suite.Docker.ContainerStop(c.ctx, c.ID, containerTypes.StopOptions{Timeout: &timeout}); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *Container) CreateConfig(targetConfigName string, templateName string, values any) {
+func (c *Container) CreateConfigFromTemplate(targetConfigName string, templateName string, values any) {
 	template := template.Must(template.ParseFiles(templateName))
 
 	f, err := os.CreateTemp(logDir, "hst-config")

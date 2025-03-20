@@ -732,7 +732,8 @@ lcp_nl_drain_messages (void)
   nl_main_t *nm = &nl_main;
 
   /* Read until there's an error */
-  while ((err = nl_recvmsgs_default (nm->sk_route)) > -1)
+  while ((err = nm->sk_route ? nl_recvmsgs_default (nm->sk_route) :
+			       -NLE_BAD_SOCK) > -1)
     ;
 
   /* If there was an error other then EAGAIN, signal process node */

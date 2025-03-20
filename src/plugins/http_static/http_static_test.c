@@ -18,6 +18,7 @@
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
 #include <vppinfra/error.h>
+#include <http_static/http_static.h>
 
 uword unformat_sw_if_index (unformat_input_t * input, va_list * args);
 
@@ -38,10 +39,10 @@ http_static_test_main_t http_static_test_main;
 #include <vlibapi/vat_helper_macros.h>
 
 static int
-api_http_static_enable (vat_main_t * vam)
+api_http_static_enable_v2 (vat_main_t *vam)
 {
   unformat_input_t *line_input = vam->input;
-  vl_api_http_static_enable_t *mp;
+  vl_api_http_static_enable_v2_t *mp;
   u64 tmp;
   u8 *www_root = 0;
   u8 *uri = 0;
@@ -49,6 +50,7 @@ api_http_static_enable (vat_main_t * vam)
   u32 private_segment_size = 0;
   u32 fifo_size = 8 << 10;
   u32 cache_size_limit = 1 << 20;
+  u32 max_age = HSS_DEFAULT_MAX_AGE;
   int ret;
 
   /* Parse args required to build the message */
@@ -88,7 +90,8 @@ api_http_static_enable (vat_main_t * vam)
 	    }
 	  cache_size_limit = (u32) tmp;
 	}
-
+      else if (unformat (line_input, "max-age %d", &max_age))
+	;
       else if (unformat (line_input, "uri %s", &uri))
 	;
       else
@@ -107,16 +110,208 @@ api_http_static_enable (vat_main_t * vam)
   if (uri == 0)
     uri = format (0, "tcp://0.0.0.0/80%c", 0);
 
-
-
   /* Construct the API message */
-  M (HTTP_STATIC_ENABLE, mp);
+  M (HTTP_STATIC_ENABLE_V2, mp);
   strncpy_s ((char *) mp->www_root, 256, (const char *) www_root, 256);
   strncpy_s ((char *) mp->uri, 256, (const char *) uri, 256);
   mp->fifo_size = ntohl (fifo_size);
   mp->cache_size_limit = ntohl (cache_size_limit);
   mp->prealloc_fifos = ntohl (prealloc_fifos);
   mp->private_segment_size = ntohl (private_segment_size);
+  mp->max_age = ntohl (max_age);
+
+  /* send it... */
+  S (mp);
+
+  /* Wait for a reply... */
+  W (ret);
+  return ret;
+}
+
+static int
+api_http_static_enable_v3 (vat_main_t *vam)
+{
+  unformat_input_t *line_input = vam->input;
+  vl_api_http_static_enable_v3_t *mp;
+  u64 tmp;
+  u8 *www_root = 0;
+  u8 *uri = 0;
+  u32 prealloc_fifos = 0;
+  u32 private_segment_size = 0;
+  u32 fifo_size = 8 << 10;
+  u32 cache_size_limit = 1 << 20;
+  u32 max_age = HSS_DEFAULT_MAX_AGE;
+  u32 keepalive_timeout = HSS_DEFAULT_KEEPALIVE_TIMEOUT;
+  int ret;
+
+  /* Parse args required to build the message */
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "www-root %s", &www_root))
+	;
+      else if (unformat (line_input, "prealloc-fifos %d", &prealloc_fifos))
+	;
+      else if (unformat (line_input, "private-segment-size %U",
+			 unformat_memory_size, &tmp))
+	{
+	  if (tmp >= 0x100000000ULL)
+	    {
+	      errmsg ("private segment size %llu, too large", tmp);
+	      return -99;
+	    }
+	  private_segment_size = (u32) tmp;
+	}
+      else if (unformat (line_input, "fifo-size %U", unformat_memory_size,
+			 &tmp))
+	{
+	  if (tmp >= 0x100000000ULL)
+	    {
+	      errmsg ("fifo-size %llu, too large", tmp);
+	      return -99;
+	    }
+	  fifo_size = (u32) tmp;
+	}
+      else if (unformat (line_input, "cache-size %U", unformat_memory_size,
+			 &tmp))
+	{
+	  if (tmp < (128ULL << 10))
+	    {
+	      errmsg ("cache-size must be at least 128kb");
+	      return -99;
+	    }
+	  cache_size_limit = (u32) tmp;
+	}
+      else if (unformat (line_input, "max-age %d", &max_age))
+	;
+      else if (unformat (line_input, "keepalive-timeout %d",
+			 &keepalive_timeout))
+	;
+      else if (unformat (line_input, "uri %s", &uri))
+	;
+      else
+	{
+	  errmsg ("unknown input `%U'", format_unformat_error, line_input);
+	  return -99;
+	}
+    }
+
+  if (www_root == 0)
+    {
+      errmsg ("Must specify www-root");
+      return -99;
+    }
+
+  if (uri == 0)
+    uri = format (0, "tcp://0.0.0.0/80%c", 0);
+
+  /* Construct the API message */
+  M (HTTP_STATIC_ENABLE_V3, mp);
+  strncpy_s ((char *) mp->www_root, 256, (const char *) www_root, 256);
+  strncpy_s ((char *) mp->uri, 256, (const char *) uri, 256);
+  mp->fifo_size = ntohl (fifo_size);
+  mp->cache_size_limit = ntohl (cache_size_limit);
+  mp->prealloc_fifos = ntohl (prealloc_fifos);
+  mp->private_segment_size = ntohl (private_segment_size);
+  mp->max_age = ntohl (max_age);
+  mp->keepalive_timeout = ntohl (keepalive_timeout);
+  /* send it... */
+  S (mp);
+
+  /* Wait for a reply... */
+  W (ret);
+  return ret;
+}
+
+static int
+api_http_static_enable_v4 (vat_main_t *vam)
+{
+  unformat_input_t *line_input = vam->input;
+  vl_api_http_static_enable_v4_t *mp;
+  u64 tmp;
+  u8 *www_root = 0;
+  u8 *uri = 0;
+  u32 prealloc_fifos = 0;
+  u32 private_segment_size = 0;
+  u32 fifo_size = 8 << 10;
+  u32 cache_size_limit = 1 << 20;
+  u32 max_age = HSS_DEFAULT_MAX_AGE;
+  u32 keepalive_timeout = HSS_DEFAULT_KEEPALIVE_TIMEOUT;
+  u64 max_body_size = HSS_DEFAULT_MAX_BODY_SIZE;
+  int ret;
+
+  /* Parse args required to build the message */
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "www-root %s", &www_root))
+	;
+      else if (unformat (line_input, "prealloc-fifos %d", &prealloc_fifos))
+	;
+      else if (unformat (line_input, "private-segment-size %U",
+			 unformat_memory_size, &tmp))
+	{
+	  if (tmp >= 0x100000000ULL)
+	    {
+	      errmsg ("private segment size %llu, too large", tmp);
+	      return -99;
+	    }
+	  private_segment_size = (u32) tmp;
+	}
+      else if (unformat (line_input, "fifo-size %U", unformat_memory_size,
+			 &tmp))
+	{
+	  if (tmp >= 0x100000000ULL)
+	    {
+	      errmsg ("fifo-size %llu, too large", tmp);
+	      return -99;
+	    }
+	  fifo_size = (u32) tmp;
+	}
+      else if (unformat (line_input, "cache-size %U", unformat_memory_size,
+			 &tmp))
+	{
+	  if (tmp < (128ULL << 10))
+	    {
+	      errmsg ("cache-size must be at least 128kb");
+	      return -99;
+	    }
+	  cache_size_limit = (u32) tmp;
+	}
+      else if (unformat (line_input, "max-age %d", &max_age))
+	;
+      else if (unformat (line_input, "keepalive-timeout %d",
+			 &keepalive_timeout))
+	;
+      else if (unformat (line_input, "uri %s", &uri))
+	;
+      else if (unformat (line_input, "max-body-size %llu", &max_body_size))
+	;
+      else
+	{
+	  errmsg ("unknown input `%U'", format_unformat_error, line_input);
+	  return -99;
+	}
+    }
+
+  if (www_root == 0)
+    {
+      errmsg ("Must specify www-root");
+      return -99;
+    }
+
+  if (uri == 0)
+    uri = format (0, "tcp://0.0.0.0/80%c", 0);
+
+  /* Construct the API message */
+  M (HTTP_STATIC_ENABLE_V4, mp);
+  strncpy_s ((char *) mp->www_root, 256, (const char *) www_root, 256);
+  strncpy_s ((char *) mp->uri, 256, (const char *) uri, 256);
+  mp->fifo_size = ntohl (fifo_size);
+  mp->cache_size_limit = ntohl (cache_size_limit);
+  mp->prealloc_fifos = ntohl (prealloc_fifos);
+  mp->private_segment_size = ntohl (private_segment_size);
+  mp->max_age = ntohl (max_age);
+  mp->keepalive_timeout = ntohl (keepalive_timeout);
+  mp->max_body_size = ntohl (max_body_size);
 
   /* send it... */
   S (mp);

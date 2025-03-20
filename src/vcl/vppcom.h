@@ -58,6 +58,7 @@ typedef enum vppcom_proto_
   VPPCOM_PROTO_QUIC,
   VPPCOM_PROTO_DTLS,
   VPPCOM_PROTO_SRTP,
+  VPPCOM_PROTO_HTTP,
 } vppcom_proto_t;
 
 typedef enum
@@ -147,8 +148,8 @@ typedef enum
   VPPCOM_ATTR_GET_LCL_ADDR,
   VPPCOM_ATTR_SET_LCL_ADDR,
   VPPCOM_ATTR_GET_PEER_ADDR,
-  VPPCOM_ATTR_GET_LIBC_EPFD,
-  VPPCOM_ATTR_SET_LIBC_EPFD,
+  VPPCOM_ATTR_GET_UNUSED,
+  VPPCOM_ATTR_SET_UNUSED,
   VPPCOM_ATTR_GET_PROTOCOL,
   VPPCOM_ATTR_GET_LISTEN,
   VPPCOM_ATTR_GET_ERROR,
@@ -185,6 +186,7 @@ typedef enum
   VPPCOM_ATTR_GET_IP_PKTINFO,
   VPPCOM_ATTR_GET_ORIGINAL_DST,
   VPPCOM_ATTR_GET_NWRITEQ,
+  VPPCOM_ATTR_GET_EXT_ENDPT,
 } vppcom_attr_op_t;
 
 typedef struct _vcl_poll
@@ -259,6 +261,9 @@ extern int vppcom_session_read_segments (uint32_t session_handle,
 					 vppcom_data_segment_t * ds,
 					 uint32_t n_segments,
 					 uint32_t max_bytes);
+extern int vppcom_session_write_segments (uint32_t session_handle,
+					 vppcom_data_segment_t * ds,
+					 uint32_t n_segments);
 extern void vppcom_session_free_segments (uint32_t session_handle,
 					  uint32_t n_bytes);
 extern int vppcom_add_cert_key_pair (vppcom_cert_key_pair_t *ckpair);

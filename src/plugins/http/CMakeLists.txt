@@ -13,7 +13,15 @@
 
 add_vpp_plugin(http
   SOURCES
+  http2/hpack.c
+  http2/frame.c
   http.c
   http_buffer.c
   http_timer.c
+  http1.c
+)
+
+add_vpp_plugin(http_unittest
+  SOURCES
+  test/http_test.c
 )

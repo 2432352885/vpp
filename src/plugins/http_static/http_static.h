@@ -23,6 +23,10 @@
 #include <vppinfra/error.h>
 #include <http_static/http_cache.h>
 
+#define HSS_DEFAULT_MAX_AGE 600
+#define HSS_DEFAULT_MAX_BODY_SIZE     8192
+#define HSS_DEFAULT_KEEPALIVE_TIMEOUT 60
+
 /** @file http_static.h
  * Static http server definitions
  */
@@ -45,13 +49,15 @@ typedef struct
   /** Data length */
   u64 data_len;
   /** Current data send offset */
-  u32 data_offset;
+  u64 data_offset;
   /** Need to free data in detach_cache_entry */
   int free_data;
   /** File cache pool index */
   u32 cache_pool_index;
-  /** Content type, e.g. text, text/javascript, etc. */
-  http_content_type_t content_type;
+  /** Response header ctx */
+  http_headers_ctx_t resp_headers;
+  /** Response header buffer */
+  u8 *headers_buf;
 } hss_session_t;
 
 typedef struct hss_session_handle_
@@ -91,6 +97,7 @@ typedef struct hss_url_handler_args_
       uword data_len;
       u8 free_vec_data;
       http_status_code_t sc;
+      http_content_type_t ct;
     };
   };
 } hss_url_handler_args_t;
@@ -153,6 +160,14 @@ typedef struct
   u8 enable_url_handlers;
   /** Max cache size before LRU occurs */
   u64 cache_size;
+  /** How long a response is considered fresh (in seconds) */
+  u32 max_age;
+  /** Maximum size of a request body (in bytes) **/
+  u64 max_body_size;
+  /** Formatted max_age: "max-age=xyz" */
+  u8 *max_age_formatted;
+  /** Timeout during which client connection will stay open */
+  u32 keepalive_timeout;
 
   /** hash table of file extensions to mime types string indices */
   uword *mime_type_indices_by_file_extensions;

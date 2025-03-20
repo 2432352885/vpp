@@ -294,6 +294,8 @@ virtio_vring_set_tx_queues (vlib_main_t *vm, virtio_if_t *vif)
 {
   vnet_main_t *vnm = vnet_get_main ();
   vnet_virtio_vring_t *vring;
+  uword n_threads = vlib_get_n_threads ();
+  u8 consistent = vif->consistent_qp;
 
   vec_foreach (vring, vif->txq_vrings)
     {
@@ -308,10 +310,11 @@ virtio_vring_set_tx_queues (vlib_main_t *vm, virtio_if_t *vif)
       return;
     }
 
-  for (u32 j = 0; j < vlib_get_n_threads (); j++)
+  for (u32 j = 0; j < n_threads; j++)
     {
       u32 qi = vif->txq_vrings[j % vif->num_txqs].queue_index;
-      vnet_hw_if_tx_queue_assign_thread (vnm, qi, j);
+      vnet_hw_if_tx_queue_assign_thread (vnm, qi,
+					 (j + consistent) % n_threads);
     }
 
   vnet_hw_if_update_runtime_data (vnm, vif->hw_if_index);
@@ -404,6 +407,7 @@ virtio_show (vlib_main_t *vm, u32 *hw_if_indices, u8 show_descr,
       vlib_cli_output (vm, "  csum-enabled %d", vif->csum_offload_enabled);
       vlib_cli_output (vm, "  packet-coalesce %d", vif->packet_coalesce);
       vlib_cli_output (vm, "  packet-buffering %d", vif->packet_buffering);
+      vlib_cli_output (vm, "  rss-enabled %d", vif->rss_enabled);
       if (type & (VIRTIO_IF_TYPE_TAP | VIRTIO_IF_TYPE_PCI))
 	vlib_cli_output (vm, "  Mac Address: %U", format_ethernet_address,
 			 vif->mac_addr);

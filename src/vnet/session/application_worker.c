@@ -175,10 +175,10 @@ app_worker_alloc_session_fifos (segment_manager_t * sm, session_t * s)
     return rv;
 
   rx_fifo->shr->master_session_index = s->session_index;
-  rx_fifo->master_thread_index = s->thread_index;
+  rx_fifo->vpp_sh = s->handle;
 
   tx_fifo->shr->master_session_index = s->session_index;
-  tx_fifo->master_thread_index = s->thread_index;
+  tx_fifo->vpp_sh = s->handle;
 
   s->rx_fifo = rx_fifo;
   s->tx_fifo = tx_fifo;
@@ -210,10 +210,10 @@ app_worker_alloc_wrk_cl_session (app_worker_t *app_wrk, session_t *ls)
 				       &tx_fifo);
 
   rx_fifo->shr->master_session_index = s->session_index;
-  rx_fifo->master_thread_index = s->thread_index;
+  rx_fifo->vpp_sh = s->handle;
 
   tx_fifo->shr->master_session_index = s->session_index;
-  tx_fifo->master_thread_index = s->thread_index;
+  tx_fifo->vpp_sh = s->handle;
 
   s->rx_fifo = rx_fifo;
   s->tx_fifo = tx_fifo;
@@ -252,6 +252,7 @@ app_worker_init_listener (app_worker_t * app_wrk, session_t * ls)
 
   /* Once the first segment is mapped, don't remove it until unlisten */
   sm->first_is_protected = 1;
+  sm->flags |= SEG_MANAGER_F_LISTENER;
 
   /* Keep track of the segment manager for the listener or this worker */
   hash_set (app_wrk->listeners_table, listen_session_get_handle (ls),
@@ -454,7 +455,10 @@ app_worker_init_connected (app_worker_t * app_wrk, session_t * s)
 
   /* Allocate fifos for session, unless the app is a builtin proxy */
   if (application_is_builtin_proxy (app))
-    return app->cb_fns.proxy_alloc_session_fifos (s);
+    {
+      s->flags |= SESSION_F_PROXY;
+      return app->cb_fns.proxy_alloc_session_fifos (s);
+    }
 
   sm = app_worker_get_connect_segment_manager (app_wrk);
   return app_worker_alloc_session_fifos (sm, s);

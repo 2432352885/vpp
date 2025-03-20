@@ -271,6 +271,12 @@ api_session_enable_disable (vat_main_t *vat)
 }
 
 static int
+api_session_enable_disable_v2 (vat_main_t *vat)
+{
+  return -1;
+}
+
+static int
 api_app_worker_add_del (vat_main_t *vat)
 {
   return -1;
@@ -350,6 +356,63 @@ api_app_namespace_add_del_v3 (vat_main_t *vat)
 
 static int
 api_session_sapi_enable_disable (vat_main_t *vat)
+{
+  return -1;
+}
+
+static int
+api_session_sdl_add_del (vat_main_t *vam)
+{
+  return -1;
+}
+
+static int
+api_session_sdl_add_del_v2 (vat_main_t *vam)
+{
+  return -1;
+}
+
+static void
+vl_api_session_sdl_details_t_handler (vl_api_session_sdl_details_t *mp)
+{
+}
+
+static void
+vl_api_session_sdl_v2_details_t_handler (vl_api_session_sdl_v2_details_t *mp)
+{
+}
+
+static void
+vl_api_session_sdl_v3_details_t_handler (vl_api_session_sdl_v3_details_t *mp)
+{
+}
+
+static int
+api_session_sdl_dump (vat_main_t *vam)
+{
+  return -1;
+}
+
+static int
+api_session_sdl_v2_dump (vat_main_t *vam)
+{
+  return -1;
+}
+
+static int
+api_session_sdl_v3_dump (vat_main_t *vam)
+{
+  return -1;
+}
+
+static void
+vl_api_session_rules_v2_details_t_handler (
+  vl_api_session_rules_v2_details_t *mp)
+{
+}
+
+static int
+api_session_rules_v2_dump (vat_main_t *vam)
 {
   return -1;
 }

@@ -1005,7 +1005,7 @@ static void
 tcp_test_set_time (u32 thread_index, u32 val)
 {
   session_main.wrk[thread_index].last_vlib_time = val;
-  tcp_set_time_now (&tcp_main.wrk_ctx[thread_index], val);
+  tcp_set_time_now (&tcp_main.wrk[thread_index], val);
 }
 
 static int
@@ -1550,8 +1550,11 @@ tcp_test (vlib_main_t * vm,
 	  unformat_input_t * input, vlib_cli_command_t * cmd_arg)
 {
   int res = 0;
+  session_enable_disable_args_t args = { .is_en = 1,
+					 .rt_engine_type =
+					   RT_BACKEND_ENGINE_RULE_TABLE };
 
-  vnet_session_enable_disable (vm, 1);
+  vnet_session_enable_disable (vm, &args);
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -1591,6 +1594,8 @@ tcp_test (vlib_main_t * vm,
 done:
   if (res)
     return clib_error_return (0, "TCP unit test failed");
+
+  vlib_cli_output (vm, "SUCCESS");
   return 0;
 }
 

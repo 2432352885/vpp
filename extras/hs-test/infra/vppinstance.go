@@ -2,17 +2,20 @@ package hst
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"go.fd.io/govpp/binapi/ethernet_types"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"go.fd.io/govpp/binapi/ethernet_types"
 
 	"github.com/edwarnicke/exechelper"
 	. "github.com/onsi/ginkgo/v2"
@@ -32,17 +35,14 @@ const vppConfigTemplate = `unix {
   nodaemon
   log %[1]s%[4]s
   full-coredump
+  coredump-size unlimited
   cli-listen %[1]s%[2]s
   runtime-dir %[1]s/var/run
-  gid vpp
+  %[5]s
 }
 
 api-trace {
   on
-}
-
-api-segment {
-  gid vpp
 }
 
 socksvr {
@@ -61,6 +61,7 @@ plugins {
   plugin af_packet_plugin.so { enable }
   plugin hs_apps_plugin.so { enable }
   plugin http_plugin.so { enable }
+  plugin http_unittest_plugin.so { enable }
   plugin http_static_plugin.so { enable }
   plugin prom_plugin.so { enable }
   plugin tlsopenssl_plugin.so { enable }
@@ -80,6 +81,7 @@ const (
 	defaultCliSocketFilePath = "/var/run/vpp/cli.sock"
 	defaultApiSocketFilePath = "/var/run/vpp/api.sock"
 	defaultLogFilePath       = "/var/log/vpp/vpp.log"
+	Consistent_qp            = 256
 )
 
 type VppInstance struct {
@@ -95,6 +97,13 @@ type VppCpuConfig struct {
 	PinMainCpu         bool
 	PinWorkersCorelist bool
 	SkipCores          int
+}
+
+type VppMemTrace struct {
+	Count     int      `json:"count"`
+	Size      int      `json:"bytes"`
+	Sample    string   `json:"sample"`
+	Traceback []string `json:"traceback"`
 }
 
 func (vpp *VppInstance) getSuite() *HstSuite {
@@ -117,18 +126,27 @@ func (vpp *VppInstance) getEtcDir() string {
 	return vpp.Container.GetContainerWorkDir() + "/etc/vpp"
 }
 
-func (vpp *VppInstance) Start() error {
-	maxReconnectAttempts := 3
-	// Replace default logger in govpp with our own
-	govppLogger := logrus.New()
-	govppLogger.SetOutput(io.MultiWriter(vpp.getSuite().Logger.Writer(), GinkgoWriter))
-	core.SetLogger(govppLogger)
-	// Create folders
-	containerWorkDir := vpp.Container.GetContainerWorkDir()
+// Appends a string to '[host-work-dir]/cli-config.conf'.
+// Creates the conf file if it doesn't exist. Used for dry-run mode.
+func (vpp *VppInstance) AppendToCliConfig(vppCliConfig string) {
+	f, err := os.OpenFile(vpp.Container.GetHostWorkDir()+"/cli-config.conf", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	vpp.getSuite().AssertNil(err)
+	_, err = f.Write([]byte(vppCliConfig))
+	vpp.getSuite().AssertNil(err)
+	err = f.Close()
+	vpp.getSuite().AssertNil(err)
+}
 
-	vpp.Container.Exec("mkdir --mode=0700 -p " + vpp.getRunDir())
-	vpp.Container.Exec("mkdir --mode=0700 -p " + vpp.getLogDir())
-	vpp.Container.Exec("mkdir --mode=0700 -p " + vpp.getEtcDir())
+func (vpp *VppInstance) Start() error {
+	containerWorkDir := vpp.Container.GetContainerWorkDir()
+	var cliConfig string
+	if *DryRun {
+		cliConfig = fmt.Sprintf("exec %s/cli-config.conf", containerWorkDir)
+	}
+
+	vpp.Container.Exec(false, "mkdir --mode=0700 -p "+vpp.getRunDir())
+	vpp.Container.Exec(false, "mkdir --mode=0700 -p "+vpp.getLogDir())
+	vpp.Container.Exec(false, "mkdir --mode=0700 -p "+vpp.getEtcDir())
 
 	// Create startup.conf inside the container
 	configContent := fmt.Sprintf(
@@ -137,6 +155,7 @@ func (vpp *VppInstance) Start() error {
 		defaultCliSocketFilePath,
 		defaultApiSocketFilePath,
 		defaultLogFilePath,
+		cliConfig,
 	)
 	configContent += vpp.generateVPPCpuConfig()
 	for _, c := range vpp.AdditionalConfig {
@@ -149,7 +168,20 @@ func (vpp *VppInstance) Start() error {
 	cliContent := "#!/usr/bin/bash\nvppctl -s " + vpp.getRunDir() + "/cli.sock"
 	vppcliFileName := "/usr/bin/vppcli"
 	vpp.Container.CreateFile(vppcliFileName, cliContent)
-	vpp.Container.Exec("chmod 0755 " + vppcliFileName)
+	vpp.Container.Exec(false, "chmod 0755 "+vppcliFileName)
+
+	if *DryRun {
+		vpp.getSuite().Log("%s* Commands to start VPP and VPPCLI:", Colors.pur)
+		vpp.getSuite().Log("vpp -c %s/startup.conf", vpp.getEtcDir())
+		vpp.getSuite().Log("vppcli (= vppctl -s %s/cli.sock)%s\n", vpp.getRunDir(), Colors.rst)
+		return nil
+	}
+
+	maxReconnectAttempts := 3
+	// Replace default logger in govpp with our own
+	govppLogger := logrus.New()
+	govppLogger.SetOutput(io.MultiWriter(vpp.getSuite().Logger.Writer(), GinkgoWriter))
+	core.SetLogger(govppLogger)
 
 	vpp.getSuite().Log("starting vpp")
 	if *IsVppDebug {
@@ -163,7 +195,7 @@ func (vpp *VppInstance) Start() error {
 			cont <- true
 		}()
 
-		vpp.Container.ExecServer("su -c \"vpp -c " + startupFileName + " &> /proc/1/fd/1\"")
+		vpp.Container.ExecServer(false, "su -c \"vpp -c "+startupFileName+" &> /proc/1/fd/1\"")
 		fmt.Println("run following command in different terminal:")
 		fmt.Println("docker exec -it " + vpp.Container.Name + " gdb -ex \"attach $(docker exec " + vpp.Container.Name + " pidof vpp)\"")
 		fmt.Println("Afterwards press CTRL+\\ to continue")
@@ -171,7 +203,7 @@ func (vpp *VppInstance) Start() error {
 		fmt.Println("continuing...")
 	} else {
 		// Start VPP
-		vpp.Container.ExecServer("su -c \"vpp -c " + startupFileName + " &> /proc/1/fd/1\"")
+		vpp.Container.ExecServer(false, "su -c \"vpp -c "+startupFileName+" &> /proc/1/fd/1\"")
 	}
 
 	vpp.getSuite().Log("connecting to vpp")
@@ -205,7 +237,17 @@ func (vpp *VppInstance) Start() error {
 	}
 	vpp.ApiStream = ch
 
+	AddReportEntry("VPP version", vpp.Vppctl("show version verbose"), ReportEntryVisibilityNever)
+
 	return nil
+}
+
+func (vpp *VppInstance) Stop() {
+	pid := strings.TrimSpace(vpp.Container.Exec(false, "pidof vpp"))
+	// Stop VPP only if it's still running
+	if len(pid) > 0 {
+		vpp.Container.Exec(false, "bash -c \"kill -15 "+pid+"\"")
+	}
 }
 
 func (vpp *VppInstance) Vppctl(command string, arguments ...any) string {
@@ -214,7 +256,23 @@ func (vpp *VppInstance) Vppctl(command string, arguments ...any) string {
 		vpp.Container.Name, vpp.getCliSocket(), vppCliCommand)
 	vpp.getSuite().Log(containerExecCommand)
 	output, err := exechelper.CombinedOutput(containerExecCommand)
-	vpp.getSuite().AssertNil(err)
+
+	// If an error occurs, retrieve the caller function's name.
+	// If retrieving the caller name fails, perform a regular assert.
+	// If the caller is 'teardown', only log the error instead of asserting.
+	if err != nil {
+		pc, _, _, ok := runtime.Caller(1)
+		if !ok {
+			vpp.getSuite().AssertNil(err)
+		} else {
+			fn := runtime.FuncForPC(pc)
+			if fn != nil && strings.Contains(fn.Name(), "TearDownTest") {
+				vpp.getSuite().Log("vppctl failed in test teardown (skipping assert): %v", err)
+			} else {
+				vpp.getSuite().AssertNil(err)
+			}
+		}
+	}
 
 	return string(output)
 }
@@ -251,6 +309,23 @@ func (vpp *VppInstance) WaitForApp(appName string, timeout int) {
 func (vpp *VppInstance) createAfPacket(
 	veth *NetInterface,
 ) (interface_types.InterfaceIndex, error) {
+	if *DryRun {
+		if ip4Address, err := veth.Ip4AddrAllocator.NewIp4InterfaceAddress(veth.Peer.NetworkNumber); err == nil {
+			veth.Ip4Address = ip4Address
+		} else {
+			return 0, err
+		}
+		vppCliConfig := fmt.Sprintf(
+			"create host-interface name %s\n"+
+				"set int state host-%s up\n"+
+				"set int ip addr host-%s %s\n",
+			veth.Name(),
+			veth.Name(),
+			veth.Name(), veth.Ip4Address)
+		vpp.AppendToCliConfig(vppCliConfig)
+		vpp.getSuite().Log("%s* Interface added:\n%s%s", Colors.grn, vppCliConfig, Colors.rst)
+		return 1, nil
+	}
 	createReq := &af_packet.AfPacketCreateV3{
 		Mode:            1,
 		UseRandomHwAddr: true,
@@ -377,20 +452,42 @@ func (vpp *VppInstance) addAppNamespace(
 	return nil
 }
 
-func (vpp *VppInstance) createTap(
-	tap *NetInterface,
-	tapId ...uint32,
-) error {
-	var id uint32 = 1
-	if len(tapId) > 0 {
-		id = tapId[0]
+func (vpp *VppInstance) CreateTap(tap *NetInterface, numRxQueues uint16, tapId uint32, flags ...uint32) error {
+	var tapFlags uint32 = 0
+	if len(flags) > 0 {
+		tapFlags = flags[0]
 	}
+
+	if *DryRun {
+		flagsCli := ""
+		if tapFlags == Consistent_qp {
+			flagsCli = "consistent-qp"
+		}
+		vppCliConfig := fmt.Sprintf("create tap id %d host-if-name %s host-ip4-addr %s num-rx-queues %d %s\n"+
+			"set int ip addr tap%d %s\n"+
+			"set int state tap%d up\n",
+			tapId,
+			tap.name,
+			tap.Ip4Address,
+			numRxQueues,
+			flagsCli,
+			tapId,
+			tap.Peer.Ip4Address,
+			tapId,
+		)
+		vpp.AppendToCliConfig(vppCliConfig)
+		vpp.getSuite().Log("%s* Interface added:\n%s%s", Colors.grn, vppCliConfig, Colors.rst)
+		return nil
+	}
+
 	createTapReq := &tapv2.TapCreateV3{
-		ID:               id,
+		ID:               tapId,
 		HostIfNameSet:    true,
 		HostIfName:       tap.Name(),
 		HostIP4PrefixSet: true,
 		HostIP4Prefix:    tap.Ip4AddressWithPrefix(),
+		NumRxQueues:      numRxQueues,
+		TapFlags:         tapv2.TapFlags(tapFlags),
 	}
 
 	vpp.getSuite().Log("create tap interface " + tap.Name())
@@ -470,8 +567,27 @@ func (vpp *VppInstance) createTap(
 	return nil
 }
 
+func (vpp *VppInstance) DeleteTap(tapInterface *NetInterface) error {
+	deleteReq := &tapv2.TapDeleteV2{
+		SwIfIndex: tapInterface.Peer.Index,
+	}
+	vpp.getSuite().Log("delete tap interface " + tapInterface.Name())
+	if err := vpp.ApiStream.SendMsg(deleteReq); err != nil {
+		return err
+	}
+	replymsg, err := vpp.ApiStream.RecvMsg()
+	if err != nil {
+		return err
+	}
+	reply := replymsg.(*tapv2.TapDeleteV2Reply)
+	if err = api.RetvalToVPPApiError(reply.Retval); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (vpp *VppInstance) saveLogs() {
-	logTarget := vpp.Container.getLogDirPath() + "vppinstance-" + vpp.Container.Name + ".log"
+	logTarget := vpp.getSuite().getLogDirPath() + "vppinstance-" + vpp.Container.Name + ".log"
 	logSource := vpp.Container.GetHostWorkDir() + defaultLogFilePath
 	cmd := exec.Command("cp", logSource, logTarget)
 	vpp.getSuite().Log(cmd.String())
@@ -534,4 +650,109 @@ func (vpp *VppInstance) generateVPPCpuConfig() string {
 	}
 
 	return c.Close().ToString()
+}
+
+// EnableMemoryTrace enables memory traces of VPP main-heap
+func (vpp *VppInstance) EnableMemoryTrace() {
+	vpp.getSuite().Log(vpp.Vppctl("memory-trace on main-heap"))
+}
+
+// GetMemoryTrace dumps memory traces for analysis
+func (vpp *VppInstance) GetMemoryTrace() ([]VppMemTrace, error) {
+	var trace []VppMemTrace
+	vpp.getSuite().Log(vpp.Vppctl("save memory-trace trace.json"))
+	err := vpp.Container.GetFile("/tmp/trace.json", "/tmp/trace.json")
+	if err != nil {
+		return nil, err
+	}
+	fileBytes, err := os.ReadFile("/tmp/trace.json")
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(fileBytes, &trace)
+	if err != nil {
+		return nil, err
+	}
+	return trace, nil
+}
+
+// memTracesSuppressCli filter out CLI related samples
+func memTracesSuppressCli(traces []VppMemTrace) []VppMemTrace {
+	var filtered []VppMemTrace
+	for i := 0; i < len(traces); i++ {
+		isCli := false
+		for j := 0; j < len(traces[i].Traceback); j++ {
+			if strings.Contains(traces[i].Traceback[j], "unix_cli") {
+				isCli = true
+				break
+			}
+		}
+		if !isCli {
+			filtered = append(filtered, traces[i])
+		}
+	}
+	return filtered
+}
+
+// MemLeakCheck compares memory traces at different point in time, analyzes if memory leaks happen and produces report
+func (vpp *VppInstance) MemLeakCheck(first, second []VppMemTrace) {
+	totalBytes := 0
+	totalCounts := 0
+	trace1 := memTracesSuppressCli(first)
+	trace2 := memTracesSuppressCli(second)
+	report := ""
+	for i := 0; i < len(trace2); i++ {
+		match := false
+		for j := 0; j < len(trace1); j++ {
+			if trace1[j].Sample == trace2[i].Sample {
+				if trace2[i].Size > trace1[j].Size {
+					deltaBytes := trace2[i].Size - trace1[j].Size
+					deltaCounts := trace2[i].Count - trace1[j].Count
+					report += fmt.Sprintf("grow %d byte(s) in %d allocation(s) from:\n", deltaBytes, deltaCounts)
+					for j := 0; j < len(trace2[i].Traceback); j++ {
+						report += fmt.Sprintf("\t#%d %s\n", j, trace2[i].Traceback[j])
+					}
+					totalBytes += deltaBytes
+					totalCounts += deltaCounts
+				}
+				match = true
+				break
+			}
+		}
+		if !match {
+			report += fmt.Sprintf("\nleak of %d byte(s) in %d allocation(s) from:\n", trace2[i].Size, trace2[i].Count)
+			for j := 0; j < len(trace2[i].Traceback); j++ {
+				report += fmt.Sprintf("\t#%d %s\n", j, trace2[i].Traceback[j])
+			}
+			totalBytes += trace2[i].Size
+			totalCounts += trace2[i].Count
+		}
+	}
+	summary := fmt.Sprintf("\nSUMMARY: %d byte(s) leaked in %d allocation(s)\n", totalBytes, totalCounts)
+	AddReportEntry(summary, report)
+}
+
+// CollectEventLogs saves event logs to the test execution directory
+func (vpp *VppInstance) CollectEventLogs() {
+	vpp.getSuite().Log(vpp.Vppctl("event-logger save event_log"))
+	targetDir := vpp.Container.Suite.getLogDirPath()
+	err := vpp.Container.GetFile("/tmp/event_log", targetDir+"/"+vpp.Container.Name+"-event_log")
+	if err != nil {
+		vpp.getSuite().Log(fmt.Sprint(err))
+	}
+}
+
+// EnablePcapTrace enables packet capture on all interfaces and maximum 10000 packets
+func (vpp *VppInstance) EnablePcapTrace() {
+	vpp.getSuite().Log(vpp.Vppctl("pcap trace rx tx max 10000 intfc any file vppTest.pcap"))
+}
+
+// CollectPcapTrace saves pcap trace to the test execution directory
+func (vpp *VppInstance) CollectPcapTrace() {
+	vpp.getSuite().Log(vpp.Vppctl("pcap trace off"))
+	targetDir := vpp.Container.Suite.getLogDirPath()
+	err := vpp.Container.GetFile("/tmp/vppTest.pcap", targetDir+"/"+vpp.Container.Name+".pcap")
+	if err != nil {
+		vpp.getSuite().Log(fmt.Sprint(err))
+	}
 }

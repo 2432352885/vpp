@@ -3,12 +3,19 @@
 source vars
 
 args=
-single_test=0
+focused_test=0
 persist_set=0
+dryrun_set=0
+coverage_set=0
 unconfigure_set=0
 debug_set=0
+leak_check_set=0
 debug_build=
 ginkgo_args=
+tc_names=()
+skip_names=()
+dryrun=
+no_color=
 
 for i in "$@"
 do
@@ -18,6 +25,13 @@ case "${i}" in
         if [ "$persist" = "true" ]; then
             args="$args -persist"
             persist_set=1
+        fi
+        ;;
+    --coverage=*)
+        coverage="${i#*=}"
+        if [ "$coverage" = "true" ]; then
+            args="$args -coverage"
+            coverage_set=1
         fi
         ;;
     --debug=*)
@@ -53,14 +67,17 @@ case "${i}" in
         args="$args -vppsrc ${i#*=}"
         ;;
     --test=*)
-        tc_name="${i#*=}"
-        if [ "$tc_name" != "all" ]; then
-            single_test=1
-            ginkgo_args="$ginkgo_args --focus $tc_name -vv"
+        tc_list="${i#*=}"
+        ginkgo_args="$ginkgo_args -v"
+        if [ "$tc_list" != "all" ]; then
+            focused_test=1
+            IFS=',' read -r -a tc_names <<< "$tc_list"
             args="$args -verbose"
-        else
-            ginkgo_args="$ginkgo_args -v"
         fi
+        ;;
+    --skip=*)
+        skip_list="${i#*=}"
+        IFS=',' read -r -a skip_names <<< "$skip_list"
         ;;
     --parallel=*)
         ginkgo_args="$ginkgo_args -procs=${i#*=}"
@@ -74,32 +91,113 @@ case "${i}" in
             args="$args -cpu0"
         fi
         ;;
+    --dryrun=*)
+        dryrun="${i#*=}"
+        if [ "$dryrun" = "true" ]; then
+            args="$args -dryrun"
+            dryrun_set=1
+        fi
+        ;;
+    --leak_check=*)
+        leak_check="${i#*=}"
+        if [ "$leak_check" = "true" ]; then
+            args="$args -leak_check"
+            leak_check_set=1
+        fi
+        ;;
+    --no_color=*)
+        no_color="${i#*=}"
+        if [ "$no_color" = "true" ]; then
+            ginkgo_args="$ginkgo_args --no-color"
+        fi
+        ;;
 esac
 done
 
-if [ $single_test -eq 0 ] && [ $persist_set -eq 1 ]; then
-    echo "persist flag is not supported while running all tests!"
-    exit 1
+if [ ${#tc_names[@]} -gt 1 ]
+then
+    focused_test=0
 fi
 
-if [ $unconfigure_set -eq 1 ] && [ $single_test -eq 0 ]; then
-    echo "a single test has to be specified when unconfigure is set"
-    exit 1
+for name in "${tc_names[@]}"; do
+    ginkgo_args="$ginkgo_args --focus $name"
+done
+
+for skip in "${skip_names[@]}"; do
+    ginkgo_args="$ginkgo_args --skip $skip"
+done
+
+if [ $focused_test -eq 0 ] && { [ $persist_set -eq 1 ] || [ $dryrun_set -eq 1 ]; }; then
+    echo -e "\e[1;31mpersist/dryrun flag is not supported while running all tests!\e[1;0m"
+    exit 2
+fi
+
+if [ $unconfigure_set -eq 1 ] && [ $focused_test -eq 0 ]; then
+    echo -e "\e[1;31ma single test has to be specified when unconfigure is set\e[1;0m"
+    exit 2
 fi
 
 if [ $persist_set -eq 1 ] && [ $unconfigure_set -eq 1 ]; then
-    echo "setting persist flag and unconfigure flag is not allowed"
-    exit 1
+    echo -e "\e[1;31msetting persist flag and unconfigure flag is not allowed\e[1;0m"
+    exit 2
 fi
 
-if [ $single_test -eq 0 ] && [ $debug_set -eq 1 ]; then
-    echo "VPP debug flag is not supported while running all tests!"
-    exit 1
+if [ $focused_test -eq 0 ] && [ $debug_set -eq 1 ]; then
+    echo -e "\e[1;31mVPP debug flag is not supported while running all tests!\e[1;0m"
+    exit 2
+fi
+
+if [ $leak_check_set -eq 1 ]; then
+  if [ $focused_test -eq 0 ]; then
+    echo -e "\e[1;31ma single test has to be specified when leak_check is set\e[1;0m"
+    exit 2
+  fi
+  ginkgo_args="--focus ${tc_names[0]}"
+  sudo -E go run github.com/onsi/ginkgo/v2/ginkgo $ginkgo_args -- $args
+  exit 0
+fi
+
+if [ -n "${BUILD_NUMBER}" ]; then
+       ginkgo_args="$ginkgo_args --no-color"
 fi
 
 mkdir -p summary
 # shellcheck disable=SC2086
-sudo -E go run github.com/onsi/ginkgo/v2/ginkgo --no-color --trace --json-report=summary/report.json $ginkgo_args -- $args
+sudo -E go run github.com/onsi/ginkgo/v2/ginkgo --json-report=summary/report.json $ginkgo_args -- $args
+exit_status=$?
 
-jq -r '.[0] | .SpecReports[] | select((.State == "failed") or (.State == "timedout") or (.State == "panicked")) | select(.Failure != null) | "TestName: \(.LeafNodeText)\nSuite:\n\(.Failure.FailureNodeLocation.FileName)\nMessage:\n\(.Failure.Message)\n Full Stack Trace:\n\(.Failure.Location.FullStackTrace)\n"' summary/report.json > summary/failed-summary.log \
-	&& echo "Summary generated -> summary/failed-summary.log"
+if [ -e "summary/failed-summary.log" ]; then
+        rm summary/failed-summary.log
+fi
+
+if [ $exit_status != 0 ]; then
+    jq -r '.[0] | .SpecReports[] | select((.State == "failed") or (.State == "timedout") or (.State == "panicked")) | select(.Failure != null) |
+"TestName:
+    \(.LeafNodeText)
+Suite:
+    \(.Failure.FailureNodeLocation.FileName)
+Message:\n"
++ (
+    if .ReportEntries? then
+        (.ReportEntries[] | select(.Name == "VPP Backtrace") |
+        "\tVPP crashed
+Full Back Trace:
+\(.Value.Representation | ltrimstr("{{red}}") | rtrimstr("{{/}}"))"
+        ) // "\(.Failure.Message)"
+    else
+        "parse error"
+    end
+)
++ (
+    if .Failure.Message == "A spec timeout occurred" then
+        "\n"
+    else
+        "\nFull Stack Trace:
+\(.Failure.Location.FullStackTrace)\n"
+    end
+)' summary/report.json > summary/failed-summary.log \
+&& echo "Summary generated -> summary/failed-summary.log"
+    exit $exit_status
+else
+    exit $exit_status
+fi

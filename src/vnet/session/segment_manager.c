@@ -625,7 +625,7 @@ segment_manager_del_sessions (segment_manager_t * sm)
          */
         while (f)
           {
-	    session = session_get_if_valid (f->shr->master_session_index,
+	    session = session_get_if_valid (f->vpp_session_index,
 					    f->master_thread_index);
 	    if (session)
 	      vec_add1 (handles, session_handle (session));
@@ -672,7 +672,7 @@ segment_manager_del_sessions_filter (segment_manager_t *sm,
 	  f = fifo_segment_get_slice_fifo_list (fs, slice_index);
 	  while (f)
 	    {
-	      session = session_get_if_valid (f->shr->master_session_index,
+	      session = session_get_if_valid (f->vpp_session_index,
 					      f->master_thread_index);
 	      if (session)
 		{
@@ -920,7 +920,7 @@ segment_manager_attach_fifo (segment_manager_t *sm, svm_fifo_t **f,
   segment_manager_segment_reader_unlock (sm);
 
   (*f)->shr->master_session_index = s->session_index;
-  (*f)->master_thread_index = s->thread_index;
+  (*f)->vpp_sh = s->handle;
 }
 
 u32
@@ -1018,10 +1018,42 @@ segment_manager_main_init (void)
 }
 
 static u8 *
+format_segment_manager_flags (u8 *s, va_list *args)
+{
+  int flags = va_arg (*args, int);
+  typedef struct sm_flags_struct
+  {
+    u8 bit;
+    char *str;
+  } sm_flags_struct_t;
+  sm_flags_struct_t *entry;
+  static sm_flags_struct_t sm_flags_array[] = {
+#define _(b, v, s)                                                            \
+  {                                                                           \
+    .bit = 1 << b,                                                            \
+    .str = #s,                                                                \
+  },
+    foreach_seg_manager_flag
+#undef _
+    { .str = NULL }
+  };
+
+  entry = sm_flags_array;
+  while (entry->str)
+    {
+      if (flags & entry->bit)
+	s = format (s, "%s ", entry->str, entry->bit);
+      entry++;
+    }
+  return s;
+}
+
+u8 *
 format_segment_manager (u8 *s, va_list *args)
 {
   segment_manager_t *sm = va_arg (*args, segment_manager_t *);
   int verbose = va_arg (*args, int);
+  int indent = format_get_indent (s);
   app_worker_t *app_wrk;
   uword max_fifo_size;
   fifo_segment_t *seg;
@@ -1034,12 +1066,13 @@ format_segment_manager (u8 *s, va_list *args)
   max_fifo_size = sm->max_fifo_size;
 
   s = format (s,
-	      "[%u] %v app-wrk: %u segs: %u max-fifo-sz: %U "
-	      "wmarks: %u %u %s flags: 0x%x",
-	      segment_manager_index (sm), app ? app->name : 0,
-	      sm->app_wrk_index, pool_elts (sm->segments), format_memory_size,
-	      max_fifo_size, sm->high_watermark, sm->low_watermark,
-	      custom_logic ? "custom-tuning" : "no-tuning", sm->flags);
+	      "%U[%u] %v app-wrk: %u segs: %u max-fifo-sz: %U "
+	      "wmarks: %u %u %s flags: %U",
+	      format_white_space, indent, segment_manager_index (sm),
+	      app ? app->name : 0, sm->app_wrk_index, pool_elts (sm->segments),
+	      format_memory_size, max_fifo_size, sm->high_watermark,
+	      sm->low_watermark, custom_logic ? "custom-tuning" : "no-tuning",
+	      format_segment_manager_flags, (int) sm->flags);
 
   if (!verbose || !pool_elts (sm->segments))
     return s;
@@ -1047,7 +1080,10 @@ format_segment_manager (u8 *s, va_list *args)
   s = format (s, "\n\n");
 
   segment_manager_foreach_segment_w_lock (
-    seg, sm, ({ s = format (s, " *%U", format_fifo_segment, seg, verbose); }));
+    seg, sm, ({
+      s = format (s, "%U *%U", format_white_space, indent, format_fifo_segment,
+		  seg, verbose);
+    }));
 
   return s;
 }
@@ -1159,7 +1195,7 @@ segment_manager_format_sessions (segment_manager_t * sm, int verbose)
             u32 session_index, thread_index;
             session_t *session;
 
-	    session_index = f->shr->master_session_index;
+	    session_index = f->vpp_session_index;
 	    thread_index = f->master_thread_index;
 
 	    session = session_get (session_index, thread_index);

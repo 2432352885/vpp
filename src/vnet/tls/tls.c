@@ -66,7 +66,7 @@ int
 tls_add_vpp_q_rx_evt (session_t * s)
 {
   if (svm_fifo_set_event (s->rx_fifo))
-    session_send_io_evt_to_thread (s->rx_fifo, SESSION_IO_EVT_RX);
+    session_enqueue_notify (s);
   return 0;
 }
 
@@ -81,7 +81,7 @@ int
 tls_add_vpp_q_tx_evt (session_t * s)
 {
   if (svm_fifo_set_event (s->tx_fifo))
-    session_send_io_evt_to_thread (s->tx_fifo, SESSION_IO_EVT_TX);
+    session_program_tx_io_evt (s->handle, SESSION_IO_EVT_TX);
   return 0;
 }
 
@@ -310,7 +310,7 @@ send_reply:
 void
 tls_notify_app_io_error (tls_ctx_t *ctx)
 {
-  ASSERT (tls_ctx_handshake_is_over (ctx));
+  ASSERT (ctx->flags & TLS_CONN_F_HS_DONE);
 
   session_transport_reset_notify (&ctx->connection);
   session_transport_closed_notify (&ctx->connection);
@@ -569,7 +569,7 @@ dtls_migrate_ctx (void *arg)
     }
 
   if (svm_fifo_max_dequeue (us->tx_fifo))
-    session_send_io_evt_to_thread (us->tx_fifo, SESSION_IO_EVT_TX);
+    session_program_tx_io_evt (us->handle, SESSION_IO_EVT_TX);
 }
 
 static void
@@ -628,16 +628,18 @@ tls_connect (transport_endpoint_cfg_t * tep)
   application_t *app;
   tls_ctx_t *ctx;
   u32 ctx_index;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
 
   sep = (session_endpoint_cfg_t *) tep;
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (!ext_cfg)
     return SESSION_E_NOEXTCFG;
 
   app_wrk = app_worker_get (sep->app_wrk_index);
   app = application_get (app_wrk->app_index);
 
-  ccfg = &sep->ext_cfg->crypto;
+  ccfg = &ext_cfg->crypto;
   engine_type = tls_get_engine_type (ccfg->crypto_engine, app->tls_engine);
   if (engine_type == CRYPTO_ENGINE_NONE)
     {
@@ -709,16 +711,18 @@ tls_start_listen (u32 app_listener_index, transport_endpoint_cfg_t *tep)
   app_listener_t *al;
   tls_ctx_t *lctx;
   u32 lctx_index;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
 
   sep = (session_endpoint_cfg_t *) tep;
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (!ext_cfg)
     return SESSION_E_NOEXTCFG;
 
   app_wrk = app_worker_get (sep->app_wrk_index);
   app = application_get (app_wrk->app_index);
 
-  ccfg = &sep->ext_cfg->crypto;
+  ccfg = &ext_cfg->crypto;
   engine_type = tls_get_engine_type (ccfg->crypto_engine, app->tls_engine);
   if (engine_type == CRYPTO_ENGINE_NONE)
     {
@@ -926,24 +930,26 @@ static u8 *
 format_tls_ctx_state (u8 * s, va_list * args)
 {
   tls_ctx_t *ctx;
-  session_t *ts;
+  session_t *as;
 
   ctx = va_arg (*args, tls_ctx_t *);
-  ts = session_get (ctx->c_s_index, ctx->c_thread_index);
-  if (ts->session_state == SESSION_STATE_LISTENING)
+  as = session_get (ctx->c_s_index, ctx->c_thread_index);
+  if (as->session_state == SESSION_STATE_LISTENING)
     s = format (s, "%s", "LISTEN");
   else
     {
-      if (ts->session_state >= SESSION_STATE_TRANSPORT_CLOSED)
-	s = format (s, "%s", "CLOSED");
-      else if (ts->session_state == SESSION_STATE_APP_CLOSED)
-	s = format (s, "%s", "APP-CLOSED");
-      else if (ts->session_state >= SESSION_STATE_TRANSPORT_CLOSING)
-	s = format (s, "%s", "CLOSING");
-      else if (tls_ctx_handshake_is_over (ctx))
+      if (as->session_state == SESSION_STATE_READY)
 	s = format (s, "%s", "ESTABLISHED");
+      else if (as->session_state == SESSION_STATE_ACCEPTING)
+	s = format (s, "%s", "ACCEPTING");
+      else if (as->session_state == SESSION_STATE_CONNECTING)
+	s = format (s, "%s", "CONNECTING");
+      else if (as->session_state >= SESSION_STATE_TRANSPORT_CLOSED)
+	s = format (s, "%s", "CLOSED");
+      else if (as->session_state >= SESSION_STATE_TRANSPORT_CLOSING)
+	s = format (s, "%s", "CLOSING");
       else
-	s = format (s, "%s", "HANDSHAKE");
+	s = format (s, "UNHANDLED %u", as->session_state);
     }
 
   return s;
@@ -1113,16 +1119,18 @@ dtls_connect (transport_endpoint_cfg_t *tep)
   application_t *app;
   tls_ctx_t *ctx;
   u32 ctx_handle;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
 
   sep = (session_endpoint_cfg_t *) tep;
-  if (!sep->ext_cfg)
+  ext_cfg = session_endpoint_get_ext_cfg (sep, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  if (!ext_cfg)
     return -1;
 
   app_wrk = app_worker_get (sep->app_wrk_index);
   app = application_get (app_wrk->app_index);
 
-  ccfg = &sep->ext_cfg->crypto;
+  ccfg = &ext_cfg->crypto;
   engine_type = tls_get_engine_type (ccfg->crypto_engine, app->tls_engine);
   if (engine_type == CRYPTO_ENGINE_NONE)
     {
@@ -1250,6 +1258,10 @@ tls_init (vlib_main_t * vm)
   vec_validate (tm->rx_bufs, num_threads - 1);
   vec_validate (tm->tx_bufs, num_threads - 1);
 
+  /*
+   * first_seg_size default value 32MB
+   * add_seg_size default value 256 MB
+   */
   tm->first_seg_size = 32 << 20;
   tm->add_seg_size = 256 << 20;
 

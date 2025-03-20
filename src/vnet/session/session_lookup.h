@@ -19,6 +19,8 @@
 #include <vnet/session/session_table.h>
 #include <vnet/session/session_types.h>
 #include <vnet/session/application_namespace.h>
+#include <vnet/fib/fib_table.h>
+#include <vnet/fib/fib_source.h>
 
 #define HALF_OPEN_LOOKUP_INVALID_VALUE ((u64)~0)
 
@@ -32,6 +34,7 @@ typedef enum session_lookup_result_
 typedef struct session_lookup_main_
 {
   clib_spinlock_t st_alloc_lock;
+  fib_source_t fib_src;
 } session_lookup_main_t;
 
 session_t *session_lookup_safe4 (u32 fib_index, ip4_address_t * lcl,
@@ -69,6 +72,9 @@ transport_connection_t *session_lookup_connection (u32 fib_index,
 						   ip46_address_t * rmt,
 						   u16 lcl_port, u16 rmt_port,
 						   u8 proto, u8 is_ip4);
+transport_connection_t *
+session_lookup_6tuple (u32 fib_index, ip46_address_t *lcl, ip46_address_t *rmt,
+		       u16 lcl_port, u16 rmt_port, u8 proto, u8 is_ip4);
 session_t *session_lookup_listener4 (u32 fib_index, ip4_address_t * lcl,
 				     u16 lcl_port, u8 proto, u8 use_wildcard);
 session_t *session_lookup_listener6 (u32 fib_index, ip6_address_t * lcl,
@@ -114,6 +120,17 @@ typedef enum _session_rule_scope
   SESSION_RULE_SCOPE_LOCAL = 2,
 } session_rule_scope_e;
 
+typedef struct _session_rules_table_add_del_args
+{
+  fib_prefix_t lcl;
+  fib_prefix_t rmt;
+  u16 lcl_port;
+  u16 rmt_port;
+  u32 action_index;
+  u8 *tag;
+  u8 is_add;
+} session_rule_table_add_del_args_t;
+
 typedef struct _session_rule_add_del_args
 {
   /**
@@ -139,6 +156,8 @@ session_error_t vnet_session_rule_add_del (session_rule_add_del_args_t *args);
 void session_lookup_set_tables_appns (app_namespace_t * app_ns);
 
 void session_lookup_init (void);
+session_table_t *session_table_get_for_fib_index (u32 fib_proto,
+						  u32 fib_index);
 
 #endif /* SRC_VNET_SESSION_SESSION_LOOKUP_H_ */
 

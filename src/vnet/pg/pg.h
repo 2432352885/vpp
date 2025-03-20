@@ -182,10 +182,38 @@ typedef struct pg_stream_t
 } pg_stream_t;
 
 always_inline void
-pg_buffer_index_free (pg_buffer_index_t * bi)
+pg_free_buffers (pg_buffer_index_t *bi)
 {
-  vec_free (bi->edits);
-  clib_fifo_free (bi->buffer_fifo);
+  vlib_main_t *vm = vlib_get_main ();
+  uword n_elts, head, len;
+
+  if (!bi || !bi->buffer_fifo)
+    return;
+
+  n_elts = clib_fifo_elts (bi->buffer_fifo);
+  if (n_elts)
+    {
+      len = clib_fifo_len (bi->buffer_fifo);
+      head = clib_fifo_head_index (bi->buffer_fifo);
+
+      if (head + n_elts <= len)
+	vlib_buffer_free (vm, &bi->buffer_fifo[head], n_elts);
+      else
+	{
+	  vlib_buffer_free (vm, &bi->buffer_fifo[head], len - head);
+	  vlib_buffer_free (vm, bi->buffer_fifo, n_elts - (len - head));
+	}
+    }
+}
+
+always_inline void
+pg_buffer_index_free (pg_buffer_index_t *bi)
+{
+  if (bi)
+    {
+      vec_free (bi->edits);
+      clib_fifo_free (bi->buffer_fifo);
+    }
 }
 
 always_inline void
@@ -216,11 +244,16 @@ pg_stream_free (pg_stream_t * s)
   vec_free (s->replay_packet_templates);
   vec_free (s->replay_packet_timestamps);
 
-  {
-    pg_buffer_index_t *bi;
-    vec_foreach (bi, s->buffer_indices) pg_buffer_index_free (bi);
-    vec_free (s->buffer_indices);
-  }
+  if (s->buffer_indices)
+    {
+      pg_buffer_index_t *bi;
+      // We only need to free the buffers from the first array, as the buffers
+      // are chained when packet-generator enable is issued.
+      pg_free_buffers (s->buffer_indices);
+      vec_foreach (bi, s->buffer_indices)
+	pg_buffer_index_free (bi);
+      vec_free (s->buffer_indices);
+    }
 }
 
 always_inline int
@@ -315,6 +348,29 @@ pg_intf_mode_to_pcap_packet_type (pg_interface_mode_t mode)
     return PCAP_PACKET_TYPE_ethernet;
 }
 
+#define foreach_pg_interface_flags                                            \
+  _ (CSUM_OFFLOAD, 0)                                                         \
+  _ (GSO, 1)                                                                  \
+  _ (GRO_COALESCE, 2)
+
+typedef enum
+{
+#define _(a, b) PG_INTERFACE_FLAG_##a = (1 << b),
+  foreach_pg_interface_flags
+#undef _
+} pg_interface_flags_t;
+
+typedef struct
+{
+  u32 if_id;
+  pg_interface_mode_t mode;
+  pg_interface_flags_t flags;
+  u32 gso_size;
+  mac_address_t hw_addr;
+  u8 hw_addr_set;
+  int rv;
+} pg_interface_args_t;
+
 typedef struct
 {
   /* TX lock */
@@ -325,6 +381,8 @@ typedef struct
 
   /* Identifies stream for this interface. */
   u32 id;
+
+  mac_address_t hw_addr;
 
   u8 coalesce_enabled;
   gro_flow_table_t *flow_table;
@@ -392,9 +450,9 @@ void pg_interface_enable_disable_coalesce (pg_interface_t * pi, u8 enable,
 					   u32 tx_node_index);
 
 /* Find/create free packet-generator interface index. */
-u32 pg_interface_add_or_get (pg_main_t *pg, u32 stream_index, u8 gso_enabled,
-			     u32 gso_size, u8 coalesce_enabled,
-			     pg_interface_mode_t mode);
+u32 pg_interface_add_or_get (pg_main_t *pg, pg_interface_args_t *args);
+
+int pg_interface_delete (u32 sw_if_index);
 
 always_inline pg_node_t *
 pg_get_node (uword node_index)
@@ -424,6 +482,7 @@ clib_error_t *pg_capture (pg_capture_args_t * a);
 
 typedef struct
 {
+  pg_interface_mode_t mode;
   u32 buffer_index;
   vlib_buffer_t buffer;
 }

@@ -217,9 +217,7 @@ app_worker_flush_events_inline (app_worker_t *app_wrk, u32 thread_index,
 			     s->connection_index, s->thread_index);
 	  session_free (s);
 	  /* Notify app that it has data on the new session */
-	  s = session_get_from_handle (evt->as_u64[1]);
-	  session_send_io_evt_to_thread (s->rx_fifo,
-					 SESSION_IO_EVT_BUILTIN_RX);
+	  session_program_rx_io_evt (evt->as_u64[1]);
 	  break;
 	case SESSION_CTRL_EVT_TRANSPORT_CLOSED:
 	  s = session_get (evt->session_index, thread_index);
@@ -256,6 +254,9 @@ app_worker_flush_events_inline (app_worker_t *app_wrk, u32 thread_index,
 	case SESSION_CTRL_EVT_APP_DEL_SEGMENT:
 	  app->cb_fns.del_segment_callback (app_wrk->wrk_index,
 					    evt->as_u64[1]);
+	  break;
+	case SESSION_CTRL_EVT_RPC:
+	  ((void (*) (session_t * s)) (evt->rpc_args.fp)) (evt->rpc_args.arg);
 	  break;
 	default:
 	  clib_warning ("unexpected event: %u", evt->event_type);

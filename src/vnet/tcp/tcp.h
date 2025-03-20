@@ -25,6 +25,7 @@
 #include <vnet/tcp/tcp_sack.h>
 #include <vnet/tcp/tcp_bt.h>
 #include <vnet/tcp/tcp_cc.h>
+#include <vnet/tcp/tcp_sdl.h>
 
 typedef void (timer_expiration_handler) (tcp_connection_t * tc);
 
@@ -45,19 +46,21 @@ typedef struct _tcp_lookup_dispatch
   u8 next, error;
 } tcp_lookup_dispatch_t;
 
-#define foreach_tcp_wrk_stat					\
-  _(timer_expirations, u64, "timer expirations")		\
-  _(rxt_segs, u64, "segments retransmitted")			\
-  _(tr_events, u32, "timer retransmit events")			\
-  _(to_closewait, u32, "timeout close-wait")			\
-  _(to_closewait2, u32, "timeout close-wait w/data")		\
-  _(to_finwait1, u32, "timeout fin-wait-1")			\
-  _(to_finwait2, u32, "timeout fin-wait-2")			\
-  _(to_lastack, u32, "timeout last-ack")			\
-  _(to_closing, u32, "timeout closing")				\
-  _(tr_abort, u32, "timer retransmit abort")			\
-  _(rst_unread, u32, "reset on close due to unread data")	\
-  _(no_buffer, u32, "out of buffers")				\
+#define foreach_tcp_wrk_stat                                                  \
+  _ (timer_expirations, u64, "timer expirations")                             \
+  _ (rxt_segs, u64, "segments retransmitted")                                 \
+  _ (tr_events, u32, "timer retransmit events")                               \
+  _ (to_establish, u32, "timeout establish")                                  \
+  _ (to_persist, u32, "timeout persist")                                      \
+  _ (to_closewait, u32, "timeout close-wait")                                 \
+  _ (to_closewait2, u32, "timeout close-wait w/data")                         \
+  _ (to_finwait1, u32, "timeout fin-wait-1")                                  \
+  _ (to_finwait2, u32, "timeout fin-wait-2")                                  \
+  _ (to_lastack, u32, "timeout last-ack")                                     \
+  _ (to_closing, u32, "timeout closing")                                      \
+  _ (tr_abort, u32, "timer retransmit abort")                                 \
+  _ (rst_unread, u32, "reset on close due to unread data")                    \
+  _ (no_buffer, u32, "out of buffers")
 
 typedef struct tcp_wrk_stats_
 {
@@ -217,7 +220,7 @@ typedef struct tcp_configuration_
 typedef struct _tcp_main
 {
   /** per-worker context */
-  tcp_worker_ctx_t *wrk_ctx;
+  tcp_worker_ctx_t *wrk;
 
   /* Pool of listeners. */
   tcp_connection_t *listener_pool;
@@ -263,6 +266,8 @@ typedef struct _tcp_main
 
   /** message ID base for API */
   u16 msg_id_base;
+
+  tcp_sdl_cb_fn_t sdl_cb;
 } tcp_main_t;
 
 extern tcp_main_t tcp_main;
@@ -296,8 +301,8 @@ vnet_get_tcp_main ()
 always_inline tcp_worker_ctx_t *
 tcp_get_worker (u32 thread_index)
 {
-  ASSERT (thread_index < vec_len (tcp_main.wrk_ctx));
-  return &tcp_main.wrk_ctx[thread_index];
+  ASSERT (thread_index < vec_len (tcp_main.wrk));
+  return &tcp_main.wrk[thread_index];
 }
 
 tcp_connection_t *tcp_connection_alloc (u8 thread_index);
@@ -357,6 +362,7 @@ format_function_t format_tcp_flags;
 format_function_t format_tcp_sacks;
 format_function_t format_tcp_rcv_sacks;
 format_function_t format_tcp_connection;
+format_function_t format_tcp_listener_connection;
 format_function_t format_tcp_connection_id;
 
 #define tcp_validate_txf_size(_tc, _a) 					\

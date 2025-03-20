@@ -259,7 +259,7 @@ uword clib_mem_size (void *p);
 void clib_mem_free_s (void *p);
 
 /* Memory allocator which panics when it fails.
-   Use macro so that clib_panic macro can expand __FUNCTION__ and __LINE__. */
+   Use macro so that clib_panic macro can expand __func__ and __LINE__. */
 #define clib_mem_alloc_aligned_no_fail(size,align)				\
 ({										\
   uword _clib_mem_alloc_size = (size);						\
@@ -299,9 +299,26 @@ void *clib_mem_init_thread_safe (void *memory, uword memory_size);
 
 void clib_mem_exit (void);
 
+typedef struct
+{
+  /* Address of callers: outer first, inner last. */
+  void *callers[12];
+
+  /* Count of allocations with this traceback. */
+  u32 n_allocations;
+
+  /* Count of bytes allocated with this traceback. */
+  u32 n_bytes;
+
+  /* Offset of this item */
+  uword offset;
+} mheap_trace_t;
+
 void clib_mem_trace (int enable);
 
 int clib_mem_is_traced (void);
+
+mheap_trace_t *clib_mem_trace_dup (clib_mem_heap_t *heap);
 
 typedef struct
 {

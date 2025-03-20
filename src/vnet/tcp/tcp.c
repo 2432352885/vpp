@@ -242,8 +242,8 @@ tcp_connection_cleanup (tcp_connection_t * tc)
 
   /* Cleanup local endpoint if this was an active connect */
   if (!(tc->cfg_flags & TCP_CFG_F_NO_ENDPOINT))
-    transport_release_local_endpoint (TRANSPORT_PROTO_TCP, &tc->c_lcl_ip,
-				      tc->c_lcl_port);
+    transport_release_local_endpoint (TRANSPORT_PROTO_TCP, tc->c_fib_index,
+				      &tc->c_lcl_ip, tc->c_lcl_port);
 
   /* Check if connection is not yet fully established */
   if (tc->state == TCP_STATE_SYN_SENT)
@@ -879,6 +879,8 @@ format_tcp_listener_session (u8 * s, va_list * args)
   if (verbose)
     s = format (s, "%-" SESSION_CLI_STATE_LEN "U", format_tcp_state,
 		tc->state);
+  if (verbose == 2)
+    s = format (s, "\n%U", format_tcp_listener_connection, tc);
   return s;
 }
 
@@ -1465,7 +1467,7 @@ tcp_stats_collector_fn (vlib_stats_collector_data_t *d)
   tcp_wrk_stats_t acc = {};
   tcp_worker_ctx_t *wrk;
 
-  vec_foreach (wrk, tm->wrk_ctx)
+  vec_foreach (wrk, tm->wrk)
     {
 #define _(name, type, str) acc.name += wrk->stats.name;
       foreach_tcp_wrk_stat
@@ -1513,7 +1515,7 @@ tcp_main_enable (vlib_main_t * vm)
   int thread;
 
   /* Already initialized */
-  if (tm->wrk_ctx)
+  if (tm->wrk)
     return 0;
 
   if ((error = vlib_call_init_function (vm, ip_main_init)))
@@ -1535,11 +1537,11 @@ tcp_main_enable (vlib_main_t * vm)
    */
 
   num_threads = 1 /* main thread */  + vtm->n_threads;
-  vec_validate (tm->wrk_ctx, num_threads - 1);
+  vec_validate (tm->wrk, num_threads - 1);
   n_workers = num_threads == 1 ? 1 : vtm->n_threads;
   prealloc_conn_per_wrk = tcp_cfg.preallocated_connections / n_workers;
 
-  wrk = &tm->wrk_ctx[0];
+  wrk = &tm->wrk[0];
   wrk->tco_next_node[0] = vlib_node_get_next (vm, session_queue_node.index,
 					      tcp4_output_node.index);
   wrk->tco_next_node[1] = vlib_node_get_next (vm, session_queue_node.index,
@@ -1547,7 +1549,7 @@ tcp_main_enable (vlib_main_t * vm)
 
   for (thread = 0; thread < num_threads; thread++)
     {
-      wrk = &tm->wrk_ctx[thread];
+      wrk = &tm->wrk[thread];
 
       vec_validate (wrk->pending_deq_acked, 255);
       vec_validate (wrk->pending_disconnects, 255);
@@ -1560,8 +1562,8 @@ tcp_main_enable (vlib_main_t * vm)
 
       if (thread > 0)
 	{
-	  wrk->tco_next_node[0] = tm->wrk_ctx[0].tco_next_node[0];
-	  wrk->tco_next_node[1] = tm->wrk_ctx[0].tco_next_node[1];
+	  wrk->tco_next_node[0] = tm->wrk[0].tco_next_node[0];
+	  wrk->tco_next_node[1] = tm->wrk[0].tco_next_node[1];
 	}
 
       /*
@@ -1612,6 +1614,14 @@ tcp_punt_unknown (vlib_main_t * vm, u8 is_ip4, u8 is_add)
     tm->punt_unknown4 = is_add;
   else
     tm->punt_unknown6 = is_add;
+}
+
+void
+tcp_sdl_enable_disable (tcp_sdl_cb_fn_t fp)
+{
+  tcp_main_t *tm = &tcp_main;
+
+  tm->sdl_cb = fp;
 }
 
 /**

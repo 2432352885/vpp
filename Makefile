@@ -23,6 +23,11 @@ MACHINE=$(shell uname -m)
 SUDO?=sudo -E
 DPDK_CONFIG?=no-pci
 
+# we prefer clang by default
+ifeq ($(CC),cc)
+  CC=clang
+endif
+
 ifeq ($(strip $(SHELL)),)
 $(error "bash not found, VPP requires bash to build")
 endif
@@ -57,12 +62,27 @@ GDB_ARGS= -ex "handle SIGUSR1 noprint nostop"
 ifneq ($(shell uname),Darwin)
 OS_ID        = $(shell grep '^ID=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
 OS_VERSION_ID= $(shell grep '^VERSION_ID=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
+OS_CODENAME  = $(shell grep '^VERSION_CODENAME=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
+endif
+
+# Fill in OS_VERSION_ID based on codename if its absent
+ifeq ($(OS_VERSION_ID),)
+# Debian testing doesn't define version_id and therefore need to be referenced by name
+ifeq ($(OS_CODENAME),trixie)
+OS_VERSION_ID = 13
+endif
 endif
 
 ifeq ($(filter ubuntu debian linuxmint,$(OS_ID)),$(OS_ID))
 PKG=deb
-else ifeq ($(filter rhel centos fedora opensuse-leap rocky almalinux,$(OS_ID)),$(OS_ID))
+else ifeq ($(filter rhel centos fedora opensuse-leap rocky almalinux anolis,$(OS_ID)),$(OS_ID))
 PKG=rpm
+else ifeq ($(filter freebsd,$(OS_ID)),$(OS_ID))
+PKG=pkg
+endif
+
+ifeq ($(filter anolis,$(OS_ID)),$(OS_ID))
+OS_VERSION_ID= $(shell grep '^VERSION_ID=' /etc/os-release | cut -f2 -d= | sed -e 's/\"//g' | cut -d. -f1)
 endif
 
 # +libganglia1-dev if building the gmond plugin
@@ -70,7 +90,7 @@ endif
 DEB_DEPENDS  = curl build-essential autoconf automake ccache
 DEB_DEPENDS += debhelper dkms git libtool libapr1-dev dh-python
 DEB_DEPENDS += libconfuse-dev git-review exuberant-ctags cscope pkg-config
-DEB_DEPENDS += gcovr lcov chrpath autoconf libnuma-dev
+DEB_DEPENDS += clang gcovr lcov chrpath autoconf libnuma-dev
 DEB_DEPENDS += python3-all python3-setuptools check
 DEB_DEPENDS += libffi-dev python3-ply libunwind-dev
 DEB_DEPENDS += cmake ninja-build python3-jsonschema python3-yaml
@@ -90,16 +110,20 @@ DEB_DEPENDS += jq # for extracting test summary from .json report (hs-test)
 
 LIBFFI=libffi6 # works on all but 20.04 and debian-testing
 ifeq ($(OS_VERSION_ID),24.04)
-        DEB_DEPENDS += libssl-dev
-        DEB_DEPENDS += llvm clang clang-format-14
+	DEB_DEPENDS += libssl-dev
+	DEB_DEPENDS += llvm clang clang-format-15
 	# overwrite clang-format version to run `make checkstyle` successfully
-	export CLANG_FORMAT_VER=14
-        LIBFFI=libffi8
-        DEB_DEPENDS += enchant-2  # for docs
+	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to 15
+	export CLANG_FORMAT_VER=15
+	LIBFFI=libffi8
+	DEB_DEPENDS += enchant-2  # for docs
 else ifeq ($(OS_VERSION_ID),22.04)
 	DEB_DEPENDS += python3-virtualenv
 	DEB_DEPENDS += libssl-dev
-	DEB_DEPENDS += clang clang-format-11
+	DEB_DEPENDS += clang clang-format-15
+	# overwrite clang-format version to run `make checkstyle` successfully
+	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to 15
+	export CLANG_FORMAT_VER=15
 	LIBFFI=libffi7
 	DEB_DEPENDS += enchant-2  # for docs
 else ifeq ($(OS_VERSION_ID),20.04)
@@ -108,9 +132,6 @@ else ifeq ($(OS_VERSION_ID),20.04)
 	DEB_DEPENDS += clang clang-format-11
 	LIBFFI=libffi7
 	DEB_DEPENDS += enchant-2  # for docs
-else ifeq ($(OS_VERSION_ID),20.10)
-	DEB_DEPENDS += clang clang-format-11
-	LIBFFI=libffi8ubuntu1
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-10)
 	DEB_DEPENDS += virtualenv
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-11)
@@ -119,9 +140,17 @@ else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-11)
 	LIBFFI=libffi7
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-12)
 	DEB_DEPENDS += virtualenv
-	DEB_DEPENDS += clang-14 clang-format-14
+	DEB_DEPENDS += clang-14 clang-format-15
 	# for extras/scripts/checkstyle.sh
-	export CLANG_FORMAT_VER=14
+	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to -15
+	export CLANG_FORMAT_VER=15
+	LIBFFI=libffi8
+else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-13)
+	DEB_DEPENDS += virtualenv
+	DEB_DEPENDS += clang-19 clang-format-19
+	# for extras/scripts/checkstyle.sh
+	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to -15
+	export CLANG_FORMAT_VER=15
 	LIBFFI=libffi8
 else
 	DEB_DEPENDS += clang-11 clang-format-11
@@ -142,6 +171,7 @@ RPM_DEPENDS += xmlto
 RPM_DEPENDS += elfutils-libelf-devel libpcap-devel
 RPM_DEPENDS += libnl3-devel libmnl-devel
 RPM_DEPENDS += nasm
+RPM_DEPENDS += socat
 
 ifeq ($(OS_ID),fedora)
 	RPM_DEPENDS += dnf-utils
@@ -179,6 +209,15 @@ else ifeq ($(OS_ID)-$(OS_VERSION_ID),centos-8)
 	RPM_DEPENDS += infiniband-diags libibumad
 	RPM_DEPENDS += libpcap-devel llvm-toolset
 	RPM_DEPENDS_GROUPS = 'Development Tools'
+else ifeq ($(OS_ID)-$(OS_VERSION_ID),anolis-8)
+	RPM_DEPENDS += yum-utils
+	RPM_DEPENDS += compat-openssl10 openssl-devel
+	RPM_DEPENDS += python2-devel python36-devel python3-ply
+	RPM_DEPENDS += python3-virtualenv python3-jsonschema
+	RPM_DEPENDS += libarchive cmake
+	RPM_DEPENDS += libpcap-devel llvm-toolset git-clang-format python3-pyyaml
+	RPM_DEPENDS_GROUPS = 'Development Tools'
+	export CLANG_FORMAT_VER=15
 else
 	RPM_DEPENDS += yum-utils
 	RPM_DEPENDS += openssl-devel
@@ -219,6 +258,18 @@ endif
 
 RPM_SUSE_DEPENDS += $(RPM_SUSE_BUILDTOOLS_DEPS) $(RPM_SUSE_DEVEL_DEPS) $(RPM_SUSE_PYTHON_DEPS) $(RPM_SUSE_PLATFORM_DEPS)
 
+# FreeBSD build and test dependancies
+
+FBSD_PY_PRE=py311
+
+FBSD_TEST_DEPS = setsid rust $(FBSD_PY_PRE)-pyshark
+FBSD_PYTHON_DEPS = python3 $(FBSD_PY_PRE)-pyelftools $(FBSD_PY_PRE)-ply
+FBSD_DEVEL_DEPS = cscope gdb
+FBSD_BUILD_DEPS = bash gmake sudo
+FBSD_BUILD_DEPS += git sudo autoconf automake curl gsed
+FBSD_BUILD_DEPS += pkgconf ninja cmake libepoll-shim jansson
+FBSD_DEPS = $(FBSD_BUILD_DEPS) $(FBSD_PYTHON_DEPS) $(FBSD_TEST_DEPS) $(FBSD_DEVEL_DEPS)
+
 ifneq ($(wildcard $(STARTUP_DIR)/startup.conf),)
         STARTUP_CONF ?= $(STARTUP_DIR)/startup.conf
 endif
@@ -251,7 +302,7 @@ help:
 	@echo " build                - build debug binaries"
 	@echo " build-release        - build release binaries"
 	@echo " build-coverity       - build coverity artifacts"
-	@echo " build-vpp-gcov 		 - build gcov vpp only"
+	@echo " build-gcov 		 - build gcov vpp only"
 	@echo " rebuild              - wipe and build debug binaries"
 	@echo " rebuild-release      - wipe and build release binaries"
 	@echo " run                  - run debug binary"
@@ -269,7 +320,9 @@ help:
 	@echo " snap-clean           - clean up snap build environment"
 	@echo " pkg-rpm              - build RPM packages"
 	@echo " install-ext-dep[s]   - install external development dependencies"
+	@echo " install-opt-deps     - install optional dependencies"
 	@echo " ctags                - (re)generate ctags database"
+	@echo " etags                - (re)generate etags database"
 	@echo " gtags                - (re)generate gtags database"
 	@echo " cscope               - (re)generate cscope database"
 	@echo " compdb               - (re)generate compile_commands.json"
@@ -385,11 +438,19 @@ else ifeq ($(OS_ID),fedora)
 	@sudo -E dnf install $(CONFIRM) $(RPM_DEPENDS)
 	@sudo -E debuginfo-install $(CONFIRM) glibc openssl-libs zlib
 endif
+else ifeq ($(OS_ID)-$(OS_VERSION_ID),anolis-8)
+	@sudo -E dnf install $(CONFIRM) dnf-plugins-core epel-release
+	@sudo -E dnf config-manager --set-enabled \
+          $(shell dnf repolist all 2>/dev/null|grep -i powertools|cut -d' ' -f1|grep -v source)
+	@sudo -E dnf groupinstall $(CONFIRM) $(RPM_DEPENDS_GROUPS)
+	@sudo -E dnf install --skip-broken $(CONFIRM) $(RPM_DEPENDS)
 else ifeq ($(filter opensuse-leap-15.3 opensuse-leap-15.4 ,$(OS_ID)-$(OS_VERSION_ID)),$(OS_ID)-$(OS_VERSION_ID))
 	@sudo -E zypper refresh
 	@sudo -E zypper install  -y $(RPM_SUSE_DEPENDS)
+else ifeq ($(OS_ID), freebsd)
+	@sudo pkg install -y $(FBSD_DEPS)
 else
-	$(error "This option currently works only on Ubuntu, Debian, RHEL, CentOS or openSUSE-leap systems")
+	$(error "This option currently works only on Ubuntu, Debian, RHEL, CentOS, openSUSE-leap or FreeBSD systems")
 endif
 	git config commit.template .git_commit_template.txt
 
@@ -397,7 +458,7 @@ endif
 install-deps: install-dep
 
 define make
-	@$(MAKE) -C $(BR) PLATFORM=$(PLATFORM) TAG=$(1) $(2)
+	@$(MAKE) -C $(BR) CC=$(CC) PLATFORM=$(PLATFORM) TAG=$(1) $(2)
 endef
 
 $(BR)/scripts/.version:
@@ -452,9 +513,10 @@ rebuild: wipe build
 build-release: $(BR)/.deps.ok
 	$(call make,$(PLATFORM),$(addsuffix -install,$(TARGETS)))
 
-.PHONY: build-vpp-gcov
-build-vpp-gcov:
-	$(call test,vpp_gcov)
+.PHONY: build-gcov
+build-gcov: $(BR)/.deps.ok
+	$(eval CC=gcc)
+	$(call make,vpp_gcov,$(addsuffix -install,$(TARGETS)))
 
 .PHONY: wipe-release
 wipe-release: test-wipe $(BR)/.deps.ok
@@ -485,16 +547,10 @@ endef
 
 .PHONY: test
 test:
-ifeq ($(CC),cc)
-	$(eval CC=clang)
-endif
 	$(call test,vpp,test)
 
 .PHONY: test-debug
 test-debug:
-ifeq ($(CC),cc)
-	$(eval CC=clang)
-endif
 	$(call test,vpp_debug,test)
 
 .PHONY: test-cov
@@ -504,9 +560,13 @@ test-cov:
 	$(call test,vpp_gcov,cov)
 
 .PHONY: test-cov-hs
-test-cov-hs:
-	@$(MAKE) -C extras/hs-test build-cov
-	@$(MAKE) -C extras/hs-test test-cov
+test-cov-hs: build-gcov
+	@$(MAKE) CC=$(CC) -C extras/hs-test test-cov \
+	VPP_BUILD_DIR=$(BR)/build-vpp_gcov-native/vpp
+
+.PHONY: test-cov-post-standalone
+test-cov-post-standalone:
+	$(MAKE) CC=$(CC) -C test cov-post HS_TEST=$(HS_TEST) VPP_BUILD_DIR=$(BR)/build-vpp_gcov-native/vpp
 
 .PHONY: test-cov-both
 test-cov-both:
@@ -612,10 +672,13 @@ test-wipe-all:
 	@$(MAKE) -C test wipe-all
 
 # Note: All python venv consolidated in test/Makefile, test/requirements*.txt
+#       Also, this target is used by ci-management/jjb/scripts/vpp/checkstyle-test.sh,
+#       thus inclusion of checkstyle-go here to include checkstyle for hs-test
+#       in the vpp-checkstyle-verify-*-*-* jobs
 .PHONY: test-checkstyle
 test-checkstyle:
-	$(warning test-checkstyle is deprecated. Running checkstyle-python.")
 	@$(MAKE) -C test checkstyle-python-all
+	@$(MAKE) -C extras/hs-test checkstyle-go
 
 # Note: All python venv consolidated in test/Makefile, test/requirements*.txt
 .PHONY: test-checkstyle-diff
@@ -733,10 +796,14 @@ pkg-srpm: dist
 
 .PHONY: install-ext-deps
 install-ext-deps:
-	$(MAKE) -C build/external install-$(PKG)
+	$(MAKE) CC=$(CC) -C build/external install-$(PKG)
 
 .PHONY: install-ext-dep
 install-ext-dep: install-ext-deps
+
+.PHONY: install-opt-deps
+install-opt-deps:
+	$(MAKE) CC=$(CC) -C build/optional install-$(PKG)
 
 .PHONY: json-api-files
 json-api-files:
@@ -757,6 +824,11 @@ cleanup-hst:
 .PHONY: ctags
 ctags: ctags.files
 	@ctags --totals --tag-relative=yes -L $<
+	@rm $<
+
+.PHONY: etags
+etags: ctags.files
+	@ctags -e --totals -L $<
 	@rm $<
 
 .PHONY: gtags
@@ -860,15 +932,15 @@ docs:
 	@$(MAKE) -C $(WS_ROOT)/docs docs
 
 .PHONY: pkg-verify
-pkg-verify: install-dep $(BR)/.deps.ok install-ext-deps
+pkg-verify: $(BR)/.deps.ok install-ext-deps
 	$(call banner,"Building for PLATFORM=vpp")
-	@$(MAKE) -C build-root PLATFORM=vpp TAG=vpp wipe-all install-packages
+	@$(MAKE) CC=$(CC) -C build-root PLATFORM=vpp TAG=vpp wipe-all install-packages
 	$(call banner,"Building sample-plugin")
-	@$(MAKE) -C build-root PLATFORM=vpp TAG=vpp sample-plugin-install
+	@$(MAKE) CC=$(CC) -C build-root PLATFORM=vpp TAG=vpp sample-plugin-install
 	$(call banner,"Building libmemif")
-	@$(MAKE) -C build-root PLATFORM=vpp TAG=vpp libmemif-install
+	@$(MAKE) CC=gcc -C build-root PLATFORM=vpp TAG=vpp libmemif-install
 	$(call banner,"Building $(PKG) packages")
-	@$(MAKE) pkg-$(PKG)
+	@$(MAKE) CC=$(CC) pkg-$(PKG)
 
 # Note: 'make verify' target is not used by ci-management scripts
 MAKE_VERIFY_GATE_OS ?= ubuntu-22.04
@@ -878,7 +950,7 @@ ifeq ($(OS_ID)-$(OS_VERSION_ID),$(MAKE_VERIFY_GATE_OS))
 	$(call banner,"Testing vppapigen")
 	@src/tools/vppapigen/test_vppapigen.py
 	$(call banner,"Running tests")
-	@$(MAKE) COMPRESS_FAILED_TEST_LOGS=yes RETRIES=3 test
+	@$(MAKE) CC=$(CC) COMPRESS_FAILED_TEST_LOGS=yes RETRIES=3 test
 else
 	$(call banner,"Skipping tests. Tests under 'make verify' supported on $(MAKE_VERIFY_GATE_OS)")
 endif

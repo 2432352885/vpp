@@ -67,7 +67,7 @@ buf_fifo_get_segs (http_buffer_t *hb, u32 max_len, u32 *n_segs)
 
   max_len = clib_min (bf->len - bf->offset, (u64) max_len);
 
-  vec_validate (bf->segs, _n_segs);
+  vec_validate (bf->segs, _n_segs - 1);
 
   len = svm_fifo_segments (bf->src, 0, bf->segs, &_n_segs, max_len);
   if (len < 0)
@@ -173,7 +173,7 @@ buf_ptr_drain (http_buffer_t *hb, u32 len)
   bf->segs[1].data += len;
   bf->segs[0].len -= len;
 
-  HTTP_DBG (1, "drained %u left %u", len, bf->segs[1].len);
+  HTTP_DBG (1, "drained %u left %u", len, bf->segs[0].len);
 
   if (!bf->segs[0].len)
     {

@@ -71,7 +71,6 @@ typedef enum vcl_session_state_
   VCL_STATE_DISCONNECT,
   VCL_STATE_DETACHED,
   VCL_STATE_UPDATED,
-  VCL_STATE_LISTEN_NO_MQ,
 } vcl_session_state_t;
 
 typedef struct epoll_event vppcom_epoll_event_t;
@@ -143,7 +142,16 @@ typedef enum vcl_session_flags_
   VCL_SESSION_F_PENDING_DISCONNECT = 1 << 6,
   VCL_SESSION_F_PENDING_FREE = 1 << 7,
   VCL_SESSION_F_PENDING_LISTEN = 1 << 8,
+  VCL_SESSION_F_APP_CLOSING = 1 << 9,
+  VCL_SESSION_F_LISTEN_NO_MQ = 1 << 10,
 } __clib_packed vcl_session_flags_t;
+
+typedef enum vcl_worker_wait_
+{
+  VCL_WRK_WAIT_CTRL,
+  VCL_WRK_WAIT_IO_RX,
+  VCL_WRK_WAIT_IO_TX,
+} vcl_worker_wait_type_t;
 
 typedef struct vcl_session_
 {
@@ -163,9 +171,8 @@ typedef struct vcl_session_
   session_handle_t parent_handle;
   u32 listener_index;		/**< index of parent listener (if any) */
   int n_accepted_sessions;	/**< sessions accepted by this listener */
-  vppcom_epoll_t vep;
+  vppcom_epoll_t vep;		/**< epoll context */
   u32 attributes;		/**< see @ref vppcom_session_attr_t */
-  int libc_epfd;
   u32 vrf;
   u16 gso_size;
 
@@ -181,8 +188,7 @@ typedef struct vcl_session_
   elog_track_t elog_track;
 #endif
 
-  u16 original_dst_port; /**< original dst port (network order) */
-  u32 original_dst_ip4;	 /**< original dst ip4 (network order) */
+  transport_endpt_attr_t *tep_attrs; /**< vector of attributes */
 } vcl_session_t;
 
 typedef struct vppcom_cfg_t_
@@ -231,6 +237,7 @@ typedef struct vcl_mq_evt_conn_
   int mq_fd;
 } vcl_mq_evt_conn_t;
 
+typedef void (*vcl_worker_wait_mq_fn) (u32 vcl_sh);
 typedef struct vcl_worker_
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
@@ -314,6 +321,10 @@ typedef struct vcl_worker_
   /** vcl needs next epoll_create to go to libc_epoll */
   u8 vcl_needs_real_epoll;
   volatile int rpc_done;
+
+  /* functions to be called pre/post wait if vcl managed by vls */
+  vcl_worker_wait_mq_fn pre_wait_fn;
+  vcl_worker_wait_mq_fn post_wait_fn;
 } vcl_worker_t;
 
 STATIC_ASSERT (sizeof (session_disconnected_msg_t) <= 16,
@@ -409,6 +420,7 @@ vcl_session_free (vcl_worker_t * wrk, vcl_session_t * s)
   vcl_session_detach_fifos (s);
   if (s->ext_config)
     clib_mem_free (s->ext_config);
+  vec_free (s->tep_attrs);
   pool_put (wrk->sessions, s);
 }
 
@@ -551,9 +563,8 @@ vcl_session_table_lookup_listener (vcl_worker_t * wrk, u64 handle)
       return 0;
     }
 
-  ASSERT (s->session_state == VCL_STATE_LISTEN
-	  || s->session_state == VCL_STATE_LISTEN_NO_MQ
-	  || vcl_session_is_connectable_listener (wrk, s));
+  ASSERT (s->session_state == VCL_STATE_LISTEN ||
+	  vcl_session_is_connectable_listener (wrk, s));
   return s;
 }
 
@@ -664,6 +675,18 @@ vcl_session_clear_attr (vcl_session_t * s, u8 attr)
   s->attributes &= ~(1 << attr);
 }
 
+static inline transport_endpt_attr_t *
+vcl_session_tep_attr_get (vcl_session_t *s, transport_endpt_attr_type_t at)
+{
+  transport_endpt_attr_t *tepa;
+  vec_foreach (tepa, s->tep_attrs)
+    {
+      if (tepa->type == at)
+	return tepa;
+    }
+  return 0;
+}
+
 static inline session_evt_type_t
 vcl_session_dgram_tx_evt (vcl_session_t *s, session_evt_type_t et)
 {
@@ -713,6 +736,7 @@ u32 vcl_segment_table_lookup (u64 segment_handle);
 void vcl_segment_table_del (u64 segment_handle);
 
 int vcl_session_read_ready (vcl_session_t * session);
+int vcl_session_read_ready2 (vcl_session_t *s);
 int vcl_session_write_ready (vcl_session_t * session);
 int vcl_session_alloc_ext_cfg (vcl_session_t *s,
 			       transport_endpt_ext_cfg_type_t type, u32 len);
@@ -772,6 +796,8 @@ svm_fifo_chunk_t *vcl_segment_alloc_chunk (uword segment_handle,
 int vcl_session_share_fifos (vcl_session_t *s, svm_fifo_t *rxf,
 			     svm_fifo_t *txf);
 void vcl_worker_detach_sessions (vcl_worker_t *wrk);
+void vcl_worker_set_wait_mq_fns (vcl_worker_wait_mq_fn pre_wait,
+				 vcl_worker_wait_mq_fn post_wait);
 
 /*
  * VCL Binary API

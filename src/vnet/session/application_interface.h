@@ -281,6 +281,7 @@ typedef enum session_fd_flag_
 } session_fd_flag_t;
 
 session_error_t parse_uri (char *uri, session_endpoint_cfg_t *sep);
+session_error_t parse_target (char **uri, char **target);
 session_error_t vnet_bind_uri (vnet_listen_args_t *);
 session_error_t vnet_unbind_uri (vnet_unlisten_args_t *a);
 session_error_t vnet_connect_uri (vnet_connect_args_t *a);
@@ -396,6 +397,7 @@ typedef struct session_accepted_msg_
   transport_endpoint_t lcl;
   transport_endpoint_t rmt;
   u8 flags;
+  /* TODO(fcoras) maybe refactor to pass as transport attr */
   u32 original_dst_ip4;
   u16 original_dst_port;
 } __clib_packed session_accepted_msg_t;
@@ -687,8 +689,8 @@ app_send_dgram_raw_gso (svm_fifo_t *f, app_session_transport_t *at,
   if (do_evt)
     {
       if (svm_fifo_set_event (f))
-	app_send_io_evt_to_vpp (vpp_evt_q, f->shr->master_session_index,
-				evt_type, noblock);
+	app_send_io_evt_to_vpp (vpp_evt_q, f->vpp_session_index, evt_type,
+				noblock);
     }
   return len;
 }
@@ -711,8 +713,8 @@ app_send_stream_raw (svm_fifo_t * f, svm_msg_q_t * vpp_evt_q, u8 * data,
   if (do_evt)
     {
       if (rv > 0 && svm_fifo_set_event (f))
-	app_send_io_evt_to_vpp (vpp_evt_q, f->shr->master_session_index,
-				evt_type, noblock);
+	app_send_io_evt_to_vpp (vpp_evt_q, f->vpp_session_index, evt_type,
+				noblock);
     }
   return rv;
 }
@@ -909,17 +911,63 @@ typedef struct app_sapi_msg_
 } __clib_packed app_sapi_msg_t;
 
 static inline void
-session_endpoint_alloc_ext_cfg (session_endpoint_cfg_t *sep_ext,
-				transport_endpt_ext_cfg_type_t type)
+session_endpoint_init_ext_cfgs (session_endpoint_cfg_t *sep_ext, u32 len)
 {
-  transport_endpt_ext_cfg_t *cfg;
-  u32 cfg_size;
+  sep_ext->ext_cfgs.len = len;
+  sep_ext->ext_cfgs.data = clib_mem_alloc (len);
+  clib_memset (sep_ext->ext_cfgs.data, 0, len);
+}
 
-  cfg_size = sizeof (transport_endpt_ext_cfg_t);
-  cfg = clib_mem_alloc (cfg_size);
-  clib_memset (cfg, 0, cfg_size);
-  cfg->type = type;
-  sep_ext->ext_cfg = cfg;
+static inline transport_endpt_ext_cfg_t *
+session_endpoint_add_ext_cfg (session_endpoint_cfg_t *sep_ext,
+			      transport_endpt_ext_cfg_type_t type, u16 len)
+{
+  transport_endpt_ext_cfg_t *ext_cfg;
+
+  if (!sep_ext->ext_cfgs.len)
+    session_endpoint_init_ext_cfgs (sep_ext,
+				    TRANSPORT_ENDPT_EXT_CFGS_CHUNK_SIZE);
+
+  ASSERT (sep_ext->ext_cfgs.tail_offset + len +
+	    TRANSPORT_ENDPT_EXT_CFG_HEADER_SIZE <
+	  sep_ext->ext_cfgs.len);
+  ext_cfg = (transport_endpt_ext_cfg_t *) (sep_ext->ext_cfgs.data +
+					   sep_ext->ext_cfgs.tail_offset);
+  ext_cfg->len = len;
+  ext_cfg->type = type;
+  sep_ext->ext_cfgs.tail_offset += len + TRANSPORT_ENDPT_EXT_CFG_HEADER_SIZE;
+  return ext_cfg;
+}
+
+static inline transport_endpt_ext_cfg_t *
+session_endpoint_get_ext_cfg (session_endpoint_cfg_t *sep_ext,
+			      transport_endpt_ext_cfg_type_t type)
+{
+  transport_endpt_ext_cfg_t *ext_cfg;
+
+  if (!sep_ext->ext_cfgs.len)
+    return 0;
+
+  ext_cfg = (transport_endpt_ext_cfg_t *) sep_ext->ext_cfgs.data;
+  while ((u8 *) ext_cfg <
+	 sep_ext->ext_cfgs.data + sep_ext->ext_cfgs.tail_offset)
+    {
+      if (ext_cfg->type == type)
+	return ext_cfg;
+      ext_cfg = (transport_endpt_ext_cfg_t *) (ext_cfg->data + ext_cfg->len);
+    }
+  return 0;
+}
+
+static inline void
+session_endpoint_free_ext_cfgs (session_endpoint_cfg_t *sep_ext)
+{
+  if (!sep_ext->ext_cfgs.len)
+    return;
+  clib_mem_free (sep_ext->ext_cfgs.data);
+  sep_ext->ext_cfgs.len = 0;
+  sep_ext->ext_cfgs.tail_offset = 0;
+  sep_ext->ext_cfgs.data = 0;
 }
 
 #endif /* __included_uri_h__ */

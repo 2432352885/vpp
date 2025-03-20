@@ -13,21 +13,6 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-if(DEFINED VPP_PLATFORM AND VPP_PLATFORM STREQUAL "default")
-  unset(VPP_PLATFORM)
-  unset(VPP_PLATFORM CACHE)
-  set(VPP_PLATFORM_NAME "default")
-elseif(DEFINED VPP_PLATFORM)
-  set(platform_file ${CMAKE_SOURCE_DIR}/cmake/platform/${VPP_PLATFORM}.cmake)
-  if(NOT EXISTS ${platform_file})
-     message(FATAL_ERROR "unknown platform ${VPP_PLATFORM}")
-  endif()
-  include(${platform_file})
-  set(VPP_PLATFORM_NAME ${VPP_PLATFORM})
-else()
-  set(VPP_PLATFORM_NAME "default")
-endif()
-
 if (DEFINED VPP_PLATFORM_C_COMPILER_NAMES)
   set(CMAKE_C_COMPILER_NAMES ${VPP_PLATFORM_C_COMPILER_NAME})
 else()
@@ -164,7 +149,7 @@ elseif (${CMAKE_BUILD_TYPE_LC} MATCHES "coverity")
   add_compile_options(-O0)
   add_compile_definitions(__COVERITY__)
 elseif (${CMAKE_BUILD_TYPE_LC} MATCHES "gcov")
-  add_compile_options(-O0 -fprofile-arcs -ftest-coverage)
+  add_compile_options(-O0 -fprofile-arcs -ftest-coverage -fprofile-update=prefer-atomic)
   add_compile_definitions(CLIB_DEBUG CLIB_GCOV)
   link_libraries(gcov)
 endif()
@@ -244,6 +229,7 @@ include(cmake/api.cmake)
 include(cmake/library.cmake)
 include(cmake/exec.cmake)
 include(cmake/plugin.cmake)
+include(cmake/crypto_engines.cmake)
 
 ##############################################################################
 # FreeBSD - use epoll-shim
@@ -278,7 +264,7 @@ elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux|FreeBSD")
   find_package(OpenSSL)
   set(SUBDIRS
     vppinfra svm vlib vlibmemory vlibapi vnet vpp vat vat2 vcl vpp-api
-    plugins tools/vppapigen tools/g2 tools/perftool cmake pkg
+    plugins crypto_engines tools/vppapigen tools/g2 tools/perftool cmake pkg
     tools/appimage
   )
 elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")

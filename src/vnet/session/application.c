@@ -18,6 +18,7 @@
 #include <vnet/session/application_namespace.h>
 #include <vnet/session/application_local.h>
 #include <vnet/session/session.h>
+#include <vnet/session/segment_manager.h>
 
 static app_main_t app_main;
 
@@ -175,8 +176,8 @@ app_listener_alloc_and_init (application_t * app,
     {
       session_type_t local_st;
 
-      local_st = session_type_from_proto_and_ip (TRANSPORT_PROTO_NONE,
-						 sep->is_ip4);
+      local_st =
+	session_type_from_proto_and_ip (TRANSPORT_PROTO_CT, sep->is_ip4);
       ls = listen_session_alloc (0, local_st);
       ls->app_wrk_index = sep->app_wrk_index;
       lh = session_handle (ls);
@@ -1084,6 +1085,7 @@ application_alloc_worker_and_init (application_t * app, app_worker_t ** wrk)
       return rv;
     }
   sm->first_is_protected = 1;
+  sm->flags |= SEG_MANAGER_F_CONNECTS;
 
   /*
    * Setup app worker
@@ -1430,7 +1432,7 @@ vnet_connect (vnet_connect_args_t *a)
       session_error_t rv;
 
       a->sep_ext.original_tp = a->sep_ext.transport_proto;
-      a->sep_ext.transport_proto = TRANSPORT_PROTO_NONE;
+      a->sep_ext.transport_proto = TRANSPORT_PROTO_CT;
       rv = app_worker_connect_session (client_wrk, &a->sep_ext, &a->sh);
       a->sep_ext.transport_proto = a->sep_ext.original_tp;
       if (!rv || rv != SESSION_E_LOCAL_CONNECT)
@@ -1848,6 +1850,9 @@ format_application (u8 * s, va_list * args)
   const u8 *app_ns_name, *app_name;
   app_worker_map_t *wrk_map;
   app_worker_t *app_wrk;
+  segment_manager_t *sm;
+  u64 handle;
+  u32 sm_index;
 
   if (app == 0)
     {
@@ -1876,6 +1881,17 @@ format_application (u8 * s, va_list * args)
   pool_foreach (wrk_map, app->worker_maps)  {
       app_wrk = app_worker_get (wrk_map->wrk_index);
       s = format (s, "%U", format_app_worker, app_wrk);
+      if (verbose > 1)
+	{
+	  sm = segment_manager_get (app_wrk->connects_seg_manager);
+	  s = format (s, "segment manager\n %U", format_segment_manager, sm,
+		      1 /* verbose */);
+	  hash_foreach (handle, sm_index, app_wrk->listeners_table, ({
+			  sm = segment_manager_get (sm_index);
+			  s = format (s, " %U\n", format_segment_manager, sm,
+				      1 /* verbose */);
+			}));
+	}
   }
 
   return s;
@@ -2034,7 +2050,7 @@ show_app_command_fn (vlib_main_t * vm, unformat_input_t * input,
       if (!app)
 	return clib_error_return (0, "No app with index %u", app_index);
 
-      vlib_cli_output (vm, "%U", format_application, app, /* verbose */ 1);
+      vlib_cli_output (vm, "%U", format_application, app, ++verbose);
       return 0;
     }
 

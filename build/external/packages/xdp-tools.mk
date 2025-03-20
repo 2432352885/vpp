@@ -14,8 +14,9 @@
 
 xdp-tools_version             := 1.2.9
 xdp-tools_tarball             := xdp-tools-$(xdp-tools_version).tar.gz
-xdp-tools_tarball_md5sum_1.2.9:= 6e4a49ceea8354bb7bb3b55990e9aed7
-xdp-tools_tarball_md5sum      := $(xdp-tools_tarball_md5sum_$(xdp-tools_version))
+xdp-tools_tarball_sha256sum_1.2.9 := 3f8d30bd2e00c522103d224014f59a95400144aba1f3b322c6ad473541a0f99e
+
+xdp-tools_tarball_sha256sum      := $(xdp-tools_tarball_sha256sum_$(xdp-tools_version))
 xdp-tools_tarball_strip_dirs  := 1
 xdp-tools_url                 := https://github.com/xdp-project/xdp-tools/releases/download/v$(xdp-tools_version)/$(xdp-tools_tarball)
 
@@ -24,7 +25,7 @@ define  xdp-tools_config_cmds
 endef
 
 define  xdp-tools_build_cmds
-	@cd ${xdp-tools_src_dir} && $(MAKE) V=1 BUILD_STATIC_ONLY=y > $(xdp-tools_build_log)
+	@cd ${xdp-tools_src_dir} && $(MAKE) CC=gcc V=1 BUILD_STATIC_ONLY=y > $(xdp-tools_build_log)
 endef
 
 define  xdp-tools_install_cmds

@@ -299,7 +299,7 @@ tcp_make_options (tcp_connection_t * tc, tcp_options_t * opts,
 void
 tcp_update_burst_snd_vars (tcp_connection_t * tc)
 {
-  tcp_main_t *tm = &tcp_main;
+  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
 
   /* Compute options to be used for connection. These may be reused when
    * sending data or to compute the effective mss (snd_mss) */
@@ -310,8 +310,7 @@ tcp_update_burst_snd_vars (tcp_connection_t * tc)
   tc->snd_mss = clib_min (tc->mss, tc->rcv_opts.mss) - tc->snd_opts_len;
   ASSERT (tc->snd_mss > 0);
 
-  tcp_options_write (tm->wrk_ctx[tc->c_thread_index].cached_opts,
-		     &tc->snd_opts);
+  tcp_options_write (wrk->cached_opts, &tc->snd_opts);
 
   tcp_update_rcv_wnd (tc);
 
@@ -875,7 +874,6 @@ tcp_push_hdr_i (tcp_connection_t * tc, vlib_buffer_t * b, u32 snd_nxt,
 {
   u8 tcp_hdr_opts_len, flags = TCP_FLAG_ACK;
   u32 advertise_wnd, data_len;
-  tcp_main_t *tm = &tcp_main;
   tcp_header_t *th;
 
   data_len = b->current_length;
@@ -907,9 +905,8 @@ tcp_push_hdr_i (tcp_connection_t * tc, vlib_buffer_t * b, u32 snd_nxt,
 
   if (maybe_burst)
     {
-      clib_memcpy_fast ((u8 *) (th + 1),
-			tm->wrk_ctx[tc->c_thread_index].cached_opts,
-			tc->snd_opts_len);
+      tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+      clib_memcpy_fast ((u8 *) (th + 1), wrk->cached_opts, tc->snd_opts_len);
     }
   else
     {
@@ -1282,6 +1279,32 @@ tcp_cc_init_rxt_timeout (tcp_connection_t * tc)
   tcp_recovery_on (tc);
 }
 
+static void
+tcp_check_syn_flood (tcp_connection_t *tc)
+{
+  tcp_main_t *tm = &tcp_main;
+  auto_sdl_track_prefix_args_t args = {};
+
+  if (tm->sdl_cb == 0)
+    return;
+
+  args.prefix.fp_addr = tc->c_rmt_ip;
+  if (tc->c_is_ip4)
+    {
+      args.prefix.fp_proto = FIB_PROTOCOL_IP4;
+      args.prefix.fp_len = 32;
+    }
+  else
+    {
+      args.prefix.fp_proto = FIB_PROTOCOL_IP6;
+      args.prefix.fp_len = 128;
+    }
+  args.fib_index = tc->c_fib_index;
+  args.action_index = 0;
+  args.tag = 0;
+  tm->sdl_cb (&args);
+}
+
 void
 tcp_timer_retransmit_handler (tcp_connection_t * tc)
 {
@@ -1397,6 +1420,8 @@ tcp_timer_retransmit_handler (tcp_connection_t * tc)
 	  tcp_connection_timers_reset (tc);
 	  tcp_program_cleanup (wrk, tc);
 	  tcp_worker_stats_inc (wrk, tr_abort, 1);
+
+	  tcp_check_syn_flood (tc);
 	  return;
 	}
 
@@ -1458,6 +1483,8 @@ tcp_timer_retransmit_syn_handler (tcp_connection_t * tc)
   TCP_EVT (TCP_EVT_CC_EVT, tc, 2);
   tc->rtt_ts = 0;
 
+  tcp_worker_stats_inc (wrk, to_establish, 1);
+
   /* Active open establish timeout */
   if (tc->rto >= TCP_ESTABLISH_TIME >> 1)
     {
@@ -1506,6 +1533,8 @@ tcp_timer_persist_handler (tcp_connection_t * tc)
   vlib_buffer_t *b;
   int n_bytes = 0;
   u8 *data;
+
+  tcp_worker_stats_inc (wrk, to_persist, 1);
 
   /* Problem already solved or worse */
   if (tc->state == TCP_STATE_CLOSED || tc->snd_wnd > tc->snd_mss

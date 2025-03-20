@@ -9,5 +9,3 @@ Package: vpp-ext-deps
 Architecture: any
 Depends: ${shlibs:Depends}
 Description: VPP developer package containing dependencies
-Replaces: vpp-dpdk-dev
-Conflicts: vpp-dpdk-dev

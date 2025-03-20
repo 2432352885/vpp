@@ -300,6 +300,10 @@ vapi_lookup_vapi_msg_id_t (vapi_ctx_t ctx, u16 vl_msg_id)
 vapi_error_e
 vapi_ctx_alloc (vapi_ctx_t * result)
 {
+  if (!clib_mem_get_per_cpu_heap () && !clib_mem_init (0, 1024L * 1024 * 32))
+    {
+      return VAPI_ENOMEM;
+    }
   vapi_ctx_t ctx = calloc (1, sizeof (struct vapi_ctx_s));
   if (!ctx)
     {
@@ -927,6 +931,7 @@ vapi_sock_client_disconnect (vapi_ctx_t ctx)
     }
 
   clib_socket_close (&ctx->client_socket);
+  clib_socket_free (&ctx->client_socket);
   vapi_api_name_and_crc_free (ctx);
   return VAPI_OK;
 }
@@ -967,11 +972,6 @@ vapi_connect_ex (vapi_ctx_t ctx, const char *name, const char *path,
       return VAPI_EINVAL;
     }
 
-  if (!clib_mem_get_per_cpu_heap () && !clib_mem_init (0, 1024L * 1024 * 32))
-    {
-      return VAPI_ENOMEM;
-    }
-
   ctx->requests_size = max_outstanding_requests;
   const size_t size = ctx->requests_size * sizeof (*ctx->requests);
   void *tmp = realloc (ctx->requests, size);
@@ -987,7 +987,7 @@ vapi_connect_ex (vapi_ctx_t ctx, const char *name, const char *path,
 
   if (use_uds)
     {
-      if (vapi_sock_client_connect (ctx, (char *) path, name) < 0)
+      if (vapi_sock_client_connect (ctx, (char *) path, name) != VAPI_OK)
 	{
 	  return VAPI_ECON_FAIL;
 	}
@@ -1358,6 +1358,7 @@ vapi_sock_disconnect (vapi_ctx_t ctx)
     }
 fail:
   clib_socket_close (&ctx->client_socket);
+  clib_socket_free (&ctx->client_socket);
   vapi_api_name_and_crc_free (ctx);
 
   ctx->connected = false;
@@ -1625,7 +1626,8 @@ vapi_wait (vapi_ctx_t ctx)
     return VAPI_ENOTSUP;
 
   svm_queue_lock (ctx->vl_input_queue);
-  svm_queue_wait (ctx->vl_input_queue);
+  if (ctx->vl_input_queue->cursize == 0)
+    svm_queue_wait (ctx->vl_input_queue);
   svm_queue_unlock (ctx->vl_input_queue);
 
   return VAPI_OK;

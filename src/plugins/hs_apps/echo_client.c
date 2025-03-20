@@ -96,8 +96,7 @@ send_data_chunk (ec_main_t *ecm, ec_session_t *es)
 	  svm_fifo_t *f = es->tx_fifo;
 	  rv = clib_min (svm_fifo_max_enqueue_prod (f), bytes_this_chunk);
 	  svm_fifo_enqueue_nocopy (f, rv);
-	  session_send_io_evt_to_thread_custom (
-	    &es->vpp_session_index, es->thread_index, SESSION_IO_EVT_TX);
+	  session_program_tx_io_evt (es->tx_fifo->vpp_sh, SESSION_IO_EVT_TX);
 	}
       else
 	rv =
@@ -132,8 +131,7 @@ send_data_chunk (ec_main_t *ecm, ec_session_t *es)
 	  hdr.lcl_port = at->lcl_port;
 	  svm_fifo_enqueue (f, sizeof (hdr), (u8 *) & hdr);
 	  svm_fifo_enqueue_nocopy (f, rv);
-	  session_send_io_evt_to_thread_custom (
-	    &es->vpp_session_index, es->thread_index, SESSION_IO_EVT_TX);
+	  session_program_tx_io_evt (es->tx_fifo->vpp_sh, SESSION_IO_EVT_TX);
 	}
       else
 	{
@@ -429,8 +427,11 @@ ec_init (vlib_main_t *vm)
 
   ecm->app_is_init = 1;
 
+  session_enable_disable_args_t args = { .is_en = 1,
+					 .rt_engine_type =
+					   RT_BACKEND_ENGINE_RULE_TABLE };
   vlib_worker_thread_barrier_sync (vm);
-  vnet_session_enable_disable (vm, 1 /* turn on session and transports */);
+  vnet_session_enable_disable (vm, &args);
 
   /* Turn on the builtin client input nodes */
   foreach_vlib_main ()
@@ -540,7 +541,7 @@ ec_ctrl_send (hs_test_cmd_t cmd)
 
   rv = svm_fifo_enqueue (s->tx_fifo, sizeof (ecm->cfg), (u8 *) &ecm->cfg);
   ASSERT (rv == sizeof (ecm->cfg));
-  session_send_io_evt_to_thread (s->tx_fifo, SESSION_IO_EVT_TX);
+  session_program_tx_io_evt (s->handle, SESSION_IO_EVT_TX);
   return 0;
 }
 
@@ -943,15 +944,16 @@ ec_connect_rpc (void *args)
       a->api_context = ci;
       if (needs_crypto)
 	{
-	  session_endpoint_alloc_ext_cfg (&a->sep_ext,
-					  TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
-	  a->sep_ext.ext_cfg->crypto.ckpair_index = ecm->ckpair_index;
+	  transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
+	    &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	    sizeof (transport_endpt_crypto_cfg_t));
+	  ext_cfg->crypto.ckpair_index = ecm->ckpair_index;
 	}
 
       rv = vnet_connect (a);
 
       if (needs_crypto)
-	clib_mem_free (a->sep_ext.ext_cfg);
+	session_endpoint_free_ext_cfgs (&a->sep_ext);
 
       if (rv)
 	{

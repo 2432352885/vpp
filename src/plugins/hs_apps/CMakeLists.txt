@@ -21,8 +21,10 @@ add_vpp_plugin(hs_apps
   hs_apps.c
   http_cli.c
   http_client_cli.c
+  http_client.c
   http_tps.c
   proxy.c
+  test_builtins.c
 )
 
 ##############################################################################
@@ -72,4 +74,9 @@ if(VPP_BUILD_VCL_TESTS)
       NO_INSTALL
     )
   endforeach()
+
+  add_vpp_executable(vcl_test_cl_udp SOURCES "vcl/vcl_test_cl_udp.c"
+    LINK_LIBRARIES vppcom pthread ${EPOLL_LIB}
+    NO_INSTALL
+  )
 endif(VPP_BUILD_VCL_TESTS)

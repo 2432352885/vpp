@@ -162,6 +162,22 @@ lcp_itf_pair_get (u32 index)
   return pool_elt_at_index (lcp_itf_pair_pool, index);
 }
 
+/* binary-direct API: for access from other plugins, bypassing VAPI.
+ * Important for parameters and return types to be simple C types, rather
+ * than structures. See src/plugins/sflow/sflow_dlapi.h for an example.
+ */
+u32
+lcp_itf_pair_get_vif_index_by_phy (u32 phy_sw_if_index)
+{
+  if (phy_sw_if_index < vec_len (lip_db_by_phy))
+    {
+      lcp_itf_pair_t *lip = lcp_itf_pair_get (lip_db_by_phy[phy_sw_if_index]);
+      if (lip)
+	return lip->lip_vif_index;
+    }
+  return INDEX_INVALID;
+}
+
 index_t
 lcp_itf_pair_find_by_vif (u32 vif_index)
 {
@@ -1001,7 +1017,8 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 	  clib_max (1, lcp_get_default_num_queues (0 /* is_tx */)),
 	.num_tx_queues =
 	  clib_max (1, lcp_get_default_num_queues (1 /* is_tx */)),
-	.id = hw->hw_if_index,
+	.id = ~0,
+	.auto_id_offset = 4096,
 	.sw_if_index = ~0,
 	.rx_ring_sz = 256,
 	.tx_ring_sz = 256,
@@ -1207,6 +1224,53 @@ lcp_itf_pair_link_up_down (vnet_main_t *vnm, u32 hw_if_index, u32 flags)
 	  hi->link_speed != UINT32_MAX)
 	{
 	  tap_set_speed (si->hw_if_index, hi->link_speed / 1000);
+	}
+    }
+
+  return 0;
+}
+
+int
+lcp_ethertype_enable (ethernet_type_t ethertype)
+{
+  ethernet_main_t *em = &ethernet_main;
+  ethernet_type_info_t *eti;
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_node_t *node = vlib_get_node_by_name (vm, (u8 *) "linux-cp-punt-xc");
+
+  if (!node)
+    return VNET_API_ERROR_UNIMPLEMENTED;
+
+  eti = ethernet_get_type_info (em, ethertype);
+  if (!eti)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (eti->node_index != ~0 && eti->node_index != node->index)
+    return VNET_API_ERROR_INVALID_REGISTRATION;
+
+  ethernet_register_input_type (vm, ethertype, node->index);
+  return 0;
+}
+
+int
+lcp_ethertype_get_enabled (ethernet_type_t **ethertypes_vec)
+{
+  ethernet_main_t *em = &ethernet_main;
+  ethernet_type_info_t *eti;
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_node_t *node = vlib_get_node_by_name (vm, (u8 *) "linux-cp-punt-xc");
+
+  if (!ethertypes_vec)
+    return VNET_API_ERROR_INVALID_ARGUMENT;
+
+  if (!node)
+    return VNET_API_ERROR_UNIMPLEMENTED;
+
+  vec_foreach (eti, em->type_infos)
+    {
+      if (eti->node_index == node->index)
+	{
+	  vec_add1 (*ethertypes_vec, eti->type);
 	}
     }
 

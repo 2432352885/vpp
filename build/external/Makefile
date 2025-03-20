@@ -11,44 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Scripts require non-POSIX parts of bash
-SHELL := $(shell which bash)
-
-DL_CACHE_DIR = $(HOME)/Downloads
-MAKE_ARGS ?= -j
-BUILD_DIR        ?= $(CURDIR)/_build
-INSTALL_DIR      ?= $(CURDIR)/_install
-PKG_VERSION ?= $(shell git describe --abbrev=0 --match 'v[0-9]*' | cut -d- -f1 | cut -dv -f2 | cut -d. -f1,2)
 PKG_SUFFIX ?= $(shell git log --oneline v$(PKG_VERSION)-rc0.. . | wc -l)
-SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct .)
-ifeq ($(shell uname), FreeBSD)
-JOBS := $(shell nproc)
-else
-JOBS := $(if $(shell [ -f /proc/cpuinfo ] && head /proc/cpuinfo),\
-	$(shell grep -c ^processor /proc/cpuinfo), 2)
-endif	# FreeBSD
 
-B := $(BUILD_DIR)
-I := $(INSTALL_DIR)
+include ../build_common.mk
+include ../packages_common.mk
 
-ifneq ($(shell which cmake3),)
-CMAKE?=cmake3
-else
-CMAKE?=cmake
-endif
-
-ARCH_X86_64=$(filter x86_64,$(shell uname -m))
-AARCH64=$(filter aarch64,$(shell uname -m))
-
-include packages.mk
 include packages/ipsec-mb.mk
 include packages/quicly.mk
 ifneq ($(shell uname), FreeBSD)
 include packages/rdma-core.mk
-include packages/dpdk.mk
 include packages/xdp-tools.mk
 include packages/octeon-roc.mk
-endif	# FreeBSD
+endif	# ! FreeBSD
+include packages/dpdk.mk
 
 .PHONY: clean
 clean:
@@ -56,14 +31,14 @@ clean:
 
 .PHONY: install
 ifeq ($(shell uname), FreeBSD)
-install: $(if $(ARCH_X86_64), ipsec-mb-install) quicly-install
+install: $(if $(ARCH_X86_64), ipsec-mb-install) dpdk-install quicly-install
 else
 install: $(if $(ARCH_X86_64), ipsec-mb-install) dpdk-install rdma-core-install quicly-install xdp-tools-install $(if $(AARCH64), octeon-roc-install)
 endif	# FreeBSD
 
 .PHONY: config
 ifeq ($(shell uname), FreeBSD)
-config: $(if $(ARCH_X86_64), ipsec-mb-config) quicly-build
+config: $(if $(ARCH_X86_64), ipsec-mb-config) dpdk-config quicly-build
 else
 config: $(if $(ARCH_X86_64), ipsec-mb-config) dpdk-config rdma-core-config quicly-build
 endif	# FreeBSD

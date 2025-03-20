@@ -103,8 +103,10 @@ oct_rx_batch (vlib_main_t *vm, oct_rx_node_ctx_t *ctx,
 	      vnet_dev_rx_queue_t *rxq, u32 n)
 {
   oct_rxq_t *crq = vnet_dev_get_rx_queue_data (rxq);
-  vlib_buffer_template_t bt = rxq->buffer_template;
-  u32 n_left;
+  vlib_buffer_template_t bt = vnet_dev_get_rx_queue_if_buffer_template (rxq);
+  u32 b0_err_flags = 0, b1_err_flags = 0;
+  u32 b2_err_flags = 0, b3_err_flags = 0;
+  u32 n_left, err_flags = 0;
   oct_nix_rx_cqe_desc_t *d = ctx->next_desc;
   vlib_buffer_t *b[4];
 
@@ -145,6 +147,13 @@ oct_rx_batch (vlib_main_t *vm, oct_rx_node_ctx_t *ctx,
 	  oct_rx_attach_tail (vm, ctx, b[2], d + 2);
 	  oct_rx_attach_tail (vm, ctx, b[3], d + 3);
 	}
+
+      b0_err_flags = (d[0].parse.w[0] >> 20) & 0xFFF;
+      b1_err_flags = (d[1].parse.w[0] >> 20) & 0xFFF;
+      b2_err_flags = (d[2].parse.w[0] >> 20) & 0xFFF;
+      b3_err_flags = (d[3].parse.w[0] >> 20) & 0xFFF;
+
+      err_flags |= b0_err_flags | b1_err_flags | b2_err_flags | b3_err_flags;
     }
 
   for (; n_left; d += 1, n_left -= 1, ctx->to_next += 1)
@@ -157,11 +166,16 @@ oct_rx_batch (vlib_main_t *vm, oct_rx_node_ctx_t *ctx,
       ctx->n_segs += 1;
       if (d[0].sg0.segs > 1)
 	oct_rx_attach_tail (vm, ctx, b[0], d + 0);
+
+      err_flags |= ((d[0].parse.w[0] >> 20) & 0xFFF);
     }
 
   plt_write64 ((crq->cq.wdata | n), crq->cq.door);
   ctx->n_rx_pkts += n;
   ctx->n_left_to_next -= n;
+  if (err_flags)
+    ctx->parse_w0_or = (err_flags << 20);
+
   return n;
 }
 
@@ -333,9 +347,9 @@ oct_rx_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   oct_nix_rx_cqe_desc_t *descs = crq->cq.desc_base;
   oct_nix_lf_cq_op_status_t status;
   oct_rx_node_ctx_t _ctx = {
-    .next_index = rxq->next_index,
-    .sw_if_index = port->intf.sw_if_index,
-    .hw_if_index = port->intf.hw_if_index,
+    .next_index = vnet_dev_get_rx_queue_if_next_index(rxq),
+    .sw_if_index = vnet_dev_get_rx_queue_if_sw_if_index (rxq),
+    .hw_if_index = vnet_dev_get_rx_queue_if_hw_if_index (rxq),
   }, *ctx = &_ctx;
 
   /* get head and tail from NIX_LF_CQ_OP_STATUS */

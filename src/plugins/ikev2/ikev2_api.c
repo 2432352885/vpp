@@ -577,6 +577,7 @@ vl_api_ikev2_child_sa_dump_t_handler (vl_api_ikev2_child_sa_dump_t * mp)
   vec_foreach (child, sa->childs)
   {
     u32 child_sa_index = child - sa->childs;
+    sai = ikev2_encode_sa_index (sai, tkm - im->per_thread_data);
     send_child_sa (child, mp, child_sa_index, sai);
   }
 }
@@ -777,6 +778,38 @@ static void
       rv = VNET_API_ERROR_UNSPECIFIED;
     }
   REPLY_MACRO (VL_API_IKEV2_PROFILE_SET_LIVENESS_REPLY);
+}
+
+static void
+vl_api_ikev2_plugin_set_sleep_interval_t_handler (
+  vl_api_ikev2_plugin_set_sleep_interval_t *mp)
+{
+  vl_api_ikev2_plugin_set_sleep_interval_reply_t *rmp;
+  int rv = 0;
+  clib_error_t *error;
+  error = ikev2_set_sleep_interval (clib_net_to_host_f64 (mp->timeout));
+
+  if (error)
+    {
+      ikev2_log_error ("%U", format_clib_error, error);
+      clib_error_free (error);
+      rv = VNET_API_ERROR_UNSPECIFIED;
+    }
+  REPLY_MACRO (VL_API_IKEV2_PLUGIN_SET_SLEEP_INTERVAL_REPLY);
+}
+
+static void
+vl_api_ikev2_get_sleep_interval_t_handler (
+  vl_api_ikev2_get_sleep_interval_t *mp)
+{
+  vl_api_ikev2_get_sleep_interval_reply_t *rmp;
+  int rv = 0;
+
+  f64 sleep_interval = ikev2_get_sleep_interval ();
+
+  REPLY_MACRO2 (VL_API_IKEV2_GET_SLEEP_INTERVAL_REPLY, ({
+		  rmp->sleep_interval = clib_host_to_net_f64 (sleep_interval);
+		}));
 }
 
 static void

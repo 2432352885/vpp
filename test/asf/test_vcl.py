@@ -564,6 +564,48 @@ class VCLThruHostStackEcho(VCLTestCase):
 @unittest.skipIf(
     "hs_apps" in config.excluded_plugins, "Exclude tests requiring hs_apps plugin"
 )
+class VCLThruHostStackCLUDPEcho(VCLTestCase):
+    """VCL Thru Host Stack CL UDP Echo"""
+
+    @classmethod
+    def setUpClass(cls):
+        super(VCLThruHostStackCLUDPEcho, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(VCLThruHostStackCLUDPEcho, cls).tearDownClass()
+
+    def setUp(self):
+        super(VCLThruHostStackCLUDPEcho, self).setUp()
+
+        self.thru_host_stack_setup()
+        self.pre_test_sleep = 2
+        self.timeout = 5
+
+    def tearDown(self):
+        self.thru_host_stack_tear_down()
+        super(VCLThruHostStackCLUDPEcho, self).tearDown()
+
+    def test_vcl_thru_host_stack_cl_udp_echo(self):
+        """run VCL IPv4 thru host stack CL UDP echo test"""
+        server_args = ["-s", self.loop0.local_ip4]
+        client_args = ["-c", self.loop0.local_ip4]
+        self.thru_host_stack_test(
+            "vcl_test_cl_udp",
+            server_args,
+            "vcl_test_cl_udp",
+            client_args,
+        )
+
+    def show_commands_at_teardown(self):
+        self.logger.debug(self.vapi.cli("show app server"))
+        self.logger.debug(self.vapi.cli("show session verbose"))
+        self.logger.debug(self.vapi.cli("show app mq"))
+
+
+@unittest.skipIf(
+    "hs_apps" in config.excluded_plugins, "Exclude tests requiring hs_apps plugin"
+)
 class VCLThruHostStackTLS(VCLTestCase):
     """VCL Thru Host Stack TLS"""
 
@@ -749,6 +791,59 @@ class VCLThruHostStackQUIC(VCLTestCase):
     def tearDown(self):
         self.thru_host_stack_tear_down()
         super(VCLThruHostStackQUIC, self).tearDown()
+
+    def show_commands_at_teardown(self):
+        self.logger.debug(self.vapi.cli("show app server"))
+        self.logger.debug(self.vapi.cli("show session verbose 2"))
+        self.logger.debug(self.vapi.cli("show app mq"))
+
+
+@unittest.skipIf(
+    "hs_apps" in config.excluded_plugins, "Exclude tests requiring hs_apps plugin"
+)
+class VCLThruHostStackHTTPPost(VCLTestCase):
+    """VCL Thru Host Stack HTTP Post"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.extra_vpp_plugin_config.append("plugin http_plugin.so { enable }")
+        super(VCLThruHostStackHTTPPost, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(VCLThruHostStackHTTPPost, cls).tearDownClass()
+
+    def setUp(self):
+        super(VCLThruHostStackHTTPPost, self).setUp()
+
+        self.thru_host_stack_setup()
+        self.client_uni_dir_http_post_timeout = 20
+        self.server_http_post_args = ["-p", "http", self.server_port]
+        self.client_uni_dir_http_post_test_args = [
+            "-N",
+            "10000",
+            "-U",
+            "-X",
+            "-p",
+            "http",
+            self.loop0.local_ip4,
+            self.server_port,
+        ]
+
+    def test_vcl_thru_host_stack_http_post_uni_dir(self):
+        """run VCL thru host stack uni-directional HTTP POST test"""
+
+        self.timeout = self.client_uni_dir_http_post_timeout
+        self.thru_host_stack_test(
+            "vcl_test_server",
+            self.server_http_post_args,
+            "vcl_test_client",
+            self.client_uni_dir_http_post_test_args,
+        )
+
+    def tearDown(self):
+        self.thru_host_stack_tear_down()
+        super(VCLThruHostStackHTTPPost, self).tearDown()
 
     def show_commands_at_teardown(self):
         self.logger.debug(self.vapi.cli("show app server"))
@@ -1005,34 +1100,6 @@ class LDPThruHostStackIperf(VCLTestCase):
         self.thru_host_stack_test(
             iperf3, self.server_iperf3_args, iperf3, self.client_iperf3_args
         )
-
-
-class LDPThruHostStackIperfMss(VCLTestCase):
-    """LDP Thru Host Stack Iperf with MSS"""
-
-    @classmethod
-    def setUpClass(cls):
-        super(LDPThruHostStackIperfMss, cls).setUpClass()
-
-    @classmethod
-    def tearDownClass(cls):
-        super(LDPThruHostStackIperfMss, cls).tearDownClass()
-
-    def setUp(self):
-        super(LDPThruHostStackIperfMss, self).setUp()
-
-        self.thru_host_stack_setup()
-        self.client_iperf3_timeout = 20
-        self.client_iperf3_args = ["-4", "-t 2", "-c", self.loop0.local_ip4]
-        self.server_iperf3_args = ["-4", "-s"]
-
-    def tearDown(self):
-        self.thru_host_stack_tear_down()
-        super(LDPThruHostStackIperfMss, self).tearDown()
-
-    def show_commands_at_teardown(self):
-        self.logger.debug(self.vapi.cli("show session verbose 2"))
-        self.logger.debug(self.vapi.cli("show app mq"))
 
     @unittest.skipUnless(_have_iperf3, "'%s' not found, Skipping.")
     def test_ldp_thru_host_stack_iperf3_mss(self):

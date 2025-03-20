@@ -78,8 +78,8 @@ list(APPEND VNET_HEADERS
   dev/args.h
   dev/bus/pci.h
   dev/counters.h
-  dev/dev.h
   dev/dev_funcs.h
+  dev/dev.h
   dev/errors.h
   dev/log.h
   dev/mgmt.h
@@ -266,21 +266,6 @@ list(APPEND VNET_SOURCES
 list(APPEND VNET_HEADERS
   srp/packet.h
   srp/srp.h
-)
-
-##############################################################################
-# Layer 2 protocol: PPP
-##############################################################################
-list(APPEND VNET_SOURCES
-  ppp/node.c
-  ppp/pg.c
-  ppp/ppp.c
-)
-
-list(APPEND VNET_HEADERS
-  ppp/error.def
-  ppp/ppp.h
-  ppp/packet.h
 )
 
 ##############################################################################
@@ -539,6 +524,7 @@ list(APPEND VNET_SOURCES
   crypto/cli.c
   crypto/crypto.c
   crypto/format.c
+  crypto/main.c
   crypto/node.c
   crypto/crypto_api.c
 )
@@ -567,6 +553,7 @@ list(APPEND VNET_SOURCES
   ipsec/ipsec_spd_policy.c
   ipsec/ipsec_tun.c
   ipsec/ipsec_tun_in.c
+  ipsec/main.c
   ipsec/esp_format.c
   ipsec/esp_encrypt.c
   ipsec/esp_decrypt.c
@@ -602,21 +589,9 @@ list(APPEND VNET_HEADERS
   ipsec/ipsec_tun.h
   ipsec/ipsec_types_api.h
   ipsec/ipsec_punt.h
+  ipsec/ipsec_funcs.h
   ipsec/esp.h
   ipsec/ah.h
-)
-
-##############################################################################
-# Layer 3 protocol: osi
-##############################################################################
-list(APPEND VNET_SOURCES
-  osi/node.c
-  osi/osi.c
-  osi/pg.c
-)
-
-list(APPEND VNET_HEADERS
-  osi/osi.h
 )
 
 ##############################################################################
@@ -653,6 +628,7 @@ list(APPEND VNET_HEADERS
   tcp/tcp_debug.h
   tcp/tcp_inlines.h
   tcp/tcp_sack.h
+  tcp/tcp_sdl.h
   tcp/tcp_types.h
   tcp/tcp.h
   tcp/tcp_error.def
@@ -772,29 +748,6 @@ list(APPEND VNET_HEADERS
 )
 
 list(APPEND VNET_API_FILES mpls/mpls.api)
-
-##############################################################################
-# Tunnel protocol: vxlan-gpe
-##############################################################################
-
-list(APPEND VNET_SOURCES
-  vxlan-gpe/vxlan_gpe.c
-  vxlan-gpe/encap.c
-  vxlan-gpe/decap.c
-  vxlan-gpe/vxlan_gpe_api.c
-)
-
-list (APPEND VNET_MULTIARCH_SOURCES
-  vxlan-gpe/decap.c
-)
-
-list(APPEND VNET_HEADERS
-  vxlan-gpe/vxlan_gpe.h
-  vxlan-gpe/vxlan_gpe_packet.h
-  vxlan-gpe/vxlan_gpe_error.def
-)
-
-list(APPEND VNET_API_FILES vxlan-gpe/vxlan_gpe.api)
 
 ##############################################################################
 # ipv6 segment routing
@@ -973,12 +926,14 @@ list(APPEND VNET_API_FILES
 
 if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
 list(APPEND VNET_SOURCES
+  dev/bus/platform.c
   devices/tap/cli.c
   devices/tap/tap.c
   devices/tap/tapv2_api.c
 )
 
 list(APPEND VNET_HEADERS
+  dev/bus/platform.h
   devices/tap/tap.h
 )
 
@@ -1023,6 +978,7 @@ list(APPEND VNET_SOURCES
   session/application_namespace.c
   session/segment_manager.c
   session/session_api.c
+  session/session_sdl.c
 )
 
 list(APPEND VNET_HEADERS
@@ -1053,10 +1009,13 @@ list(APPEND VNET_API_FILES session/session.api)
 
 list(APPEND VNET_SOURCES
   tls/tls.c
+  tls/tls_record.c
 )
 
 list(APPEND VNET_HEADERS
   tls/tls.h
+  tls/tls_inlines.h
+  tls/tls_record.h
   tls/tls_test.h
 )
 
@@ -1156,6 +1115,7 @@ list(APPEND VNET_HEADERS
   fib/fib_sas.h
   fib/fib_source.h
   fib/fib_urpf_list.h
+  fib/fib_walk.h
 )
 
 list(APPEND VNET_API_FILES

@@ -16,15 +16,7 @@ enable_language(ASM)
 ##############################################################################
 # find libdl
 ##############################################################################
-vpp_find_path(LIBDL_INCLUDE_DIR dlfcn.h)
-vpp_find_library(LIBDL_LIB NAMES dl)
-
-if (LIBDL_INCLUDE_DIR AND LIBDL_LIB)
-  message(STATUS "libdl found at ${LIBDL_LIB}")
-  list(APPEND VPPINFRA_LIBS ${LIBDL_LIB})
-else()
-  message(FATAL_ERROR "libdl not found")
-endif()
+list(APPEND VPPINFRA_LIBS ${CMAKE_DL_LIBS})
 
 ##############################################################################
 # find libunwind
@@ -77,6 +69,7 @@ set(VPPINFRA_SRCS
   bitmap.c
   bihash_all_vector.c
   cpu.c
+  devicetree.c
   dlmalloc.c
   elf.c
   elog.c
@@ -159,6 +152,7 @@ set(VPPINFRA_HEADERS
   crypto/aes_ctr.h
   crypto/aes_gcm.h
   crypto/poly1305.h
+  devicetree.h
   dlist.h
   dlmalloc.h
   elf_clib.h

@@ -9,7 +9,6 @@ from scapy.layers.inet import IP, UDP, TCP, ICMP, icmptypes, icmpcodes
 from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import Ether, Dot1Q, ARP
 from scapy.packet import Raw
-from six import moves
 
 from framework import VppTestCase
 from asfframework import VppTestRunner, tag_fixme_vpp_workers
@@ -142,13 +141,11 @@ class TestIPv4(VppTestCase):
 
         pkts = [
             self.modify_packet(src_if, i, pkt_tmpl)
-            for i in moves.range(
-                self.pg_if_packet_sizes[0], self.pg_if_packet_sizes[1], 10
-            )
+            for i in range(self.pg_if_packet_sizes[0], self.pg_if_packet_sizes[1], 10)
         ]
         pkts_b = [
             self.modify_packet(src_if, i, pkt_tmpl)
-            for i in moves.range(
+            for i in range(
                 self.pg_if_packet_sizes[1] + hdr_ext,
                 self.pg_if_packet_sizes[2] + hdr_ext,
                 50,
@@ -1456,7 +1453,7 @@ class TestIPLoadBalance(VppTestCase):
             src_pkts.append(
                 (
                     Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
-                    / IP(dst="1.1.1.1", src="20.0.0.%d" % ii)
+                    / IP(dst="1.1.1.1", src="20.0.0.%d" % (ii % 256))
                     / UDP(sport=1234, dport=1234)
                     / Raw(b"\xa5" * 100)
                 )

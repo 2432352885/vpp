@@ -1,7 +1,16 @@
-FROM hs-test/build
+ARG UBUNTU_VERSION=22.04
+
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG TARGETARCH
+
+RUN apt-get update \
+ && apt-get install -y xz-utils wget \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY script/build_curl.sh /build_curl.sh
-RUN apt-get update && apt-get install wget
+COPY resources/curl/* /tmp/
+RUN fallocate -l 10MB /tmp/testFile
 RUN /build_curl.sh
 
 CMD ["/bin/sh"]

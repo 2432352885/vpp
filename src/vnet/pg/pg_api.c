@@ -33,11 +33,24 @@ vl_api_pg_create_interface_t_handler (vl_api_pg_create_interface_t * mp)
 {
   vl_api_pg_create_interface_reply_t *rmp;
   int rv = 0;
+  u32 pg_if_id = ~0;
 
   pg_main_t *pg = &pg_main;
-  u32 pg_if_id =
-    pg_interface_add_or_get (pg, ntohl (mp->interface_id), mp->gso_enabled,
-			     ntohl (mp->gso_size), 0, PG_MODE_ETHERNET);
+  pg_interface_args_t args = { 0 };
+
+  args.mode = PG_MODE_ETHERNET;
+  args.gso_size = 0;
+  args.hw_addr_set = 0;
+  args.flags = 0;
+  args.if_id = ntohl (mp->interface_id);
+
+  if (mp->gso_enabled)
+    {
+      args.flags = PG_INTERFACE_FLAG_GSO;
+      args.gso_size = ntohl (mp->gso_size);
+    }
+
+  pg_if_id = pg_interface_add_or_get (pg, &args);
   pg_interface_t *pi = pool_elt_at_index (pg->interfaces, pg_if_id);
 
   REPLY_MACRO2(VL_API_PG_CREATE_INTERFACE_REPLY,
@@ -51,11 +64,25 @@ vl_api_pg_create_interface_v2_t_handler (vl_api_pg_create_interface_v2_t *mp)
 {
   vl_api_pg_create_interface_v2_reply_t *rmp;
   int rv = 0;
+  u32 pg_if_id = ~0;
 
   pg_main_t *pg = &pg_main;
-  u32 pg_if_id =
-    pg_interface_add_or_get (pg, ntohl (mp->interface_id), mp->gso_enabled,
-			     ntohl (mp->gso_size), 0, (u8) mp->mode);
+
+  pg_interface_args_t args = { 0 };
+
+  args.mode = (pg_interface_mode_t) mp->mode;
+  args.gso_size = 0;
+  args.hw_addr_set = 0;
+  args.flags = 0;
+  args.if_id = ntohl (mp->interface_id);
+
+  if (mp->gso_enabled)
+    {
+      args.flags = PG_INTERFACE_FLAG_GSO;
+      args.gso_size = ntohl (mp->gso_size);
+    }
+
+  pg_if_id = pg_interface_add_or_get (pg, &args);
   pg_interface_t *pi = pool_elt_at_index (pg->interfaces, pg_if_id);
 
   REPLY_MACRO2 (VL_API_PG_CREATE_INTERFACE_V2_REPLY,
@@ -63,18 +90,36 @@ vl_api_pg_create_interface_v2_t_handler (vl_api_pg_create_interface_v2_t *mp)
 }
 
 static void
+vl_api_pg_delete_interface_t_handler (vl_api_pg_delete_interface_t *mp)
+{
+  vl_api_pg_delete_interface_reply_t *rmp;
+  pg_main_t *pg = &pg_main;
+  u32 sw_if_index = ~0;
+  int rv = 0;
+
+  VALIDATE_SW_IF_INDEX (mp);
+
+  sw_if_index = ntohl (mp->sw_if_index);
+
+  rv = pg_interface_delete (sw_if_index);
+
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_PG_DELETE_INTERFACE_REPLY);
+}
+
+static void
   vl_api_pg_interface_enable_disable_coalesce_t_handler
   (vl_api_pg_interface_enable_disable_coalesce_t * mp)
 {
   vl_api_pg_interface_enable_disable_coalesce_reply_t *rmp;
+  pg_main_t *pg = &pg_main;
+  vnet_main_t *vnm = vnet_get_main ();
   int rv = 0;
 
   VALIDATE_SW_IF_INDEX (mp);
 
   u32 sw_if_index = ntohl (mp->sw_if_index);
 
-  pg_main_t *pg = &pg_main;
-  vnet_main_t *vnm = vnet_get_main ();
   vnet_hw_interface_t *hw =
     vnet_get_sup_hw_interface_api_visible_or_null (vnm, sw_if_index);
 

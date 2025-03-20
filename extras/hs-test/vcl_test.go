@@ -1,14 +1,15 @@
 package main
 
 import (
-	. "fd.io/hs-test/infra"
 	"fmt"
 	"time"
+
+	. "fd.io/hs-test/infra"
 )
 
 func init() {
 	RegisterVethTests(XEchoVclClientUdpTest, XEchoVclClientTcpTest, XEchoVclServerUdpTest,
-		XEchoVclServerTcpTest, VclEchoTcpTest, VclEchoUdpTest, VclRetryAttachTest)
+		XEchoVclServerTcpTest, VclEchoTcpTest, VclEchoUdpTest, VclHttpPostTest, VclRetryAttachTest)
 }
 
 func getVclConfig(c *Container, ns_id_optional ...string) string {
@@ -39,18 +40,17 @@ func XEchoVclClientTcpTest(s *VethsSuite) {
 
 func testXEchoVclClient(s *VethsSuite, proto string) {
 	port := "12345"
-	serverVpp := s.GetContainerByName("server-vpp").VppInstance
+	serverVpp := s.Containers.ServerVpp.VppInstance
 
-	serverVeth := s.GetInterfaceByName(ServerInterfaceName)
-	serverVpp.Vppctl("test echo server uri %s://%s/%s fifo-size 64k", proto, serverVeth.Ip4AddressString(), port)
+	serverVpp.Vppctl("test echo server uri %s://%s/%s fifo-size 64k", proto, s.Interfaces.Server.Ip4AddressString(), port)
 
 	echoClnContainer := s.GetTransientContainerByName("client-app")
 	echoClnContainer.CreateFile("/vcl.conf", getVclConfig(echoClnContainer))
 
-	testClientCommand := "vcl_test_client -N 100 -p " + proto + " " + serverVeth.Ip4AddressString() + " " + port
+	testClientCommand := "vcl_test_client -N 100 -p " + proto + " " + s.Interfaces.Server.Ip4AddressString() + " " + port
 	s.Log(testClientCommand)
 	echoClnContainer.AddEnvVar("VCL_CONFIG", "/vcl.conf")
-	o := echoClnContainer.Exec(testClientCommand)
+	o := echoClnContainer.Exec(true, testClientCommand)
 	s.Log(o)
 	s.AssertContains(o, "CLIENT RESULTS")
 }
@@ -65,18 +65,17 @@ func XEchoVclServerTcpTest(s *VethsSuite) {
 
 func testXEchoVclServer(s *VethsSuite, proto string) {
 	port := "12345"
-	srvVppCont := s.GetContainerByName("server-vpp")
-	srvAppCont := s.GetContainerByName("server-app")
+	srvVppCont := s.Containers.ServerVpp
+	srvAppCont := s.Containers.ServerApp
 
 	srvAppCont.CreateFile("/vcl.conf", getVclConfig(srvVppCont))
 	srvAppCont.AddEnvVar("VCL_CONFIG", "/vcl.conf")
 	vclSrvCmd := fmt.Sprintf("vcl_test_server -p %s %s", proto, port)
-	srvAppCont.ExecServer(vclSrvCmd)
+	srvAppCont.ExecServer(true, vclSrvCmd)
 
-	serverVeth := s.GetInterfaceByName(ServerInterfaceName)
-	serverVethAddress := serverVeth.Ip4AddressString()
+	serverVethAddress := s.Interfaces.Server.Ip4AddressString()
 
-	clientVpp := s.GetContainerByName("client-vpp").VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
 	o := clientVpp.Vppctl("test echo client uri %s://%s/%s fifo-size 64k verbose mbytes 2", proto, serverVethAddress, port)
 	s.Log(o)
 	s.AssertContains(o, "Test finished at")
@@ -84,22 +83,21 @@ func testXEchoVclServer(s *VethsSuite, proto string) {
 
 func testVclEcho(s *VethsSuite, proto string) {
 	port := "12345"
-	srvVppCont := s.GetContainerByName("server-vpp")
-	srvAppCont := s.GetContainerByName("server-app")
+	srvVppCont := s.Containers.ServerVpp
+	srvAppCont := s.Containers.ServerApp
 
 	srvAppCont.CreateFile("/vcl.conf", getVclConfig(srvVppCont))
 	srvAppCont.AddEnvVar("VCL_CONFIG", "/vcl.conf")
-	srvAppCont.ExecServer("vcl_test_server " + port)
+	srvAppCont.ExecServer(true, "vcl_test_server -p "+proto+" "+port)
 
-	serverVeth := s.GetInterfaceByName(ServerInterfaceName)
-	serverVethAddress := serverVeth.Ip4AddressString()
+	serverVethAddress := s.Interfaces.Server.Ip4AddressString()
 
 	echoClnContainer := s.GetTransientContainerByName("client-app")
 	echoClnContainer.CreateFile("/vcl.conf", getVclConfig(echoClnContainer))
 
 	testClientCommand := "vcl_test_client -p " + proto + " " + serverVethAddress + " " + port
 	echoClnContainer.AddEnvVar("VCL_CONFIG", "/vcl.conf")
-	o := echoClnContainer.Exec(testClientCommand)
+	o := echoClnContainer.Exec(true, testClientCommand)
 	s.Log(o)
 }
 
@@ -111,6 +109,10 @@ func VclEchoUdpTest(s *VethsSuite) {
 	testVclEcho(s, "udp")
 }
 
+func VclHttpPostTest(s *VethsSuite) {
+	testVclEcho(s, "http")
+}
+
 func VclRetryAttachTest(s *VethsSuite) {
 	testRetryAttach(s, "tcp")
 }
@@ -118,32 +120,31 @@ func VclRetryAttachTest(s *VethsSuite) {
 func testRetryAttach(s *VethsSuite, proto string) {
 	srvVppContainer := s.GetTransientContainerByName("server-vpp")
 
-	echoSrvContainer := s.GetContainerByName("server-app")
+	echoSrvContainer := s.Containers.ServerApp
 
 	echoSrvContainer.CreateFile("/vcl.conf", getVclConfig(echoSrvContainer))
 
 	echoSrvContainer.AddEnvVar("VCL_CONFIG", "/vcl.conf")
-	echoSrvContainer.ExecServer("vcl_test_server -p " + proto + " 12346")
+	echoSrvContainer.ExecServer(true, "vcl_test_server -p "+proto+" 12346")
 
 	s.Log("This whole test case can take around 3 minutes to run. Please be patient.")
 	s.Log("... Running first echo client test, before disconnect.")
 
-	serverVeth := s.GetInterfaceByName(ServerInterfaceName)
-	serverVethAddress := serverVeth.Ip4AddressString()
+	serverVethAddress := s.Interfaces.Server.Ip4AddressString()
 
 	echoClnContainer := s.GetTransientContainerByName("client-app")
 	echoClnContainer.CreateFile("/vcl.conf", getVclConfig(echoClnContainer))
 
 	testClientCommand := "vcl_test_client -U -p " + proto + " " + serverVethAddress + " 12346"
 	echoClnContainer.AddEnvVar("VCL_CONFIG", "/vcl.conf")
-	o := echoClnContainer.Exec(testClientCommand)
+	o := echoClnContainer.Exec(true, testClientCommand)
 	s.Log(o)
 	s.Log("... First test ended. Stopping VPP server now.")
 
 	// Stop server-vpp-instance, start it again and then run vcl-test-client once more
 	srvVppContainer.VppInstance.Disconnect()
 	stopVppCommand := "/bin/bash -c 'ps -C vpp_main -o pid= | xargs kill -9'"
-	srvVppContainer.Exec(stopVppCommand)
+	srvVppContainer.Exec(false, stopVppCommand)
 
 	s.SetupServerVpp()
 
@@ -151,7 +152,7 @@ func testRetryAttach(s *VethsSuite, proto string) {
 	time.Sleep(30 * time.Second) // Wait a moment for the re-attachment to happen
 
 	s.Log("... Running second echo client test, after disconnect and re-attachment.")
-	o = echoClnContainer.Exec(testClientCommand)
+	o = echoClnContainer.Exec(true, testClientCommand)
 	s.Log(o)
 	s.Log("Done.")
 }

@@ -19,14 +19,48 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <http/http_content_types.h>
+
 /** @file static_server.c
  *  Static http server, sufficient to serve .html / .css / .js content.
  */
 /*? %%clicmd:group_label Static HTTP Server %% ?*/
 
 #define HSS_FIFO_THRESH (16 << 10)
-
+#define HSS_HEADER_BUF_MAX_SIZE 16192
 hss_main_t hss_main;
+
+static int
+hss_add_header (hss_session_t *hs, http_header_name_t name, const char *value,
+		uword value_len)
+{
+  u32 needed_size = 0;
+  while (http_add_header (&hs->resp_headers, name, value, value_len) == -1)
+    {
+      if (needed_size)
+	{
+	  http_truncate_headers_list (&hs->resp_headers);
+	  hs->data_len = 0;
+	  return -1;
+	}
+      else
+	needed_size = hs->resp_headers.tail_offset +
+		      sizeof (http_app_header_t) + value_len;
+      if (needed_size < HSS_HEADER_BUF_MAX_SIZE)
+	{
+	  vec_resize (hs->headers_buf, sizeof (http_app_header_t) + value_len);
+	  hs->resp_headers.len = needed_size;
+	  hs->resp_headers.buf = hs->headers_buf;
+	}
+      else
+	{
+	  http_truncate_headers_list (&hs->resp_headers);
+	  hs->data_len = 0;
+	  return -1;
+	}
+    }
+  return 0;
+}
 
 static hss_session_t *
 hss_session_alloc (u32 thread_index)
@@ -38,6 +72,8 @@ hss_session_alloc (u32 thread_index)
   hs->session_index = hs - hsm->sessions[thread_index];
   hs->thread_index = thread_index;
   hs->cache_pool_index = ~0;
+  /* 1kB for headers should be enough for now */
+  vec_validate (hs->headers_buf, 1023);
   return hs;
 }
 
@@ -55,8 +91,6 @@ hss_session_free (hss_session_t *hs)
 {
   hss_main_t *hsm = &hss_main;
 
-  pool_put (hsm->sessions[hs->thread_index], hs);
-
   if (CLIB_DEBUG)
     {
       u32 save_thread_index;
@@ -65,6 +99,8 @@ hss_session_free (hss_session_t *hs)
       memset (hs, 0xfa, sizeof (*hs));
       hs->thread_index = save_thread_index;
     }
+
+  pool_put (hsm->sessions[hs->thread_index], hs);
 }
 
 /** \brief Disconnect a session
@@ -83,48 +119,74 @@ start_send_data (hss_session_t *hs, http_status_code_t status)
 {
   http_msg_t msg;
   session_t *ts;
+  u32 n_enq;
+  u64 to_send;
   int rv;
 
   ts = session_get (hs->vpp_session_index, hs->thread_index);
 
   msg.type = HTTP_MSG_REPLY;
   msg.code = status;
-  msg.content_type = hs->content_type;
-  msg.data.len = hs->data_len;
+  msg.data.body_len = hs->data_len;
+  msg.data.headers_offset = 0;
+  msg.data.headers_len = hs->resp_headers.tail_offset;
+  msg.data.len = msg.data.body_len + msg.data.headers_len;
 
-  if (hs->data_len > hss_main.use_ptr_thresh)
+  if (msg.data.len > hss_main.use_ptr_thresh)
     {
       msg.data.type = HTTP_MSG_DATA_PTR;
       rv = svm_fifo_enqueue (ts->tx_fifo, sizeof (msg), (u8 *) &msg);
       ASSERT (rv == sizeof (msg));
 
+      if (msg.data.headers_len)
+	{
+	  uword headers = pointer_to_uword (hs->headers_buf);
+	  rv =
+	    svm_fifo_enqueue (ts->tx_fifo, sizeof (headers), (u8 *) &headers);
+	  ASSERT (rv == sizeof (headers));
+	}
+
+      if (!msg.data.body_len)
+	goto done;
+
       uword data = pointer_to_uword (hs->data);
       rv = svm_fifo_enqueue (ts->tx_fifo, sizeof (data), (u8 *) &data);
-      ASSERT (rv == sizeof (sizeof (data)));
+      ASSERT (rv == sizeof (data));
 
       goto done;
     }
 
   msg.data.type = HTTP_MSG_DATA_INLINE;
+  msg.data.body_offset = msg.data.headers_len;
 
   rv = svm_fifo_enqueue (ts->tx_fifo, sizeof (msg), (u8 *) &msg);
   ASSERT (rv == sizeof (msg));
 
-  if (!msg.data.len)
+  if (msg.data.headers_len)
+    {
+      rv =
+	svm_fifo_enqueue (ts->tx_fifo, msg.data.headers_len, hs->headers_buf);
+      ASSERT (rv == msg.data.headers_len);
+    }
+
+  if (!msg.data.body_len)
     goto done;
 
-  rv = svm_fifo_enqueue (ts->tx_fifo, hs->data_len, hs->data);
+  to_send = hs->data_len;
+  n_enq = clib_min (svm_fifo_size (ts->tx_fifo), to_send);
 
-  if (rv != hs->data_len)
+  rv = svm_fifo_enqueue (ts->tx_fifo, n_enq, hs->data);
+
+  if (rv < to_send)
     {
-      hs->data_offset = rv;
+      hs->data_offset = (rv > 0) ? rv : 0;
       svm_fifo_add_want_deq_ntf (ts->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
     }
 
 done:
 
   if (svm_fifo_set_event (ts->tx_fifo))
-    session_send_io_evt_to_thread (ts->tx_fifo, SESSION_IO_EVT_TX);
+    session_program_tx_io_evt (ts->handle, SESSION_IO_EVT_TX);
 }
 
 __clib_export void
@@ -142,6 +204,13 @@ hss_session_send_data (hss_url_handler_args_t *args)
   hs->data = args->data;
   hs->data_len = args->data_len;
   hs->free_data = args->free_vec_data;
+
+  /* Set content type only if we have some response data */
+  if (hs->data_len)
+    if (hss_add_header (hs, HTTP_HEADER_CONTENT_TYPE,
+			http_content_type_token (args->ct)))
+      args->sc = HTTP_STATUS_INTERNAL_ERROR;
+
   start_send_data (hs, args->sc);
 }
 
@@ -217,7 +286,6 @@ try_url_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
   http_status_code_t sc = HTTP_STATUS_OK;
   hss_url_handler_args_t args = {};
   uword *p, *url_table;
-  http_content_type_t type;
   int rv;
 
   if (!hsm->enable_url_handlers || !target_path)
@@ -228,8 +296,6 @@ try_url_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
     {
       target_path = format (target_path, "index.html");
     }
-
-  type = content_type_from_request (target_path);
 
   /* Look for built-in GET / POST handlers */
   url_table =
@@ -263,17 +329,22 @@ try_url_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
     {
       clib_warning ("builtin handler %llx hit on %s '%s' but failed!", p[0],
 		    (rt == HTTP_REQ_GET) ? "GET" : "POST", target_path);
-      sc = HTTP_STATUS_NOT_FOUND;
+      sc = HTTP_STATUS_BAD_GATEWAY;
     }
 
   hs->data = args.data;
   hs->data_len = args.data_len;
   hs->free_data = args.free_vec_data;
-  hs->content_type = type;
+
+  /* Set content type only if we have some response data */
+  if (hs->data_len)
+    if (hss_add_header (hs, HTTP_HEADER_CONTENT_TYPE,
+			http_content_type_token (args.ct)))
+      sc = HTTP_STATUS_INTERNAL_ERROR;
 
   start_send_data (hs, sc);
 
-  if (!hs->data)
+  if (!hs->data_len)
     hss_session_disconnect_transport (hs);
 
   return 0;
@@ -337,18 +408,21 @@ try_index_file (hss_main_t *hsm, hss_session_t *hs, u8 *path)
     }
 
   redirect =
-    format (0,
-	    "Location: http%s://%U%s%s\r\n\r\n",
-	    proto == TRANSPORT_PROTO_TLS ? "s" : "", format_ip46_address,
-	    &endpt.ip, endpt.is_ip4, print_port ? port_str : (u8 *) "", path);
+    format (0, "http%s://%U%s%s", proto == TRANSPORT_PROTO_TLS ? "s" : "",
+	    format_ip46_address, &endpt.ip, endpt.is_ip4,
+	    print_port ? port_str : (u8 *) "", path);
 
   if (hsm->debug_level > 0)
     clib_warning ("redirect: %s", redirect);
 
   vec_free (port_str);
 
-  hs->data = redirect;
-  hs->data_len = vec_len (redirect);
+  if (hss_add_header (hs, HTTP_HEADER_LOCATION, (const char *) redirect,
+		      vec_len (redirect)))
+    return HTTP_STATUS_INTERNAL_ERROR;
+
+  vec_free (redirect);
+  hs->data_len = 0;
   hs->free_data = 1;
 
   return HTTP_STATUS_MOVED;
@@ -362,15 +436,14 @@ try_file_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
   u8 *path, *sanitized_path;
   u32 ce_index;
   http_content_type_t type;
+  u8 *last_modified;
 
   /* Feature not enabled */
   if (!hsm->www_root)
     return -1;
 
-  type = content_type_from_request (target);
-
-  /* Remove dot segments to prevent path traversal */
-  sanitized_path = http_path_remove_dot_segments (target);
+  /* Sanitize received path */
+  sanitized_path = http_path_sanitize (target);
 
   /*
    * Construct the file to open
@@ -388,8 +461,8 @@ try_file_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
 
   hs->data_offset = 0;
 
-  ce_index =
-    hss_cache_lookup_and_attach (&hsm->cache, path, &hs->data, &hs->data_len);
+  ce_index = hss_cache_lookup_and_attach (&hsm->cache, path, &hs->data,
+					  &hs->data_len, &last_modified);
   if (ce_index == ~0)
     {
       if (!file_path_is_valid (path))
@@ -408,8 +481,8 @@ try_file_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
 	  sc = try_index_file (hsm, hs, path);
 	  goto done;
 	}
-      ce_index =
-	hss_cache_add_and_attach (&hsm->cache, path, &hs->data, &hs->data_len);
+      ce_index = hss_cache_add_and_attach (&hsm->cache, path, &hs->data,
+					   &hs->data_len, &last_modified);
       if (ce_index == ~0)
 	{
 	  sc = HTTP_STATUS_INTERNAL_ERROR;
@@ -420,11 +493,27 @@ try_file_handler (hss_main_t *hsm, hss_session_t *hs, http_req_method_t rt,
   hs->path = path;
   hs->cache_pool_index = ce_index;
 
+  /* Set following headers only for happy path:
+   * Content-Type
+   * Cache-Control max-age
+   * Last-Modified
+   */
+  type = content_type_from_request (target);
+  if (hss_add_header (hs, HTTP_HEADER_CONTENT_TYPE,
+		      http_content_type_token (type)) ||
+      hss_add_header (hs, HTTP_HEADER_CACHE_CONTROL,
+		      (const char *) hsm->max_age_formatted,
+		      vec_len (hsm->max_age_formatted)) ||
+      hss_add_header (hs, HTTP_HEADER_LAST_MODIFIED,
+		      (const char *) last_modified, vec_len (last_modified)))
+    {
+      sc = HTTP_STATUS_INTERNAL_ERROR;
+    }
+
 done:
   vec_free (sanitized_path);
-  hs->content_type = type;
   start_send_data (hs, sc);
-  if (!hs->data)
+  if (!hs->data_len)
     hss_session_disconnect_transport (hs);
 
   return 0;
@@ -450,6 +539,7 @@ handle_request (hss_session_t *hs, http_req_method_t rt, u8 *target_path,
 static int
 hss_ts_rx_callback (session_t *ts)
 {
+  hss_main_t *hsm = &hss_main;
   hss_session_t *hs;
   u8 *target_path = 0, *target_query = 0, *data = 0;
   http_msg_t msg;
@@ -459,6 +549,9 @@ hss_ts_rx_callback (session_t *ts)
   if (hs->free_data)
     vec_free (hs->data);
   hs->data = 0;
+  hs->data_len = 0;
+  http_init_headers_ctx (&hs->resp_headers, hs->headers_buf,
+			 vec_len (hs->headers_buf));
 
   /* Read the http message header */
   rv = svm_fifo_dequeue (ts->rx_fifo, sizeof (msg), (u8 *) &msg);
@@ -467,14 +560,11 @@ hss_ts_rx_callback (session_t *ts)
   if (msg.type != HTTP_MSG_REQUEST ||
       (msg.method_type != HTTP_REQ_GET && msg.method_type != HTTP_REQ_POST))
     {
-      start_send_data (hs, HTTP_STATUS_METHOD_NOT_ALLOWED);
-      goto done;
-    }
-
-  if (msg.data.target_form != HTTP_TARGET_ORIGIN_FORM)
-    {
-      start_send_data (hs, HTTP_STATUS_BAD_REQUEST);
-      goto done;
+      if (hss_add_header (hs, HTTP_HEADER_ALLOW, http_token_lit ("GET, POST")))
+	start_send_data (hs, HTTP_STATUS_INTERNAL_ERROR);
+      else
+	start_send_data (hs, HTTP_STATUS_METHOD_NOT_ALLOWED);
+      goto err_done;
     }
 
   /* Read target path */
@@ -487,7 +577,7 @@ hss_ts_rx_callback (session_t *ts)
       if (http_validate_abs_path_syntax (target_path, 0))
 	{
 	  start_send_data (hs, HTTP_STATUS_BAD_REQUEST);
-	  goto done;
+	  goto err_done;
 	}
       /* Target path must be a proper C-string in addition to a vector */
       vec_add1 (target_path, 0);
@@ -503,13 +593,24 @@ hss_ts_rx_callback (session_t *ts)
       if (http_validate_query_syntax (target_query, 0))
 	{
 	  start_send_data (hs, HTTP_STATUS_BAD_REQUEST);
-	  goto done;
+	  goto err_done;
 	}
     }
 
-  /* Read body */
-  if (msg.data.body_len)
+  /* Read request body for POST requests */
+  if (msg.data.body_len && msg.method_type == HTTP_REQ_POST)
     {
+      if (msg.data.body_len > hsm->max_body_size)
+	{
+	  start_send_data (hs, HTTP_STATUS_CONTENT_TOO_LARGE);
+	  goto err_done;
+	}
+      if (svm_fifo_max_dequeue (ts->rx_fifo) - msg.data.body_offset <
+	  msg.data.body_len)
+	{
+	  start_send_data (hs, HTTP_STATUS_INTERNAL_ERROR);
+	  goto err_done;
+	}
       vec_validate (data, msg.data.body_len - 1);
       rv = svm_fifo_peek (ts->rx_fifo, msg.data.body_offset, msg.data.body_len,
 			  data);
@@ -518,7 +619,10 @@ hss_ts_rx_callback (session_t *ts)
 
   /* Find and send data */
   handle_request (hs, msg.method_type, target_path, target_query, data);
+  goto done;
 
+err_done:
+  hss_session_disconnect_transport (hs);
 done:
   vec_free (target_path);
   vec_free (target_query);
@@ -531,7 +635,8 @@ static int
 hss_ts_tx_callback (session_t *ts)
 {
   hss_session_t *hs;
-  u32 to_send;
+  u32 n_enq;
+  u64 to_send;
   int rv;
 
   hs = hss_session_get (ts->thread_index, ts->opaque);
@@ -539,7 +644,9 @@ hss_ts_tx_callback (session_t *ts)
     return 0;
 
   to_send = hs->data_len - hs->data_offset;
-  rv = svm_fifo_enqueue (ts->tx_fifo, to_send, hs->data + hs->data_offset);
+  n_enq = clib_min (svm_fifo_size (ts->tx_fifo), to_send);
+
+  rv = svm_fifo_enqueue (ts->tx_fifo, n_enq, hs->data + hs->data_offset);
 
   if (rv <= 0)
     {
@@ -554,7 +661,7 @@ hss_ts_tx_callback (session_t *ts)
     }
 
   if (svm_fifo_set_event (ts->tx_fifo))
-    session_send_io_evt_to_thread (ts->tx_fifo, SESSION_IO_EVT_TX);
+    session_program_tx_io_evt (ts->handle, SESSION_IO_EVT_TX);
 
   return 0;
 }
@@ -648,6 +755,7 @@ hss_ts_cleanup (session_t *s, session_cleanup_ntf_t ntf)
   hs->data = 0;
   hs->data_offset = 0;
   hs->free_data = 0;
+  vec_free (hs->headers_buf);
   vec_free (hs->path);
 
   hss_session_free (hs);
@@ -671,7 +779,7 @@ hss_attach ()
   hss_main_t *hsm = &hss_main;
   u64 options[APP_OPTIONS_N_OPTIONS];
   vnet_app_attach_args_t _a, *a = &_a;
-  u32 segment_size = 128 << 20;
+  u64 segment_size = 128 << 20;
 
   clib_memset (a, 0, sizeof (*a));
   clib_memset (options, 0, sizeof (options));
@@ -728,7 +836,9 @@ hss_listen (void)
   vnet_listen_args_t _a, *a = &_a;
   char *uri = "tcp://0.0.0.0/80";
   u8 need_crypto;
+  transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
+  transport_endpt_cfg_http_t http_cfg = { hsm->keepalive_timeout, 0 };
 
   clib_memset (a, 0, sizeof (*a));
   a->app_index = hsm->app_index;
@@ -744,17 +854,21 @@ hss_listen (void)
   sep.transport_proto = TRANSPORT_PROTO_HTTP;
   clib_memcpy (&a->sep_ext, &sep, sizeof (sep));
 
+  ext_cfg = session_endpoint_add_ext_cfg (
+    &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
+  clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
+
   if (need_crypto)
     {
-      session_endpoint_alloc_ext_cfg (&a->sep_ext,
-				      TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
-      a->sep_ext.ext_cfg->crypto.ckpair_index = hsm->ckpair_index;
+      ext_cfg = session_endpoint_add_ext_cfg (
+	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	sizeof (transport_endpt_crypto_cfg_t));
+      ext_cfg->crypto.ckpair_index = hsm->ckpair_index;
     }
 
   rv = vnet_listen (a);
 
-  if (need_crypto)
-    clib_mem_free (a->sep_ext.ext_cfg);
+  session_endpoint_free_ext_cfgs (&a->sep_ext);
 
   return rv;
 }
@@ -798,6 +912,8 @@ hss_create (vlib_main_t *vm)
   if (hsm->enable_url_handlers)
     hss_url_handlers_init (hsm);
 
+  hsm->max_age_formatted = format (0, "max-age=%d", hsm->max_age);
+
   return 0;
 }
 
@@ -818,6 +934,9 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
   hsm->private_segment_size = 0;
   hsm->fifo_size = 0;
   hsm->cache_size = 10 << 20;
+  hsm->max_age = HSS_DEFAULT_MAX_AGE;
+  hsm->max_body_size = HSS_DEFAULT_MAX_BODY_SIZE;
+  hsm->keepalive_timeout = HSS_DEFAULT_KEEPALIVE_TIMEOUT;
 
   /* Get a line of input. */
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -842,6 +961,9 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (line_input, "debug %d", &hsm->debug_level))
 	;
+      else if (unformat (line_input, "keepalive-timeout %d",
+			 &hsm->keepalive_timeout))
+	;
       else if (unformat (line_input, "debug"))
 	hsm->debug_level = 1;
       else if (unformat (line_input, "ptr-thresh %U", unformat_memory_size,
@@ -849,6 +971,11 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (line_input, "url-handlers"))
 	hsm->enable_url_handlers = 1;
+      else if (unformat (line_input, "max-age %d", &hsm->max_age))
+	;
+      else if (unformat (line_input, "max-body-size %U", unformat_memory_size,
+			 &hsm->max_body_size))
+	;
       else
 	{
 	  error = clib_error_return (0, "unknown input `%U'",
@@ -877,7 +1004,10 @@ no_input:
       goto done;
     }
 
-  vnet_session_enable_disable (vm, 1 /* turn on TCP, etc. */ );
+  session_enable_disable_args_t args = { .is_en = 1,
+					 .rt_engine_type =
+					   RT_BACKEND_ENGINE_RULE_TABLE };
+  vnet_session_enable_disable (vm, &args);
 
   if ((rv = hss_create (vm)))
     {
@@ -900,14 +1030,16 @@ done:
  * http static server www-root /tmp/www uri tcp://0.0.0.0/80 cache-size 2m
  * @cliend
  * @cliexcmd{http static server www-root <path> [prealloc-fios <nn>]
- *   [private-segment-size <nnMG>] [fifo-size <nbytes>] [uri <uri>]}
+ *   [private-segment-size <nnMG>] [fifo-size <nbytes>] [uri <uri>]
+ *   [keepalive-timeout <nn>]}
 ?*/
 VLIB_CLI_COMMAND (hss_create_command, static) = {
   .path = "http static server",
   .short_help =
     "http static server www-root <path> [prealloc-fifos <nn>]\n"
-    "[private-segment-size <nnMG>] [fifo-size <nbytes>] [uri <uri>]\n"
-    "[ptr-thresh <nn>] [url-handlers] [debug [nn]]\n",
+    "[private-segment-size <nnMG>] [fifo-size <nbytes>] [max-age <nseconds>]\n"
+    "[uri <uri>] [ptr-thresh <nn>] [url-handlers] [debug [nn]]\n"
+    "[keepalive-timeout <nn>] [max-body-size <nn>]\n",
   .function = hss_create_command_fn,
 };
 
@@ -917,7 +1049,7 @@ format_hss_session (u8 *s, va_list *args)
   hss_session_t *hs = va_arg (*args, hss_session_t *);
   int __clib_unused verbose = va_arg (*args, int);
 
-  s = format (s, "\n path %s, data length %u, data_offset %u",
+  s = format (s, "\n path %s, data length %llu, data_offset %llu",
 	      hs->path ? hs->path : (u8 *) "[none]", hs->data_len,
 	      hs->data_offset);
   return s;

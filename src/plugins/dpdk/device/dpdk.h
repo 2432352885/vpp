@@ -71,7 +71,8 @@ typedef uint16_t dpdk_portid_t;
   _ (11, RX_FLOW_OFFLOAD, "rx-flow-offload")                                  \
   _ (12, RX_IP4_CKSUM, "rx-ip4-cksum")                                        \
   _ (13, INT_SUPPORTED, "int-supported")                                      \
-  _ (14, INT_UNMASKABLE, "int-unmaskable")
+  _ (14, INT_UNMASKABLE, "int-unmaskable")                                    \
+  _ (15, TX_PREPARE, "tx-prepare")
 
 typedef enum
 {
@@ -131,7 +132,7 @@ typedef struct
   u32 interface_number_from_port_id : 1;
   u32 use_intel_phdr_cksum : 1;
   u32 int_unmaskable : 1;
-  vlib_simple_counter_main_t *xstats_counters;
+  u32 need_tx_prepare : 1;
 } dpdk_driver_t;
 
 dpdk_driver_t *dpdk_driver_find (const char *name, const char **desc);
@@ -211,6 +212,8 @@ typedef struct
   struct rte_eth_stats last_stats;
   struct rte_eth_xstat *xstats;
   f64 time_last_stats_update;
+  vlib_simple_counter_main_t xstats_counters;
+  u32 *xstats_symlinks;
 
   /* mac address */
   u8 *default_mac_address;
@@ -241,6 +244,7 @@ typedef struct
   _ (num_rx_desc)                                                             \
   _ (num_tx_desc)                                                             \
   _ (max_lro_pkt_size)                                                        \
+  _ (disable_rxq_int)                                                         \
   _ (rss_fn)
 
 typedef enum

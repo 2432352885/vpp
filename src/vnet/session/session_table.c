@@ -15,6 +15,7 @@
 
 #include <vnet/session/session_table.h>
 #include <vnet/session/session.h>
+#include <vnet/session/session_rules_table.h>
 
 /**
  * Pool of session tables
@@ -64,12 +65,8 @@ void
 session_table_free (session_table_t *slt, u8 fib_proto)
 {
   u8 all = fib_proto > FIB_PROTOCOL_IP6 ? 1 : 0;
-  int i;
 
-  for (i = 0; i < TRANSPORT_N_PROTOS; i++)
-    session_rules_table_free (&slt->session_rules[i]);
-
-  vec_free (slt->session_rules);
+  session_rules_table_free (slt, fib_proto);
 
   if (fib_proto == FIB_PROTOCOL_IP4 || all)
     {
@@ -82,6 +79,7 @@ session_table_free (session_table_t *slt, u8 fib_proto)
       clib_bihash_free_48_8 (&slt->v6_half_open_hash);
     }
 
+  vec_free (slt->appns_index);
   pool_put (lookup_tables, slt);
 }
 
@@ -92,10 +90,9 @@ session_table_free (session_table_t *slt, u8 fib_proto)
  * otherwise it uses defaults above.
  */
 void
-session_table_init (session_table_t * slt, u8 fib_proto)
+session_table_init (session_table_t *slt, u8 fib_proto)
 {
   u8 all = fib_proto > FIB_PROTOCOL_IP6 ? 1 : 0;
-  int i;
 
 #define _(af,table,parm,value) 						\
   u32 configured_##af##_##table##_table_##parm = value;
@@ -109,6 +106,7 @@ session_table_init (session_table_t * slt, u8 fib_proto)
   foreach_hash_table_parameter;
 #undef _
 
+  slt->srtg_handle = SESSION_SRTG_HANDLE_INVALID;
   if (fib_proto == FIB_PROTOCOL_IP4 || all)
     {
       clib_bihash_init2_args_16_8_t _a, *a = &_a;
@@ -153,10 +151,6 @@ session_table_init (session_table_t * slt, u8 fib_proto)
       a->instantiate_immediately = 1;
       clib_bihash_init2_48_8 (a);
     }
-
-  vec_validate (slt->session_rules, TRANSPORT_N_PROTOS - 1);
-  for (i = 0; i < TRANSPORT_N_PROTOS; i++)
-    session_rules_table_init (&slt->session_rules[i]);
 }
 
 typedef struct _ip4_session_table_walk_ctx_t
@@ -229,7 +223,17 @@ u8 *
 format_session_table (u8 *s, va_list *args)
 {
   session_table_t *st = va_arg (*args, session_table_t *);
+  u32 appns_index, i;
 
+  s = format (s, "appns index: ");
+  vec_foreach_index (i, st->appns_index)
+    {
+      appns_index = *vec_elt_at_index (st->appns_index, i);
+      if (i > 0)
+	s = format (s, ", ");
+      s = format (s, "%d", appns_index);
+    }
+  s = format (s, "\n");
   if (clib_bihash_is_initialised_16_8 (&st->v4_session_hash))
     {
       s = format (s, "%U", format_bihash_16_8, &st->v4_session_hash, 0);

@@ -18,25 +18,25 @@ DPDK_TAP_PMD                 ?= n
 DPDK_FAILSAFE_PMD            ?= n
 DPDK_MACHINE                 ?= default
 DPDK_MLX_IBV_LINK            ?= static
+# On most of the systems, default value for max lcores is 128
+DPDK_MAX_LCORES              ?=
 
-dpdk_version                 ?= 24.03
+dpdk_version                 ?= 24.11.1
 dpdk_base_url                ?= http://fast.dpdk.org/rel
 dpdk_tarball                 := dpdk-$(dpdk_version).tar.xz
-dpdk_tarball_md5sum_24.03    := a98da848d6ba09808ef00f9a26aaa49a
-dpdk_tarball_md5sum_23.11    := 896c09f5b45b452bd77287994650b916
-dpdk_tarball_md5sum_23.07    := 2b6d57f077585cb15b885482362fd47f
-dpdk_tarball_md5sum_23.03    := 3cf8ebbcd412d5726db230f2eeb90cc9
-dpdk_tarball_md5sum_22.11.1  := 0594708fe42ce186a55b0235c6e20cfe
-dpdk_tarball_md5sum_22.07    := fb73b58b80b1349cd05fe9cf6984afd4
-dpdk_tarball_md5sum_22.03    := a07ca8839f98062f46e1cc359735cce8
-dpdk_tarball_md5sum_21.11    := 58660bbbe9e95abce86e47692b196555
-dpdk_tarball_md5sum          := $(dpdk_tarball_md5sum_$(dpdk_version))
+
+dpdk_tarball_sha256sum_24.11.1 := bcae7d42c449fc456dfb279feabcbe0599a29bebb2fe2905761e187339d96b8e
+
+dpdk_tarball_sha256sum       := $(dpdk_tarball_sha256sum_$(dpdk_version))
 dpdk_url                     := $(dpdk_base_url)/$(dpdk_tarball)
 dpdk_tarball_strip_dirs      := 1
 ifeq ($(shell uname), FreeBSD)
 dpdk_depends		     := $(if $(ARCH_X86_64), ipsec-mb)
 else
 dpdk_depends		     := rdma-core $(if $(ARCH_X86_64), ipsec-mb)
+endif
+ifeq ($(rdma-core_version),)
+$(error Missing rdma-core_version)
 endif
 DPDK_MLX_DEFAULT             := $(shell if grep -q "rdma=$(rdma-core_version) dpdk=$(dpdk_version)" mlx_rdma_dpdk_matrix.txt; then echo 'y'; else echo 'n'; fi)
 DPDK_MLX4_PMD                ?= $(DPDK_MLX_DEFAULT)
@@ -47,6 +47,11 @@ DPDK_MLX5_COMMON_PMD         ?= $(DPDK_MLX_DEFAULT)
 DPDK_BUILD_TYPE:=release
 ifeq ($(DPDK_DEBUG), y)
 DPDK_BUILD_TYPE:=debug
+endif
+
+DPDK_MAX_LCORES_FLAG :=
+ifneq ($(DPDK_MAX_LCORES),)
+DPDK_MAX_LCORES_FLAG := "-Dmax_lcores=$(DPDK_MAX_LCORES)"
 endif
 
 DPDK_DRIVERS_DISABLED := baseband/\*,	\
@@ -180,7 +185,8 @@ DPDK_MESON_ARGS = \
 	"-Ddisable_libs=$(DPDK_LIBS_DISABLED)" \
 	-Db_pie=true \
 	-Dmachine=$(DPDK_MACHINE) \
-	--buildtype=$(DPDK_BUILD_TYPE) \
+	$(DPDK_MAX_LCORES_FLAG) \
+        --buildtype=$(DPDK_BUILD_TYPE) \
 	-Denable_kmods=false \
 	${DPDK_MLX_CONFIG_FLAG}
 
@@ -193,8 +199,8 @@ define dpdk_config_cmds
 	mkdir -p ../dpdk-meson-venv && \
 	python3 -m venv ../dpdk-meson-venv && \
 	source ../dpdk-meson-venv/bin/activate && \
-	(if ! ls $(PIP_DOWNLOAD_DIR)meson* ; then pip3 download -d $(PIP_DOWNLOAD_DIR) -f $(DL_CACHE_DIR) meson==0.55.3 setuptools wheel pyelftools; fi) && \
-	pip3 install --no-index --find-links=$(PIP_DOWNLOAD_DIR) meson==0.55.3 pyelftools && \
+	(if ! ls $(PIP_DOWNLOAD_DIR)meson* ; then pip3 download -d $(PIP_DOWNLOAD_DIR) -f $(DL_CACHE_DIR) meson==0.57.2 setuptools wheel pyelftools; fi) && \
+	pip3 install --no-index --find-links=$(PIP_DOWNLOAD_DIR) meson==0.57.2 pyelftools && \
 	PKG_CONFIG_PATH=$(dpdk_install_dir)/lib/pkgconfig meson setup $(dpdk_src_dir) \
 		$(dpdk_build_dir) \
 		$(DPDK_MESON_ARGS) \

@@ -19,50 +19,160 @@
 #include <vnet/session/application_interface.h>
 #include <hs_apps/proxy.h>
 #include <vnet/tcp/tcp.h>
+#include <http/http_header_names.h>
 
 proxy_main_t proxy_main;
 
 #define TCP_MSS 1460
 
-typedef struct
-{
-  session_endpoint_cfg_t sep;
-  u32 app_index;
-  u32 api_context;
-} proxy_connect_args_t;
+static const char masque_udp_uri_prefix[] = ".well-known/masque/udp/";
+#define MASQUE_UDP_URI_PREFIX_LEN (sizeof (masque_udp_uri_prefix) - 1)
+#define MASQUE_UDP_URI_MIN_LEN	  (MASQUE_UDP_URI_PREFIX_LEN + 10)
 
-static void
-proxy_cb_fn (void *data, u32 data_len)
-{
-  proxy_connect_args_t *pa = (proxy_connect_args_t *) data;
-  vnet_connect_args_t a;
+#define PROXY_DEBUG 0
 
-  clib_memset (&a, 0, sizeof (a));
-  a.api_context = pa->api_context;
-  a.app_index = pa->app_index;
-  clib_memcpy (&a.sep_ext, &pa->sep, sizeof (pa->sep));
-  vnet_connect (&a);
-  if (a.sep_ext.ext_cfg)
-    clib_mem_free (a.sep_ext.ext_cfg);
+#if PROXY_DEBUG
+#define PROXY_DBG(_fmt, _args...) clib_warning (_fmt, ##_args)
+#else
+#define PROXY_DBG(_fmt, _args...)
+#endif
+
+static proxy_session_side_ctx_t *
+proxy_session_side_ctx_alloc (proxy_worker_t *wrk)
+{
+  proxy_session_side_ctx_t *ctx;
+
+  pool_get_zero (wrk->ctx_pool, ctx);
+  ctx->sc_index = ctx - wrk->ctx_pool;
+  ctx->ps_index = ~0;
+
+  return ctx;
 }
 
 static void
-proxy_call_main_thread (vnet_connect_args_t * a)
+proxy_session_side_ctx_free (proxy_worker_t *wrk,
+			     proxy_session_side_ctx_t *ctx)
 {
-  if (vlib_get_thread_index () == 0)
+  pool_put (wrk->ctx_pool, ctx);
+}
+
+static proxy_session_side_ctx_t *
+proxy_session_side_ctx_get (proxy_worker_t *wrk, u32 ctx_index)
+{
+  return pool_elt_at_index (wrk->ctx_pool, ctx_index);
+}
+
+static_always_inline void
+proxy_send_http_resp (session_t *s, http_status_code_t sc,
+		      http_headers_ctx_t *headers)
+{
+  http_msg_t msg;
+  int rv;
+  uword headers_ptr;
+  svm_fifo_seg_t seg[2];
+  u32 n_segs = 1;
+
+  ASSERT (s->thread_index == vlib_get_thread_index ());
+
+  msg.data.headers_len = 0;
+  if (headers)
     {
-      vnet_connect (a);
-      if (a->sep_ext.ext_cfg)
-	clib_mem_free (a->sep_ext.ext_cfg);
+      msg.data.headers_len = headers->tail_offset;
+      headers_ptr = pointer_to_uword (headers->buf);
+      seg[1].data = (u8 *) &headers_ptr;
+      seg[1].len = sizeof (headers_ptr);
+      n_segs = 2;
     }
-  else
+  msg.type = HTTP_MSG_REPLY;
+  msg.code = sc;
+  msg.data.type = HTTP_MSG_DATA_PTR;
+  msg.data.len = msg.data.headers_len;
+  msg.data.headers_offset = 0;
+  msg.data.body_len = 0;
+  msg.data.body_offset = 0;
+  seg[0].data = (u8 *) &msg;
+  seg[0].len = sizeof (msg);
+
+  rv =
+    svm_fifo_enqueue_segments (s->tx_fifo, seg, n_segs, 0 /* allow partial */);
+  ASSERT (rv == (sizeof (msg) + (n_segs == 2 ? sizeof (headers_ptr) : 0)));
+
+  if (svm_fifo_set_event (s->tx_fifo))
+    session_program_tx_io_evt (s->handle, SESSION_IO_EVT_TX);
+}
+
+static void
+proxy_do_connect (vnet_connect_args_t *a)
+{
+  ASSERT (session_vlib_thread_is_cl_thread ());
+  vnet_connect (a);
+  session_endpoint_free_ext_cfgs (&a->sep_ext);
+}
+
+static void
+proxy_handle_connects_rpc (void *args)
+{
+  u32 thread_index = pointer_to_uword (args), n_connects = 0, n_pending;
+  proxy_worker_t *wrk;
+  u32 max_connects;
+
+  wrk = proxy_worker_get (thread_index);
+
+  clib_spinlock_lock (&wrk->pending_connects_lock);
+
+  n_pending = clib_fifo_elts (wrk->pending_connects);
+  max_connects = clib_min (32, n_pending);
+  vec_validate (wrk->burst_connects, max_connects);
+
+  while (n_connects < max_connects)
+    clib_fifo_sub1 (wrk->pending_connects, wrk->burst_connects[n_connects++]);
+
+  clib_spinlock_unlock (&wrk->pending_connects_lock);
+
+  /* Do connects without locking pending_connects */
+  n_connects = 0;
+  while (n_connects < max_connects)
     {
-      proxy_connect_args_t args;
-      args.api_context = a->api_context;
-      args.app_index = a->app_index;
-      clib_memcpy (&args.sep, &a->sep_ext, sizeof (a->sep_ext));
-      vl_api_rpc_call_main_thread (proxy_cb_fn, (u8 *) & args, sizeof (args));
+      proxy_do_connect (&wrk->burst_connects[n_connects]);
+      n_connects += 1;
     }
+
+  /* More work to do, program rpc */
+  if (max_connects < n_pending)
+    session_send_rpc_evt_to_thread_force (
+      transport_cl_thread (), proxy_handle_connects_rpc,
+      uword_to_pointer ((uword) thread_index, void *));
+}
+
+static void
+proxy_program_connect (vnet_connect_args_t *a)
+{
+  u32 connects_thread = transport_cl_thread (), thread_index, n_pending;
+  proxy_worker_t *wrk;
+
+  thread_index = vlib_get_thread_index ();
+
+  /* If already on first worker, handle request */
+  if (thread_index == connects_thread)
+    {
+      proxy_do_connect (a);
+      return;
+    }
+
+  /* If not on first worker, queue request */
+  wrk = proxy_worker_get (thread_index);
+
+  clib_spinlock_lock (&wrk->pending_connects_lock);
+
+  clib_fifo_add1 (wrk->pending_connects, *a);
+  n_pending = clib_fifo_elts (wrk->pending_connects);
+
+  clib_spinlock_unlock (&wrk->pending_connects_lock);
+
+  if (n_pending == 1)
+    session_send_rpc_evt_to_thread_force (
+      connects_thread, proxy_handle_connects_rpc,
+      uword_to_pointer ((uword) thread_index, void *));
 }
 
 static proxy_session_t *
@@ -85,16 +195,6 @@ proxy_session_get (u32 ps_index)
   return pool_elt_at_index (pm->sessions, ps_index);
 }
 
-static inline proxy_session_t *
-proxy_session_get_if_valid (u32 ps_index)
-{
-  proxy_main_t *pm = &proxy_main;
-
-  if (pool_is_free_index (pm->sessions, ps_index))
-    return 0;
-  return pool_elt_at_index (pm->sessions, ps_index);
-}
-
 static void
 proxy_session_free (proxy_session_t *ps)
 {
@@ -114,8 +214,10 @@ proxy_session_postponed_free_rpc (void *arg)
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
 
+  PROXY_DBG ("[%u] ps %u postponed free", vlib_get_thread_index (), ps_index);
+
   ps = proxy_session_get (ps_index);
-  segment_manager_dealloc_fifos (ps->server_rx_fifo, ps->server_tx_fifo);
+  segment_manager_dealloc_fifos (ps->po.rx_fifo, ps->po.tx_fifo);
   proxy_session_free (ps);
 
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
@@ -126,57 +228,113 @@ proxy_session_postponed_free_rpc (void *arg)
 static void
 proxy_session_postponed_free (proxy_session_t *ps)
 {
-  session_send_rpc_evt_to_thread (ps->po_thread_index,
+  /* Passive open session handle has been invalidated so we don't have thread
+   * index at this point */
+  session_send_rpc_evt_to_thread (ps->po.rx_fifo->master_thread_index,
 				  proxy_session_postponed_free_rpc,
 				  uword_to_pointer (ps->ps_index, void *));
+}
+
+static void
+proxy_session_close_po (proxy_session_t *ps)
+{
+  vnet_disconnect_args_t _a = {}, *a = &_a;
+  proxy_main_t *pm = &proxy_main;
+
+  ASSERT (!vlib_num_workers () ||
+	  CLIB_SPINLOCK_IS_LOCKED (&pm->sessions_lock));
+
+  a->handle = ps->po.session_handle;
+  a->app_index = pm->server_app_index;
+  vnet_disconnect_session (a);
+
+  ps->po_disconnected = 1;
+}
+
+static void
+proxy_session_close_ao (proxy_session_t *ps)
+{
+  vnet_disconnect_args_t _a = {}, *a = &_a;
+  proxy_main_t *pm = &proxy_main;
+
+  ASSERT (!vlib_num_workers () ||
+	  CLIB_SPINLOCK_IS_LOCKED (&pm->sessions_lock));
+
+  a->handle = ps->ao.session_handle;
+  a->app_index = pm->active_open_app_index;
+  vnet_disconnect_session (a);
+
+  ps->ao_disconnected = 1;
 }
 
 static void
 proxy_try_close_session (session_t * s, int is_active_open)
 {
   proxy_main_t *pm = &proxy_main;
-  proxy_session_t *ps = 0;
-  vnet_disconnect_args_t _a, *a = &_a;
+  proxy_session_side_ctx_t *sc;
+  proxy_session_t *ps;
+  proxy_worker_t *wrk;
+
+  wrk = proxy_worker_get (s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, s->opaque);
+
+  PROXY_DBG ("[%u] ps %u close (is ao %u)", vlib_get_thread_index (),
+	     sc->ps_index, is_active_open);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
 
-  ps = proxy_session_get (s->opaque);
+  ps = proxy_session_get (sc->ps_index);
 
   if (is_active_open)
     {
-      a->handle = ps->vpp_active_open_handle;
-      a->app_index = pm->active_open_app_index;
-      vnet_disconnect_session (a);
-      ps->ao_disconnected = 1;
+      proxy_session_close_ao (ps);
 
       if (!ps->po_disconnected)
 	{
-	  ASSERT (ps->vpp_server_handle != SESSION_INVALID_HANDLE);
-	  a->handle = ps->vpp_server_handle;
-	  a->app_index = pm->server_app_index;
-	  vnet_disconnect_session (a);
-	  ps->po_disconnected = 1;
+	  ASSERT (ps->po.session_handle != SESSION_INVALID_HANDLE);
+	  proxy_session_close_po (ps);
 	}
     }
   else
     {
-      a->handle = ps->vpp_server_handle;
-      a->app_index = pm->server_app_index;
-      vnet_disconnect_session (a);
-      ps->po_disconnected = 1;
+      proxy_session_close_po (ps);
 
       if (!ps->ao_disconnected && !ps->active_open_establishing)
 	{
 	  /* Proxy session closed before active open */
-	  if (ps->vpp_active_open_handle != SESSION_INVALID_HANDLE)
-	    {
-	      a->handle = ps->vpp_active_open_handle;
-	      a->app_index = pm->active_open_app_index;
-	      vnet_disconnect_session (a);
-	    }
+	  if (ps->ao.session_handle != SESSION_INVALID_HANDLE)
+	    proxy_session_close_ao (ps);
 	  ps->ao_disconnected = 1;
 	}
     }
+  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+}
+
+static void
+proxy_try_side_ctx_cleanup (session_t *s)
+{
+  proxy_main_t *pm = &proxy_main;
+  proxy_session_t *ps;
+  proxy_session_side_ctx_t *sc;
+  proxy_worker_t *wrk;
+
+  wrk = proxy_worker_get (s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, s->opaque);
+  if (sc->state == PROXY_SC_S_CREATED)
+    return;
+
+  PROXY_DBG ("[%u] ps %u side ctx cleanup", vlib_get_thread_index (),
+	     sc->ps_index);
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
+
+  ps = proxy_session_get (sc->ps_index);
+
+  if (!ps->po_disconnected)
+    proxy_session_close_po (ps);
+
+  if (!ps->ao_disconnected)
+    proxy_session_close_ao (ps);
+
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
 }
 
@@ -185,25 +343,36 @@ proxy_try_delete_session (session_t * s, u8 is_active_open)
 {
   proxy_main_t *pm = &proxy_main;
   proxy_session_t *ps = 0;
+  proxy_session_side_ctx_t *sc;
+  proxy_worker_t *wrk;
+  u32 ps_index;
+
+  wrk = proxy_worker_get (s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, s->opaque);
+  ps_index = sc->ps_index;
+
+  PROXY_DBG ("[%u] ps %u delete (is ao %u)", vlib_get_thread_index (),
+	     sc->ps_index, is_active_open);
+
+  proxy_session_side_ctx_free (wrk, sc);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
 
-  ps = proxy_session_get (s->opaque);
+  ps = proxy_session_get (ps_index);
 
   if (is_active_open)
     {
-      ps->vpp_active_open_handle = SESSION_INVALID_HANDLE;
+      ps->ao.session_handle = SESSION_INVALID_HANDLE;
 
       /* Revert master thread index change on connect notification */
-      ps->server_rx_fifo->master_thread_index = ps->po_thread_index;
+      ps->po.rx_fifo->master_thread_index =
+	ps->po.tx_fifo->master_thread_index;
 
       /* Passive open already cleaned up */
-      if (ps->vpp_server_handle == SESSION_INVALID_HANDLE)
+      if (ps->po.session_handle == SESSION_INVALID_HANDLE)
 	{
-	  ASSERT (s->rx_fifo->refcnt == 1);
-
 	  /* The two sides of the proxy on different threads */
-	  if (ps->po_thread_index != s->thread_index)
+	  if (ps->po.tx_fifo->master_thread_index != s->thread_index)
 	    {
 	      /* This is not the right thread to delete the fifos */
 	      s->rx_fifo = 0;
@@ -211,14 +380,17 @@ proxy_try_delete_session (session_t * s, u8 is_active_open)
 	      proxy_session_postponed_free (ps);
 	    }
 	  else
-	    proxy_session_free (ps);
+	    {
+	      ASSERT (s->rx_fifo->refcnt == 1);
+	      proxy_session_free (ps);
+	    }
 	}
     }
   else
     {
-      ps->vpp_server_handle = SESSION_INVALID_HANDLE;
+      ps->po.session_handle = SESSION_INVALID_HANDLE;
 
-      if (ps->vpp_active_open_handle == SESSION_INVALID_HANDLE)
+      if (ps->ao.session_handle == SESSION_INVALID_HANDLE)
 	{
 	  if (!ps->active_open_establishing)
 	    proxy_session_free (ps);
@@ -275,16 +447,28 @@ static int
 proxy_accept_callback (session_t * s)
 {
   proxy_main_t *pm = &proxy_main;
+  proxy_session_side_ctx_t *sc;
   proxy_session_t *ps;
+  proxy_worker_t *wrk;
+  transport_proto_t tp = session_get_transport_proto (s);
+
+  wrk = proxy_worker_get (s->thread_index);
+  sc = proxy_session_side_ctx_alloc (wrk);
+  s->opaque = sc->sc_index;
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
 
   ps = proxy_session_alloc ();
-  ps->vpp_server_handle = session_handle (s);
-  ps->vpp_active_open_handle = SESSION_INVALID_HANDLE;
-  ps->po_thread_index = s->thread_index;
 
-  s->opaque = ps->ps_index;
+  PROXY_DBG ("[%u] ps %u new", vlib_get_thread_index (), ps->ps_index);
+
+  ps->po.session_handle = session_handle (s);
+  ps->po.rx_fifo = s->rx_fifo;
+  ps->po.tx_fifo = s->tx_fifo;
+  ps->po.is_http = tp == TRANSPORT_PROTO_HTTP ? 1 : 0;
+
+  ps->ao.session_handle = SESSION_INVALID_HANDLE;
+  sc->ps_index = ps->ps_index;
 
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
 
@@ -325,91 +509,236 @@ proxy_transport_needs_crypto (transport_proto_t proto)
   return proto == TRANSPORT_PROTO_TLS;
 }
 
-static int
-proxy_rx_callback (session_t * s)
+static void
+proxy_http_connect (session_t *s, vnet_connect_args_t *a)
 {
   proxy_main_t *pm = &proxy_main;
-  u32 thread_index = vlib_get_thread_index ();
-  svm_fifo_t *ao_tx_fifo;
-  proxy_session_t *ps;
+  http_msg_t msg;
+  http_uri_authority_t target_uri;
+  session_endpoint_cfg_t target_sep = SESSION_ENDPOINT_CFG_NULL;
+  int rv;
+  u8 *rx_buf = pm->rx_buf[s->thread_index];
+  http_header_table_t req_headers = pm->req_headers[s->thread_index];
 
-  ASSERT (s->thread_index == thread_index);
+  rv = svm_fifo_dequeue (s->rx_fifo, sizeof (msg), (u8 *) &msg);
+  ASSERT (rv == sizeof (msg));
 
-  clib_spinlock_lock_if_init (&pm->sessions_lock);
+  ASSERT (msg.type == HTTP_MSG_REQUEST);
 
-  ps = proxy_session_get (s->opaque);
-
-  if (PREDICT_TRUE (ps->vpp_active_open_handle != SESSION_INVALID_HANDLE))
+  if (PREDICT_FALSE (msg.method_type != HTTP_REQ_CONNECT))
     {
-      clib_spinlock_unlock_if_init (&pm->sessions_lock);
-
-      ao_tx_fifo = s->rx_fifo;
-
-      /*
-       * Send event for active open tx fifo
-       */
-      if (svm_fifo_set_event (ao_tx_fifo))
+      PROXY_DBG ("invalid method");
+      goto bad_req;
+    }
+  if (msg.data.upgrade_proto == HTTP_UPGRADE_PROTO_NA)
+    {
+      /* TCP tunnel (RFC9110 section 9.3.6) */
+      PROXY_DBG ("CONNECT");
+      /* get tunnel target */
+      if (!msg.data.target_authority_len)
 	{
-	  u32 ao_thread_index = ao_tx_fifo->master_thread_index;
-	  u32 ao_session_index = ao_tx_fifo->shr->master_session_index;
-	  if (session_send_io_evt_to_thread_custom (&ao_session_index,
-						    ao_thread_index,
-						    SESSION_IO_EVT_TX))
-	    clib_warning ("failed to enqueue tx evt");
+	  PROXY_DBG ("CONNECT target missing");
+	  goto bad_req;
+	}
+      ASSERT (msg.data.target_authority_len <= pm->rcv_buffer_size);
+      rv = svm_fifo_peek (s->rx_fifo, msg.data.target_authority_offset,
+			  msg.data.target_authority_len, rx_buf);
+      ASSERT (rv == msg.data.target_authority_len);
+      rv = http_parse_authority (rx_buf, msg.data.target_authority_len,
+				 &target_uri);
+      if (rv)
+	{
+	  PROXY_DBG ("authority parsing failed");
+	  goto bad_req;
+	}
+      /* TODO reg-name resolution */
+      if (target_uri.host_type == HTTP_URI_HOST_TYPE_REG_NAME)
+	{
+	  PROXY_DBG ("reg-name resolution not supported");
+	  goto bad_req;
+	}
+      target_sep.transport_proto = TRANSPORT_PROTO_TCP;
+    }
+  else if (msg.data.upgrade_proto == HTTP_UPGRADE_PROTO_CONNECT_UDP)
+    {
+      /* UDP tunnel (RFC9298) */
+      PROXY_DBG ("CONNECT-UDP");
+      /* get tunnel target */
+      if (msg.data.target_path_len < MASQUE_UDP_URI_MIN_LEN)
+	{
+	  PROXY_DBG ("invalid target");
+	  goto bad_req;
+	}
+      ASSERT (msg.data.target_path_len <= pm->rcv_buffer_size);
+      rv = svm_fifo_peek (s->rx_fifo, msg.data.target_path_offset,
+			  msg.data.target_path_len, rx_buf);
+      ASSERT (rv == msg.data.target_path_len);
+      if (http_validate_target_syntax (rx_buf, msg.data.target_path_len, 0, 0))
+	{
+	  PROXY_DBG ("invalid target");
+	  goto bad_req;
+	}
+      if (memcmp (rx_buf, masque_udp_uri_prefix, MASQUE_UDP_URI_PREFIX_LEN))
+	{
+	  PROXY_DBG ("uri prefix not match");
+	  goto bad_req;
+	}
+      rv = http_parse_masque_host_port (
+	rx_buf + MASQUE_UDP_URI_PREFIX_LEN,
+	msg.data.target_path_len - MASQUE_UDP_URI_PREFIX_LEN, &target_uri);
+      if (rv)
+	{
+	  PROXY_DBG ("masque host/port parsing failed");
+	  goto bad_req;
 	}
 
-      if (svm_fifo_max_enqueue (ao_tx_fifo) <= TCP_MSS)
-	svm_fifo_add_want_deq_ntf (ao_tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
+      /* Capsule-Protocol header is optional, but need to have true value */
+      http_reset_header_table (&req_headers);
+      http_init_header_table_buf (&req_headers, msg);
+      rv = svm_fifo_peek (s->rx_fifo, msg.data.headers_offset,
+			  msg.data.headers_len, req_headers.buf);
+      ASSERT (rv == msg.data.headers_len);
+      http_build_header_table (&req_headers, msg);
+      const http_token_t *capsule_protocol = http_get_header (
+	&req_headers, http_header_name_token (HTTP_HEADER_CAPSULE_PROTOCOL));
+      if (capsule_protocol)
+	{
+	  PROXY_DBG ("Capsule-Protocol header present");
+	  if (!http_token_is (capsule_protocol->base, capsule_protocol->len,
+			      http_token_lit (HTTP_BOOLEAN_TRUE)))
+	    {
+	      PROXY_DBG ("Capsule-Protocol invalid value");
+	      goto bad_req;
+	    }
+	}
+      target_sep.transport_proto = TRANSPORT_PROTO_UDP;
     }
   else
     {
-      vnet_connect_args_t _a, *a = &_a;
-      svm_fifo_t *tx_fifo, *rx_fifo;
-      u32 max_dequeue, ps_index;
-      int actual_transfer __attribute__ ((unused));
+    bad_req:
+      proxy_send_http_resp (s, HTTP_STATUS_BAD_REQUEST, 0);
+      svm_fifo_dequeue_drop_all (s->rx_fifo);
+      return;
+    }
+  PROXY_DBG ("proxy target %U:%u", format_ip46_address, &target_uri.ip,
+	     target_uri.host_type == HTTP_URI_HOST_TYPE_IP4,
+	     clib_net_to_host_u16 (target_uri.port));
+  svm_fifo_dequeue_drop (s->rx_fifo, msg.data.len);
+  target_sep.is_ip4 = target_uri.host_type == HTTP_URI_HOST_TYPE_IP4;
+  target_sep.ip = target_uri.ip;
+  target_sep.port = target_uri.port;
+  clib_memcpy (&a->sep_ext, &target_sep, sizeof (target_sep));
+}
 
-      rx_fifo = s->rx_fifo;
-      tx_fifo = s->tx_fifo;
+static void
+proxy_session_start_connect (proxy_session_side_ctx_t *sc, session_t *s)
+{
+  int actual_transfer __attribute__ ((unused));
+  vnet_connect_args_t _a = {}, *a = &_a;
+  proxy_main_t *pm = &proxy_main;
+  u32 max_dequeue, ps_index;
+  proxy_session_t *ps;
+  transport_proto_t tp = session_get_transport_proto (s);
 
-      ASSERT (rx_fifo->master_thread_index == thread_index);
-      ASSERT (tx_fifo->master_thread_index == thread_index);
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
 
+  ps = proxy_session_get (sc->ps_index);
+
+  /* maybe we were already here */
+  if (ps->active_open_establishing)
+    {
+      clib_spinlock_unlock_if_init (&pm->sessions_lock);
+      return;
+    }
+
+  ps->active_open_establishing = 1;
+  ps_index = ps->ps_index;
+
+  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+
+  if (tp == TRANSPORT_PROTO_HTTP)
+    proxy_http_connect (s, a);
+  else
+    {
       max_dequeue = svm_fifo_max_dequeue_cons (s->rx_fifo);
-
       if (PREDICT_FALSE (max_dequeue == 0))
+	return;
+
+      max_dequeue = clib_min (pm->rcv_buffer_size, max_dequeue);
+      actual_transfer =
+	svm_fifo_peek (s->rx_fifo, 0 /* relative_offset */, max_dequeue,
+		       pm->rx_buf[s->thread_index]);
+
+      /* Expectation is that here actual data just received is parsed and based
+       * on its contents, the destination and parameters of the connect to the
+       * upstream are decided
+       */
+      clib_memcpy (&a->sep_ext, &pm->client_sep[tp], sizeof (*pm->client_sep));
+    }
+
+  a->api_context = ps_index;
+  a->app_index = pm->active_open_app_index;
+
+  if (proxy_transport_needs_crypto (a->sep.transport_proto))
+    {
+      transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
+	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	sizeof (transport_endpt_crypto_cfg_t));
+      ext_cfg->crypto.ckpair_index = pm->ckpair_index;
+    }
+
+  proxy_program_connect (a);
+}
+
+static int
+proxy_rx_callback (session_t *s)
+{
+  proxy_session_side_ctx_t *sc;
+  svm_fifo_t *ao_tx_fifo;
+  proxy_session_t *ps;
+  proxy_worker_t *wrk;
+
+  ASSERT (s->thread_index == vlib_get_thread_index ());
+
+  wrk = proxy_worker_get (s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, s->opaque);
+
+  if (PREDICT_FALSE (sc->state < PROXY_SC_S_ESTABLISHED))
+    {
+      proxy_main_t *pm = &proxy_main;
+
+      if (sc->state == PROXY_SC_S_CREATED)
 	{
-	  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+	  PROXY_DBG ("[%u] ps %u start connect", vlib_get_thread_index (),
+		     sc->ps_index);
+	  proxy_session_start_connect (sc, s);
+	  sc->state = PROXY_SC_S_CONNECTING;
 	  return 0;
 	}
 
-      max_dequeue = clib_min (pm->rcv_buffer_size, max_dequeue);
-      actual_transfer = svm_fifo_peek (rx_fifo, 0 /* relative_offset */ ,
-				       max_dequeue, pm->rx_buf[thread_index]);
+      clib_spinlock_lock_if_init (&pm->sessions_lock);
 
-      /* $$$ your message in this space: parse url, etc. */
-
-      clib_memset (a, 0, sizeof (*a));
-
-      ps->server_rx_fifo = rx_fifo;
-      ps->server_tx_fifo = tx_fifo;
-      ps->active_open_establishing = 1;
-      ps_index = ps->ps_index;
+      ps = proxy_session_get (sc->ps_index);
+      sc->pair = ps->ao;
 
       clib_spinlock_unlock_if_init (&pm->sessions_lock);
 
-      clib_memcpy (&a->sep_ext, &pm->client_sep, sizeof (pm->client_sep));
-      a->api_context = ps_index;
-      a->app_index = pm->active_open_app_index;
+      if (sc->pair.session_handle == SESSION_INVALID_HANDLE)
+	return 0;
 
-      if (proxy_transport_needs_crypto (a->sep.transport_proto))
-	{
-	  session_endpoint_alloc_ext_cfg (&a->sep_ext,
-					  TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
-	  a->sep_ext.ext_cfg->crypto.ckpair_index = pm->ckpair_index;
-	}
-
-      proxy_call_main_thread (a);
+      sc->state = PROXY_SC_S_ESTABLISHED;
     }
+
+  ao_tx_fifo = s->rx_fifo;
+
+  /*
+   * Send event for active open tx fifo
+   */
+  if (svm_fifo_set_event (ao_tx_fifo))
+    session_program_tx_io_evt (sc->pair.session_handle, SESSION_IO_EVT_TX);
+
+  if (svm_fifo_max_enqueue (ao_tx_fifo) <= TCP_MSS)
+    svm_fifo_add_want_deq_ntf (ao_tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
 
   return 0;
 }
@@ -418,20 +747,20 @@ static void
 proxy_force_ack (void *handlep)
 {
   transport_connection_t *tc;
-  session_t *ao_s;
+  session_t *s;
 
-  ao_s = session_get_from_handle (pointer_to_uword (handlep));
-  if (session_get_transport_proto (ao_s) != TRANSPORT_PROTO_TCP)
+  s = session_get_from_handle (pointer_to_uword (handlep));
+  if (session_get_transport_proto (s) != TRANSPORT_PROTO_TCP)
     return;
-  tc = session_get_transport (ao_s);
+  tc = session_get_transport (s);
   tcp_send_ack ((tcp_connection_t *) tc);
 }
 
 static int
 proxy_tx_callback (session_t * proxy_s)
 {
-  proxy_main_t *pm = &proxy_main;
-  proxy_session_t *ps;
+  proxy_session_side_ctx_t *sc;
+  proxy_worker_t *wrk;
   u32 min_free;
 
   min_free = clib_min (svm_fifo_size (proxy_s->tx_fifo) >> 3, 128 << 10);
@@ -441,21 +770,17 @@ proxy_tx_callback (session_t * proxy_s)
       return 0;
     }
 
-  clib_spinlock_lock_if_init (&pm->sessions_lock);
-
-  ps = proxy_session_get (proxy_s->opaque);
-
-  if (ps->vpp_active_open_handle == SESSION_INVALID_HANDLE)
-    goto unlock;
+  wrk = proxy_worker_get (proxy_s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, proxy_s->opaque);
+  if (sc->state < PROXY_SC_S_ESTABLISHED)
+    return 0;
 
   /* Force ack on active open side to update rcv wnd. Make sure it's done on
    * the right thread */
-  void *arg = uword_to_pointer (ps->vpp_active_open_handle, void *);
-  session_send_rpc_evt_to_thread (ps->server_rx_fifo->master_thread_index,
-				  proxy_force_ack, arg);
-
-unlock:
-  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+  void *arg = uword_to_pointer (sc->pair.session_handle, void *);
+  session_send_rpc_evt_to_thread (
+    session_thread_from_handle (sc->pair.session_handle), proxy_force_ack,
+    arg);
 
   return 0;
 }
@@ -464,7 +789,10 @@ static void
 proxy_cleanup_callback (session_t * s, session_cleanup_ntf_t ntf)
 {
   if (ntf == SESSION_CLEANUP_TRANSPORT)
-    return;
+    {
+      proxy_try_side_ctx_cleanup (s);
+      return;
+    }
 
   proxy_try_delete_session (s, 0 /* is_active_open */ );
 }
@@ -488,19 +816,28 @@ active_open_alloc_session_fifos (session_t *s)
   svm_fifo_t *rxf, *txf;
   proxy_session_t *ps;
 
+  PROXY_DBG ("[%u] ps %u ao alloc fifos", vlib_get_thread_index (), s->opaque);
+
   clib_spinlock_lock_if_init (&pm->sessions_lock);
 
+  /* Active open opaque is pointing at proxy session */
   ps = proxy_session_get (s->opaque);
 
-  txf = ps->server_rx_fifo;
-  rxf = ps->server_tx_fifo;
+  if (ps->po_disconnected)
+    {
+      clib_spinlock_unlock_if_init (&pm->sessions_lock);
+      return SESSION_E_ALLOC;
+    }
+
+  txf = ps->po.rx_fifo;
+  rxf = ps->po.tx_fifo;
 
   /*
    * Reset the active-open tx-fifo master indices so the active-open session
    * will receive data, etc.
    */
   txf->shr->master_session_index = s->session_index;
-  txf->master_thread_index = s->thread_index;
+  txf->vpp_sh = s->handle;
 
   /*
    * Account for the active-open session's use of the fifos
@@ -518,36 +855,90 @@ active_open_alloc_session_fifos (session_t *s)
   return 0;
 }
 
+static void
+active_open_send_http_resp_rpc (void *arg)
+{
+  u32 ps_index = pointer_to_uword (arg);
+  proxy_main_t *pm = &proxy_main;
+  proxy_session_t *ps;
+  session_t *po_s;
+  transport_proto_t ao_tp;
+  int connect_failed;
+
+  PROXY_DBG ("ps[%xlu] going to send connect response", ps_index);
+
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
+
+  ps = proxy_session_get (ps_index);
+  po_s = session_get_from_handle (ps->po.session_handle);
+  connect_failed = ps->ao_disconnected;
+
+  if (!connect_failed)
+    {
+      ao_tp = session_get_transport_proto (
+	session_get_from_handle (ps->ao.session_handle));
+      if (ao_tp == TRANSPORT_PROTO_UDP)
+	proxy_send_http_resp (po_s, HTTP_STATUS_SWITCHING_PROTOCOLS,
+			      &pm->capsule_proto_header);
+      else
+	proxy_send_http_resp (po_s, HTTP_STATUS_OK, 0);
+    }
+  else
+    {
+      proxy_send_http_resp (po_s, HTTP_STATUS_BAD_GATEWAY, 0);
+      proxy_session_close_po (ps);
+    }
+
+  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+}
+
 static int
 active_open_connected_callback (u32 app_index, u32 opaque,
 				session_t * s, session_error_t err)
 {
   proxy_main_t *pm = &proxy_main;
   proxy_session_t *ps;
-  u8 thread_index = vlib_get_thread_index ();
-
-  /*
-   * Setup proxy session handle.
-   */
-  clib_spinlock_lock_if_init (&pm->sessions_lock);
-
-  ps = proxy_session_get (opaque);
+  proxy_worker_t *wrk;
+  proxy_session_side_ctx_t *sc;
 
   /* Connection failed */
   if (err)
     {
-      vnet_disconnect_args_t _a, *a = &_a;
+      PROXY_DBG ("[%u] ps %u connect failed: %d", vlib_get_thread_index (),
+		 opaque, err);
+      clib_spinlock_lock_if_init (&pm->sessions_lock);
 
-      a->handle = ps->vpp_server_handle;
-      a->app_index = pm->server_app_index;
-      vnet_disconnect_session (a);
-      ps->po_disconnected = 1;
+      ps = proxy_session_get (opaque);
+      PROXY_DBG ("ps[%lu] connect failed: %d", opaque, err);
+      ps->ao_disconnected = 1;
+      if (ps->po.is_http)
+	{
+	  session_send_rpc_evt_to_thread (
+	    session_thread_from_handle (ps->po.session_handle),
+	    active_open_send_http_resp_rpc,
+	    uword_to_pointer (ps->ps_index, void *));
+	}
+      else
+	proxy_session_close_po (ps);
+
+      clib_spinlock_unlock_if_init (&pm->sessions_lock);
+
+      return 0;
     }
-  else
-    {
-      ps->vpp_active_open_handle = session_handle (s);
-      ps->active_open_establishing = 0;
-    }
+
+  PROXY_DBG ("[%u] ps %u connected", vlib_get_thread_index (), opaque);
+
+  wrk = proxy_worker_get (s->thread_index);
+
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
+
+  ps = proxy_session_get (opaque);
+
+  ps->ao.rx_fifo = s->rx_fifo;
+  ps->ao.tx_fifo = s->tx_fifo;
+  ps->ao.session_handle = session_handle (s);
+
+  ps->active_open_establishing = 0;
 
   /* Passive open session was already closed! */
   if (ps->po_disconnected)
@@ -558,18 +949,132 @@ active_open_connected_callback (u32 app_index, u32 opaque,
       return -1;
     }
 
-  s->opaque = opaque;
+  sc = proxy_session_side_ctx_alloc (wrk);
+  sc->pair = ps->po;
+  sc->ps_index = ps->ps_index;
 
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
 
-  /*
-   * Send event for active open tx fifo
-   */
-  ASSERT (s->thread_index == thread_index);
-  if (svm_fifo_set_event (s->tx_fifo))
-    session_send_io_evt_to_thread (s->tx_fifo, SESSION_IO_EVT_TX);
+  sc->state = PROXY_SC_S_ESTABLISHED;
+  s->opaque = sc->sc_index;
+
+  if (sc->pair.is_http)
+    {
+      session_send_rpc_evt_to_thread (
+	session_thread_from_handle (ps->po.session_handle),
+	active_open_send_http_resp_rpc,
+	uword_to_pointer (ps->ps_index, void *));
+    }
+  else
+    {
+      /*
+       * Send event for active open tx fifo
+       */
+      ASSERT (s->thread_index == vlib_get_thread_index ());
+      if (svm_fifo_set_event (s->tx_fifo))
+	session_program_tx_io_evt (session_handle (s), SESSION_IO_EVT_TX);
+    }
 
   return 0;
+}
+
+static void
+active_open_migrate_po_fixup_rpc (void *arg)
+{
+  u32 ps_index = pointer_to_uword (arg);
+  proxy_session_side_ctx_t *po_sc;
+  proxy_main_t *pm = &proxy_main;
+  session_handle_t po_sh;
+  proxy_worker_t *wrk;
+  proxy_session_t *ps;
+  session_t *po_s;
+
+  PROXY_DBG ("[%u] ps %u migrate (po fixup)", vlib_get_thread_index (),
+	     ps_index);
+
+  wrk = proxy_worker_get (vlib_get_thread_index ());
+
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
+
+  ps = proxy_session_get (ps_index);
+
+  po_s = session_get_from_handle (ps->po.session_handle);
+
+  po_sc = proxy_session_side_ctx_get (wrk, po_s->opaque);
+  po_sc->pair = ps->ao;
+  po_sh = ps->po.session_handle;
+
+  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+
+  session_program_tx_io_evt (po_sh, SESSION_IO_EVT_TX);
+}
+
+static void
+active_open_migrate_rpc (void *arg)
+{
+  u32 ps_index = pointer_to_uword (arg);
+  proxy_main_t *pm = &proxy_main;
+  proxy_session_side_ctx_t *sc;
+  proxy_worker_t *wrk;
+  proxy_session_t *ps;
+  session_t *s;
+
+  PROXY_DBG ("[%u] ps %u migrate (alloc new sc)", vlib_get_thread_index (),
+	     ps_index);
+
+  wrk = proxy_worker_get (vlib_get_thread_index ());
+  sc = proxy_session_side_ctx_alloc (wrk);
+
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
+
+  ps = proxy_session_get (ps_index);
+  sc->ps_index = ps->ps_index;
+  sc->state = PROXY_SC_S_ESTABLISHED;
+
+  s = session_get_from_handle (ps->ao.session_handle);
+  s->opaque = sc->sc_index;
+  s->flags &= ~SESSION_F_IS_MIGRATING;
+
+  sc->pair = ps->po;
+
+  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+
+  session_send_rpc_evt_to_thread (
+    session_thread_from_handle (sc->pair.session_handle),
+    active_open_migrate_po_fixup_rpc, uword_to_pointer (sc->ps_index, void *));
+}
+
+static void
+active_open_migrate_callback (session_t *s, session_handle_t new_sh)
+{
+  proxy_main_t *pm = &proxy_main;
+  proxy_session_side_ctx_t *sc;
+  proxy_session_t *ps;
+  proxy_worker_t *wrk;
+
+  wrk = proxy_worker_get (s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, s->opaque);
+
+  PROXY_DBG ("[%u] ps %u migrate (free sc)", vlib_get_thread_index (),
+	     sc->ps_index);
+
+  /* NOTE: this is just an example. ZC makes this migration rather
+   * tedious. Probably better approaches could be found */
+  clib_spinlock_lock_if_init (&pm->sessions_lock);
+
+  ps = proxy_session_get (sc->ps_index);
+  ps->ao.session_handle = new_sh;
+  ps->ao.tx_fifo->shr->master_session_index =
+    session_index_from_handle (new_sh);
+  ps->ao.tx_fifo->master_thread_index = session_thread_from_handle (new_sh);
+
+  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+
+  session_send_rpc_evt_to_thread (session_thread_from_handle (new_sh),
+				  active_open_migrate_rpc,
+				  uword_to_pointer (sc->ps_index, void *));
+
+  proxy_session_side_ctx_free (wrk, sc);
 }
 
 static void
@@ -601,13 +1106,7 @@ active_open_rx_callback (session_t * s)
    * Send event for server tx fifo
    */
   if (svm_fifo_set_event (proxy_tx_fifo))
-    {
-      u8 thread_index = proxy_tx_fifo->master_thread_index;
-      u32 session_index = proxy_tx_fifo->shr->master_session_index;
-      return session_send_io_evt_to_thread_custom (&session_index,
-						   thread_index,
-						   SESSION_IO_EVT_TX);
-    }
+    session_program_tx_io_evt (proxy_tx_fifo->vpp_sh, SESSION_IO_EVT_TX);
 
   if (svm_fifo_max_enqueue (proxy_tx_fifo) <= TCP_MSS)
     svm_fifo_add_want_deq_ntf (proxy_tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
@@ -618,10 +1117,8 @@ active_open_rx_callback (session_t * s)
 static int
 active_open_tx_callback (session_t * ao_s)
 {
-  proxy_main_t *pm = &proxy_main;
-  transport_connection_t *tc;
-  proxy_session_t *ps;
-  session_t *proxy_s;
+  proxy_session_side_ctx_t *sc;
+  proxy_worker_t *wrk;
   u32 min_free;
 
   min_free = clib_min (svm_fifo_size (ao_s->tx_fifo) >> 3, 128 << 10);
@@ -631,23 +1128,26 @@ active_open_tx_callback (session_t * ao_s)
       return 0;
     }
 
-  clib_spinlock_lock_if_init (&pm->sessions_lock);
+  wrk = proxy_worker_get (ao_s->thread_index);
+  sc = proxy_session_side_ctx_get (wrk, ao_s->opaque);
 
-  ps = proxy_session_get_if_valid (ao_s->opaque);
-  if (!ps)
-    goto unlock;
+  if (sc->state < PROXY_SC_S_ESTABLISHED)
+    return 0;
 
-  if (ps->vpp_server_handle == ~0)
-    goto unlock;
-
-  proxy_s = session_get_from_handle (ps->vpp_server_handle);
-
-  /* Force ack on proxy side to update rcv wnd */
-  tc = session_get_transport (proxy_s);
-  tcp_send_ack ((tcp_connection_t *) tc);
-
-unlock:
-  clib_spinlock_unlock_if_init (&pm->sessions_lock);
+  if (sc->pair.is_http)
+    {
+      /* notify HTTP transport */
+      session_program_transport_io_evt (sc->pair.session_handle,
+					SESSION_IO_EVT_RX);
+    }
+  else
+    {
+      /* Force ack on proxy side to update rcv wnd */
+      void *arg = uword_to_pointer (sc->pair.session_handle, void *);
+      session_send_rpc_evt_to_thread (
+	session_thread_from_handle (sc->pair.session_handle), proxy_force_ack,
+	arg);
+    }
 
   return 0;
 }
@@ -664,6 +1164,7 @@ active_open_cleanup_callback (session_t * s, session_cleanup_ntf_t ntf)
 static session_cb_vft_t active_open_clients = {
   .session_reset_callback = active_open_reset_callback,
   .session_connected_callback = active_open_connected_callback,
+  .session_migrate_callback = active_open_migrate_callback,
   .session_accept_callback = active_open_create_callback,
   .session_disconnect_callback = active_open_disconnect_callback,
   .session_cleanup_callback = active_open_cleanup_callback,
@@ -756,22 +1257,34 @@ proxy_server_listen ()
 {
   proxy_main_t *pm = &proxy_main;
   vnet_listen_args_t _a, *a = &_a;
-  int rv;
+  int rv, need_crypto;
 
   clib_memset (a, 0, sizeof (*a));
 
   a->app_index = pm->server_app_index;
   clib_memcpy (&a->sep_ext, &pm->server_sep, sizeof (pm->server_sep));
-  if (proxy_transport_needs_crypto (a->sep.transport_proto))
+  /* Make sure listener is marked connected for transports like udp */
+  a->sep_ext.transport_flags = TRANSPORT_CFG_F_CONNECTED;
+  need_crypto = proxy_transport_needs_crypto (a->sep.transport_proto);
+  if (need_crypto)
     {
-      session_endpoint_alloc_ext_cfg (&a->sep_ext,
-				      TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
-      a->sep_ext.ext_cfg->crypto.ckpair_index = pm->ckpair_index;
+      transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
+	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	sizeof (transport_endpt_crypto_cfg_t));
+      ext_cfg->crypto.ckpair_index = pm->ckpair_index;
+    }
+  /* set http timeout for connect-proxy */
+  if (pm->server_sep.transport_proto == TRANSPORT_PROTO_HTTP)
+    {
+      transport_endpt_cfg_http_t http_cfg = { pm->idle_timeout,
+					      HTTP_UDP_TUNNEL_DGRAM };
+      transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
+	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
+      clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
     }
 
   rv = vnet_listen (a);
-  if (a->sep_ext.ext_cfg)
-    clib_mem_free (a->sep_ext.ext_cfg);
+  session_endpoint_free_ext_cfgs (&a->sep_ext);
 
   return rv;
 }
@@ -797,25 +1310,32 @@ proxy_server_create (vlib_main_t * vm)
 {
   vlib_thread_main_t *vtm = vlib_get_thread_main ();
   proxy_main_t *pm = &proxy_main;
+  proxy_worker_t *wrk;
   u32 num_threads;
   int i;
+  http_header_table_t empty_ht = HTTP_HEADER_TABLE_NULL;
+
+  if (vlib_num_workers ())
+    clib_spinlock_init (&pm->sessions_lock);
 
   num_threads = 1 /* main thread */  + vtm->n_threads;
   vec_validate (pm->rx_buf, num_threads - 1);
+  vec_validate_init_empty (pm->req_headers, num_threads - 1, empty_ht);
 
   for (i = 0; i < num_threads; i++)
     vec_validate (pm->rx_buf[i], pm->rcv_buffer_size);
+
+  vec_validate (pm->workers, vlib_num_workers ());
+  vec_foreach (wrk, pm->workers)
+    {
+      clib_spinlock_init (&wrk->pending_connects_lock);
+    }
 
   proxy_server_add_ckpair ();
 
   if (proxy_server_attach ())
     {
       clib_warning ("failed to attach server app");
-      return -1;
-    }
-  if (proxy_server_listen ())
-    {
-      clib_warning ("failed to start listening");
       return -1;
     }
   if (active_open_attach ())
@@ -849,9 +1369,6 @@ proxy_server_create_command_fn (vlib_main_t * vm, unformat_input_t * input,
   pm->private_segment_count = 0;
   pm->segment_size = 512 << 20;
 
-  if (vlib_num_workers ())
-    clib_spinlock_init (&pm->sessions_lock);
-
   if (!unformat_user (input, unformat_line_input, line_input))
     return 0;
 
@@ -883,6 +1400,8 @@ proxy_server_create_command_fn (vlib_main_t * vm, unformat_input_t * input,
 	vec_add1 (server_uri, 0);
       else if (unformat (line_input, "client-uri %s", &client_uri))
 	vec_add1 (client_uri, 0);
+      else if (unformat (line_input, "idle-timeout %d", &pm->idle_timeout))
+	;
       else
 	{
 	  error = clib_error_return (0, "unknown input `%U'",
@@ -897,34 +1416,45 @@ proxy_server_create_command_fn (vlib_main_t * vm, unformat_input_t * input,
 		    default_server_uri);
       server_uri = format (0, "%s%c", default_server_uri, 0);
     }
-  if (!client_uri)
-    {
-      clib_warning ("No client-uri provided, Using default: %s",
-		    default_client_uri);
-      client_uri = format (0, "%s%c", default_client_uri, 0);
-    }
-
   if (parse_uri ((char *) server_uri, &pm->server_sep))
     {
       error = clib_error_return (0, "Invalid server uri %v", server_uri);
       goto done;
     }
-  if (parse_uri ((char *) client_uri, &pm->client_sep))
+
+  /* http proxy get target within request */
+  if (pm->server_sep.transport_proto != TRANSPORT_PROTO_HTTP)
     {
-      error = clib_error_return (0, "Invalid client uri %v", client_uri);
-      goto done;
+      if (!client_uri)
+	{
+	  clib_warning ("No client-uri provided, Using default: %s",
+			default_client_uri);
+	  client_uri = format (0, "%s%c", default_client_uri, 0);
+	}
+      if (parse_uri ((char *) client_uri,
+		     &pm->client_sep[pm->server_sep.transport_proto]))
+	{
+	  error = clib_error_return (0, "Invalid client uri %v", client_uri);
+	  goto done;
+	}
     }
 
-  vnet_session_enable_disable (vm, 1 /* turn on session and transport */ );
-
-  rv = proxy_server_create (vm);
-  switch (rv)
+  if (pm->server_app_index == APP_INVALID_INDEX)
     {
-    case 0:
-      break;
-    default:
-      error = clib_error_return (0, "server_create returned %d", rv);
+      session_enable_disable_args_t args = { .is_en = 1,
+					     .rt_engine_type =
+					       RT_BACKEND_ENGINE_RULE_TABLE };
+      vnet_session_enable_disable (vm, &args);
+      rv = proxy_server_create (vm);
+      if (rv)
+	{
+	  error = clib_error_return (0, "server_create returned %d", rv);
+	  goto done;
+	}
     }
+
+  if (proxy_server_listen ())
+    error = clib_error_return (0, "failed to start listening");
 
 done:
   unformat_free (line_input);
@@ -933,14 +1463,14 @@ done:
   return error;
 }
 
-VLIB_CLI_COMMAND (proxy_create_command, static) =
-{
+VLIB_CLI_COMMAND (proxy_create_command, static) = {
   .path = "test proxy server",
-  .short_help = "test proxy server [server-uri <tcp://ip/port>]"
-      "[client-uri <tcp://ip/port>][fifo-size <nn>[k|m]]"
-      "[max-fifo-size <nn>[k|m]][high-watermark <nn>]"
-      "[low-watermark <nn>][rcv-buf-size <nn>][prealloc-fifos <nn>]"
-      "[private-segment-size <mem>][private-segment-count <nn>]",
+  .short_help = "test proxy server [server-uri <proto://ip/port>]"
+		"[client-uri <tcp://ip/port>][fifo-size <nn>[k|m]]"
+		"[max-fifo-size <nn>[k|m]][high-watermark <nn>]"
+		"[low-watermark <nn>][rcv-buf-size <nn>][prealloc-fifos <nn>]"
+		"[private-segment-size <mem>][private-segment-count <nn>]"
+		"[idle-timeout <nn>]",
   .function = proxy_server_create_command_fn,
 };
 
@@ -950,6 +1480,16 @@ proxy_main_init (vlib_main_t * vm)
   proxy_main_t *pm = &proxy_main;
   pm->server_client_index = ~0;
   pm->active_open_client_index = ~0;
+  pm->server_app_index = APP_INVALID_INDEX;
+  pm->idle_timeout = 600; /* connect-proxy default idle timeout 10 minutes */
+  vec_validate (pm->client_sep, TRANSPORT_N_PROTOS - 1);
+
+  vec_validate (pm->capsule_proto_header_buf, 10);
+  http_init_headers_ctx (&pm->capsule_proto_header,
+			 pm->capsule_proto_header_buf,
+			 vec_len (pm->capsule_proto_header_buf));
+  http_add_header (&pm->capsule_proto_header, HTTP_HEADER_CAPSULE_PROTOCOL,
+		   http_token_lit (HTTP_BOOLEAN_TRUE));
 
   return 0;
 }
