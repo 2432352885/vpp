@@ -340,7 +340,7 @@ typedef struct
       u32 __pad[3];
       u32 sad_index;
       u32 protect_index;
-      u16 thread_index;
+      clib_thread_index_t thread_index;
     } ipsec;
 
     /* MAP */
@@ -450,6 +450,15 @@ STATIC_ASSERT (sizeof (vnet_buffer_opaque_t) <=
 
 #define vnet_buffer(b) ((vnet_buffer_opaque_t *) (b)->opaque)
 
+static_always_inline void *
+vnet_buffer_get_opaque (vlib_buffer_t *b)
+{
+  return vnet_buffer (b)->unused;
+}
+
+#define VNET_BUFFER_OPAQUE_SIZE                                               \
+  (sizeof (vnet_buffer ((vlib_buffer_t *) 0)->unused))
+
 /* Full cache line (64 bytes) of additional space */
 typedef struct
 {
@@ -502,7 +511,7 @@ typedef struct
      */
     struct
     {
-      u32 thread_index;
+      clib_thread_index_t thread_index;
       u32 pool_index;
       u32 id;
     } reass;
@@ -521,10 +530,15 @@ STATIC_ASSERT (sizeof (vnet_buffer_opaque2_t) ==
 		 STRUCT_SIZE_OF (vlib_buffer_t, opaque2),
 	       "VNET buffer opaque2 meta-data too large for vlib_buffer");
 
-#define gso_mtu_sz(b) (vnet_buffer2(b)->gso_size + \
-                       vnet_buffer2(b)->gso_l4_hdr_sz + \
-                       vnet_buffer(b)->l4_hdr_offset - \
-                       vnet_buffer (b)->l3_hdr_offset)
+#define gso_mtu_tunnel_size(b)                                                \
+  ((vnet_buffer (b)->oflags & VNET_BUFFER_OFFLOAD_F_TNL_MASK) ?               \
+     vnet_buffer (b)->l3_hdr_offset - vnet_buffer2 (b)->outer_l3_hdr_offset : \
+     0)
+
+#define gso_mtu_sz(b)                                                         \
+  (vnet_buffer2 (b)->gso_size + vnet_buffer2 (b)->gso_l4_hdr_sz +             \
+   vnet_buffer (b)->l4_hdr_offset - vnet_buffer (b)->l3_hdr_offset +          \
+   gso_mtu_tunnel_size (b))
 
 format_function_t format_vnet_buffer_no_chain;
 format_function_t format_vnet_buffer;
@@ -547,6 +561,23 @@ vnet_buffer_offload_flags_set (vlib_buffer_t *b, vnet_buffer_oflags_t oflags)
       vnet_buffer (b)->oflags = oflags;
       b->flags |= VNET_BUFFER_F_OFFLOAD;
     }
+#if CLIB_DEBUG > 0
+  if (VNET_BUFFER_OFFLOAD_F_IP_CKSUM & oflags)
+    {
+      ASSERT (b->flags & VNET_BUFFER_F_L3_HDR_OFFSET_VALID);
+      ASSERT (b->flags & VNET_BUFFER_F_IS_IP4);
+    }
+
+  if ((VNET_BUFFER_OFFLOAD_F_TCP_CKSUM | VNET_BUFFER_OFFLOAD_F_UDP_CKSUM) &
+      oflags)
+    ASSERT (b->flags & VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
+
+  if (VNET_BUFFER_OFFLOAD_F_OUTER_UDP_CKSUM & oflags)
+    ASSERT (VNET_BUFFER_OFFLOAD_F_TNL_VXLAN & oflags);
+  if (VNET_BUFFER_OFFLOAD_F_OUTER_IP_CKSUM & oflags)
+    ASSERT ((VNET_BUFFER_OFFLOAD_F_TNL_IPIP & oflags) ||
+	    (VNET_BUFFER_OFFLOAD_F_TNL_VXLAN & oflags));
+#endif
 }
 
 static_always_inline void

@@ -72,6 +72,21 @@ typedef struct
   vlib_buffer_t buffer;
 } af_packet_tx_trace_t;
 
+always_inline word
+af_packet_error_is_fatal (word error)
+{
+  switch (error)
+    {
+#ifdef CLIB_UNIX
+    case EAGAIN:
+    case ENOBUFS:
+    case EINTR:
+      return 0;
+#endif
+    }
+  return 1;
+}
+
 #ifndef CLIB_MARCH_VARIANT
 u8 *
 format_af_packet_device_name (u8 * s, va_list * args)
@@ -84,6 +99,21 @@ format_af_packet_device_name (u8 * s, va_list * args)
   return s;
 }
 #endif /* CLIB_MARCH_VARIANT */
+
+static u8 *
+format_af_packet_offload_flag (u8 *s, va_list *args)
+{
+  af_packet_offload_flag_t af_oflags =
+    va_arg (*args, af_packet_offload_flag_t);
+  u32 indent = va_arg (*args, u32);
+
+#define _(o, n, str)                                                          \
+  if (af_oflags & AF_PACKET_OFFLOAD_FLAG_##o)                                 \
+    s = format (s, "\n%U%s", format_white_space, indent + 3, str);
+  foreach_af_packet_offload_flag
+#undef _
+    return s;
+}
 
 static u8 *
 format_af_packet_device (u8 * s, va_list * args)
@@ -106,6 +136,13 @@ format_af_packet_device (u8 * s, va_list * args)
     s = format (s, "\n%Ucksum-gso-enabled", format_white_space, indent + 2);
   if (apif->is_fanout_enabled)
     s = format (s, "\n%Ufanout-enabled", format_white_space, indent + 2);
+  s = format (s, "\n%UHost Interface Offload:", format_white_space, indent);
+  s = format (s, "\n%Ucreation time:%U", format_white_space, indent + 2,
+	      format_af_packet_offload_flag, apif->host_interface_oflags,
+	      indent);
+  s = format (s, "\n%Unow:%U", format_white_space, indent + 2,
+	      format_af_packet_offload_flag,
+	      af_packet_get_if_capabilities (apif->host_if_name), indent);
 
   vec_foreach (rx_queue, apif->rx_queues)
     {
@@ -296,11 +333,11 @@ fill_gso_offload (vlib_buffer_t *b0, vnet_virtio_net_hdr_t *vnet_hdr)
   if (b0->flags & VNET_BUFFER_F_IS_IP4)
     {
       ip4_header_t *ip4;
-      vnet_hdr->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
-      vnet_hdr->gso_size = vnet_buffer2 (b0)->gso_size;
-      vnet_hdr->hdr_len = l4_hdr_offset + vnet_buffer2 (b0)->gso_l4_hdr_sz;
       vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-      vnet_hdr->csum_start = l4_hdr_offset; // 0x22;
+      vnet_hdr->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+      vnet_hdr->hdr_len = l4_hdr_offset + vnet_buffer2 (b0)->gso_l4_hdr_sz;
+      vnet_hdr->gso_size = vnet_buffer2 (b0)->gso_size;
+      vnet_hdr->csum_start = l4_hdr_offset;
       vnet_hdr->csum_offset = STRUCT_OFFSET_OF (tcp_header_t, checksum);
       ip4 = (ip4_header_t *) (b0->data + vnet_buffer (b0)->l3_hdr_offset);
       if (oflags & VNET_BUFFER_OFFLOAD_F_IP_CKSUM)
@@ -312,11 +349,11 @@ fill_gso_offload (vlib_buffer_t *b0, vnet_virtio_net_hdr_t *vnet_hdr)
   else if (b0->flags & VNET_BUFFER_F_IS_IP6)
     {
       ip6_header_t *ip6;
-      vnet_hdr->gso_type = VIRTIO_NET_HDR_GSO_TCPV6;
-      vnet_hdr->gso_size = vnet_buffer2 (b0)->gso_size;
-      vnet_hdr->hdr_len = l4_hdr_offset + vnet_buffer2 (b0)->gso_l4_hdr_sz;
       vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-      vnet_hdr->csum_start = l4_hdr_offset; // 0x36;
+      vnet_hdr->gso_type = VIRTIO_NET_HDR_GSO_TCPV6;
+      vnet_hdr->hdr_len = l4_hdr_offset + vnet_buffer2 (b0)->gso_l4_hdr_sz;
+      vnet_hdr->gso_size = vnet_buffer2 (b0)->gso_size;
+      vnet_hdr->csum_start = l4_hdr_offset;
       vnet_hdr->csum_offset = STRUCT_OFFSET_OF (tcp_header_t, checksum);
       ip6 = (ip6_header_t *) (b0->data + vnet_buffer (b0)->l3_hdr_offset);
       tcp_header_t *tcp =
@@ -336,46 +373,50 @@ fill_cksum_offload (vlib_buffer_t *b0, vnet_virtio_net_hdr_t *vnet_hdr)
       ip4 = (ip4_header_t *) (b0->data + vnet_buffer (b0)->l3_hdr_offset);
       if (oflags & VNET_BUFFER_OFFLOAD_F_IP_CKSUM)
 	ip4->checksum = ip4_header_checksum (ip4);
-      vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-      vnet_hdr->csum_start = l4_hdr_offset;
       if (oflags & VNET_BUFFER_OFFLOAD_F_TCP_CKSUM)
 	{
 	  tcp_header_t *tcp =
 	    (tcp_header_t *) (b0->data + vnet_buffer (b0)->l4_hdr_offset);
 	  tcp->checksum = ip4_pseudo_header_cksum (ip4);
-	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (tcp_header_t, checksum);
+	  vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 	  vnet_hdr->hdr_len = l4_hdr_offset + tcp_header_bytes (tcp);
+	  vnet_hdr->csum_start = l4_hdr_offset;
+	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (tcp_header_t, checksum);
 	}
       else if (oflags & VNET_BUFFER_OFFLOAD_F_UDP_CKSUM)
 	{
 	  udp_header_t *udp =
 	    (udp_header_t *) (b0->data + vnet_buffer (b0)->l4_hdr_offset);
 	  udp->checksum = ip4_pseudo_header_cksum (ip4);
-	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (udp_header_t, checksum);
+	  vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 	  vnet_hdr->hdr_len = l4_hdr_offset + sizeof (udp_header_t);
+	  vnet_hdr->csum_start = l4_hdr_offset;
+	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (udp_header_t, checksum);
 	}
     }
   else if (b0->flags & VNET_BUFFER_F_IS_IP6)
     {
       ip6_header_t *ip6;
-      vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-      vnet_hdr->csum_start = l4_hdr_offset;
       ip6 = (ip6_header_t *) (b0->data + vnet_buffer (b0)->l3_hdr_offset);
       if (oflags & VNET_BUFFER_OFFLOAD_F_TCP_CKSUM)
 	{
 	  tcp_header_t *tcp =
 	    (tcp_header_t *) (b0->data + vnet_buffer (b0)->l4_hdr_offset);
 	  tcp->checksum = ip6_pseudo_header_cksum (ip6);
-	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (tcp_header_t, checksum);
+	  vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 	  vnet_hdr->hdr_len = l4_hdr_offset + tcp_header_bytes (tcp);
+	  vnet_hdr->csum_start = l4_hdr_offset;
+	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (tcp_header_t, checksum);
 	}
       else if (oflags & VNET_BUFFER_OFFLOAD_F_UDP_CKSUM)
 	{
 	  udp_header_t *udp =
 	    (udp_header_t *) (b0->data + vnet_buffer (b0)->l4_hdr_offset);
 	  udp->checksum = ip6_pseudo_header_cksum (ip6);
-	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (udp_header_t, checksum);
+	  vnet_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 	  vnet_hdr->hdr_len = l4_hdr_offset + sizeof (udp_header_t);
+	  vnet_hdr->csum_start = l4_hdr_offset;
+	  vnet_hdr->csum_offset = STRUCT_OFFSET_OF (udp_header_t, checksum);
 	}
     }
 }
@@ -583,9 +624,13 @@ VNET_DEVICE_CLASS_TX_FN (af_packet_device_class) (vlib_main_t * vm,
 	   */
 	  uword counter;
 
-	  if (unix_error_is_fatal (errno))
+	  if (af_packet_error_is_fatal (errno))
 	    {
 	      counter = AF_PACKET_TX_ERROR_TXRING_FATAL;
+	      vlib_log_err (apm->log_class,
+			    "af_packet_%s sendto failed: %d %s",
+			    apif->host_if_name, errno, strerror (errno));
+	      /* TODO attempt to reattach */
 	    }
 	  else
 	    {

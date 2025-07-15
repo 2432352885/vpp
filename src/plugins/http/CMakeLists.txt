@@ -14,6 +14,7 @@
 add_vpp_plugin(http
   SOURCES
   http2/hpack.c
+  http2/http2.c
   http2/frame.c
   http.c
   http_buffer.c

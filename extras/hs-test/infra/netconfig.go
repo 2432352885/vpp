@@ -16,6 +16,7 @@ type (
 	MacAddress           = ethernet_types.MacAddress
 	AddressWithPrefix    = ip_types.AddressWithPrefix
 	IP4AddressWithPrefix = ip_types.IP4AddressWithPrefix
+	IP6AddressWithPrefix = ip_types.IP6AddressWithPrefix
 	InterfaceIndex       = interface_types.InterfaceIndex
 
 	NetConfig interface {
@@ -34,6 +35,8 @@ type (
 		NetConfigBase
 		Ip4AddrAllocator *Ip4AddressAllocator
 		Ip4Address       string
+		Ip6AddrAllocator *Ip6AddressAllocator
+		Ip6Address       string
 		Index            InterfaceIndex
 		HwAddress        MacAddress
 		NetworkNamespace string
@@ -119,10 +122,69 @@ func newNetworkInterface(cfg NetDevConfig, a *Ip4AddressAllocator) (*NetInterfac
 	return newInterface, nil
 }
 
+func newNetworkInterface6(cfg NetDevConfig, a *Ip6AddressAllocator) (*NetInterface, error) {
+	var newInterface *NetInterface = &NetInterface{}
+	var err error
+	newInterface.Ip6AddrAllocator = a
+	newInterface.name = cfg["name"].(string)
+	newInterface.NetworkNumber = DEFAULT_NETWORK_NUM
+
+	if interfaceType, ok := cfg["type"]; ok {
+		newInterface.category = interfaceType.(string)
+	}
+
+	if presetHwAddress, ok := cfg["preset-hw-address"]; ok {
+		newInterface.HwAddress, err = ethernet_types.ParseMacAddress(presetHwAddress.(string))
+		if err != nil {
+			return &NetInterface{}, err
+		}
+	}
+
+	if netns, ok := cfg["netns"]; ok {
+		newInterface.NetworkNamespace = netns.(string)
+	}
+
+	if ip, ok := cfg["ip6"]; ok {
+		if n, ok := ip.(NetDevConfig)["network"]; ok {
+			newInterface.NetworkNumber = n.(int)
+		}
+		newInterface.Ip6Address, err = newInterface.Ip6AddrAllocator.NewIp6InterfaceAddress(
+			newInterface.NetworkNumber,
+		)
+		if err != nil {
+			return &NetInterface{}, err
+		}
+	}
+
+	if _, ok := cfg["peer"]; !ok {
+		return newInterface, nil
+	}
+
+	peer := cfg["peer"].(NetDevConfig)
+
+	if newInterface.Peer, err = newNetworkInterface6(peer, a); err != nil {
+		return &NetInterface{}, err
+	}
+
+	return newInterface, nil
+}
+
 func (n *NetInterface) configureUpState() error {
 	err := setDevUp(n.Name(), "")
 	if err != nil {
 		return fmt.Errorf("set link up failed: %v", err)
+	}
+	return nil
+}
+
+func (n *NetInterface) configureMultiQueue() error {
+	// TODO multiqueue for tap
+	if n.Type() != Veth {
+		return nil
+	}
+	err := linkSetMultiQueue(n.Name())
+	if err != nil {
+		return fmt.Errorf("set multiqueue failed: %v", err)
 	}
 	return nil
 }
@@ -159,6 +221,10 @@ func (n *NetInterface) configure() error {
 	}
 
 	if err := n.configureUpState(); err != nil {
+		return err
+	}
+
+	if err := n.configureMultiQueue(); err != nil {
 		return err
 	}
 
@@ -199,8 +265,13 @@ func (n *NetInterface) Type() string {
 	return n.category
 }
 
-func (n *NetInterface) AddressWithPrefix() AddressWithPrefix {
-	address, _ := ip_types.ParseAddressWithPrefix(n.Ip4Address)
+func (n *NetInterface) AddressWithPrefix(IPv6 bool) AddressWithPrefix {
+	var address ip_types.AddressWithPrefix
+	if IPv6 {
+		address, _ = ip_types.ParseAddressWithPrefix(n.Ip6Address)
+	} else {
+		address, _ = ip_types.ParseAddressWithPrefix(n.Ip4Address)
+	}
 	return address
 }
 
@@ -210,8 +281,18 @@ func (n *NetInterface) Ip4AddressWithPrefix() IP4AddressWithPrefix {
 	return Ip4AddressWithPrefix
 }
 
+func (n *NetInterface) Ip6AddressWithPrefix() IP6AddressWithPrefix {
+	ip6Prefix, _ := ip_types.ParseIP6Prefix(n.Ip6Address)
+	Ip6AddressWithPrefix := ip_types.IP6AddressWithPrefix(ip6Prefix)
+	return Ip6AddressWithPrefix
+}
+
 func (n *NetInterface) Ip4AddressString() string {
 	return strings.Split(n.Ip4Address, "/")[0]
+}
+
+func (n *NetInterface) Ip6AddressString() string {
+	return strings.Split(n.Ip6Address, "/")[0]
 }
 
 func (b *NetConfigBase) Name() string {
@@ -323,6 +404,16 @@ func linkSetNetns(ifName, ns string) error {
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("error setting device '%s' to netns '%s: %v", ifName, ns, err)
+	}
+	return nil
+}
+
+func linkSetMultiQueue(ifName string) error {
+	cmd := exec.Command("ethtool", "-L", ifName, "rx", "4", "tx", "4")
+	fmt.Println("configuring multiqueue for interface:", cmd.String())
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("error configuring multiqueue '%s: %v", ifName, err)
 	}
 	return nil
 }

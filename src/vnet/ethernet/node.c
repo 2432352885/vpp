@@ -610,6 +610,7 @@ eth_input_tag_lookup (vlib_main_t * vm, vnet_main_t * vnm,
   vlib_buffer_advance (b, l->adv);
   vnet_buffer (b)->l2.l2_len = l->len;
   vnet_buffer (b)->l3_hdr_offset = vnet_buffer (b)->l2_hdr_offset + l->len;
+  b->flags |= VNET_BUFFER_F_L3_HDR_OFFSET_VALID;
 
   if (l->err == ETHERNET_ERROR_NONE)
     {
@@ -1218,7 +1219,7 @@ ethernet_input_inline (vlib_main_t * vm,
   vlib_node_runtime_t *error_node;
   u32 n_left_from, next_index, *to_next;
   u32 stats_sw_if_index, stats_n_packets, stats_n_bytes;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
   u32 cached_sw_if_index = ~0;
   u32 cached_is_l2 = 0;		/* shut up gcc */
   vnet_hw_interface_t *hi = NULL;	/* used for main interface only */

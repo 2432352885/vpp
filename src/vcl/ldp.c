@@ -122,9 +122,6 @@ typedef struct
   u32 vlsh_bit_mask;
   u32 debug;
 
-  /** vcl needs next epoll_create to go to libc_epoll */
-  u8 vcl_needs_real_epoll;
-
   /**
    * crypto state used only for testing
    */
@@ -288,11 +285,11 @@ ldp_init (void)
 
   ldp_init_cfg ();
   ldp->init = 1;
-  ldp->vcl_needs_real_epoll = 1;
+  vls_set_epoll_fns (
+    (vls_epoll_fns_t){ libc_epoll_create1, libc_epoll_ctl, libc_epoll_wait });
   rv = vls_app_create (ldp_get_app_name ());
   if (rv != VPPCOM_OK)
     {
-      ldp->vcl_needs_real_epoll = 0;
       if (rv == VPPCOM_EEXIST)
 	return 0;
       LDBG (2,
@@ -302,7 +299,6 @@ ldp_init (void)
       ldp->init = 0;
       return rv;
     }
-  ldp->vcl_needs_real_epoll = 0;
 
   LDBG (0, "LDP initialization: done!");
 
@@ -655,25 +651,29 @@ ldp_select_init_maps (fd_set * __restrict original,
   clib_memcpy_fast (*resultb, original, n_bytes);
   memset (original, 0, n_bytes);
 
-  clib_bitmap_foreach (fd, *resultb)  {
-    if (fd > nfds)
-      break;
-    vlsh = ldp_fd_to_vlsh (fd);
-    if (vlsh == VLS_INVALID_HANDLE)
-      clib_bitmap_set_no_check (*libcb, fd, 1);
-    else
-      {
+  clib_bitmap_foreach (fd, *resultb)
+    {
+      if (fd > nfds)
+	break;
+      vlsh = ldp_fd_to_vlsh (fd);
+      if (vlsh == VLS_INVALID_HANDLE)
+	clib_bitmap_set_no_check (*libcb, fd, 1);
+      else
+	{
 	  vlsh_to_session_and_worker_index (vlsh, &session_index, &wrk_index);
 	  if (wrk_index != vppcom_worker_index ())
-	    clib_warning ("migration currently not supported");
+	    clib_warning (
+	      "migration for %d vlsh %d from %d to %d not supported", fd, vlsh,
+	      wrk_index, vppcom_worker_index ());
 	  else
 	    *vclb = clib_bitmap_set (*vclb, session_index, 1);
-      }
-  }
+	}
+    }
 
   si_bits_set = clib_bitmap_last_set (*vclb) + 1;
   *si_bits = (si_bits_set > *si_bits) ? si_bits_set : *si_bits;
-  clib_bitmap_validate (*resultb, *si_bits);
+  if (*si_bits)
+    clib_bitmap_validate (*resultb, *si_bits);
 
   libc_bits_set = clib_bitmap_last_set (*libcb) + 1;
   *libc_bits = (libc_bits_set > *libc_bits) ? libc_bits_set : *libc_bits;
@@ -2385,21 +2385,10 @@ shutdown (int fd, int how)
 int
 epoll_create1 (int flags)
 {
-  ldp_worker_ctx_t *ldpw = ldp_worker_get_current ();
   vls_handle_t vlsh;
   int rv;
 
   ldp_init_check ();
-
-  if (ldp->vcl_needs_real_epoll || vls_use_real_epoll ())
-    {
-      rv = libc_epoll_create1 (flags);
-      ldp->vcl_needs_real_epoll = 0;
-      /* Assume this is a request to create the mq epfd */
-      ldpw->vcl_mq_epfd = rv;
-      LDBG (0, "created vcl epfd %u", rv);
-      return rv;
-    }
 
   vlsh = vls_epoll_create ();
   if (PREDICT_FALSE (vlsh == VLS_INVALID_HANDLE))
@@ -2527,10 +2516,6 @@ ldp_epoll_pwait (int epfd, struct epoll_event *events, int maxevents,
   if (PREDICT_FALSE (vppcom_worker_index () == ~0))
     vls_register_vcl_worker ();
 
-  ldpw = ldp_worker_get_current ();
-  if (epfd == ldpw->vcl_mq_epfd)
-    return libc_epoll_pwait (epfd, events, maxevents, timeout, sigmask);
-
   ep_vlsh = ldp_fd_to_vlsh (epfd);
   if (PREDICT_FALSE (ep_vlsh == VLS_INVALID_HANDLE))
     {
@@ -2539,6 +2524,7 @@ ldp_epoll_pwait (int epfd, struct epoll_event *events, int maxevents,
       return -1;
     }
 
+  ldpw = ldp_worker_get_current ();
   if (PREDICT_FALSE (ldpw->clib_time.init_cpu_time == 0))
     clib_time_init (&ldpw->clib_time);
   time_to_wait = ((timeout >= 0) ? (double) timeout / 1000 : 0);
@@ -2611,9 +2597,6 @@ ldp_epoll_pwait_eventfd (int epfd, struct epoll_event *events,
     vls_register_vcl_worker ();
 
   ldpw = ldp_worker_get_current ();
-  if (epfd == ldpw->vcl_mq_epfd)
-    return libc_epoll_pwait (epfd, events, maxevents, timeout, sigmask);
-
   ep_vlsh = ldp_fd_to_vlsh (epfd);
   if (PREDICT_FALSE (ep_vlsh == VLS_INVALID_HANDLE))
     {
@@ -2655,8 +2638,7 @@ ldp_epoll_pwait_eventfd (int epfd, struct epoll_event *events,
       ldpw->vcl_mq_epfd = vppcom_mq_epoll_fd ();
       e.events = EPOLLIN;
       e.data.fd = ldpw->vcl_mq_epfd;
-      if (libc_epoll_ctl (libc_epfd, EPOLL_CTL_ADD, ldpw->vcl_mq_epfd, &e) <
-	  0)
+      if (libc_epoll_ctl (libc_epfd, EPOLL_CTL_ADD, ldpw->vcl_mq_epfd, &e) < 0)
 	{
 	  LDBG (0, "epfd %d, add libc mq epoll fd %d to libc epoll fd %d",
 		epfd, ldpw->vcl_mq_epfd, libc_epfd);

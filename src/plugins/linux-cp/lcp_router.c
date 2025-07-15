@@ -17,7 +17,6 @@
 #include <linux/if.h>
 #include <linux/mpls.h>
 
-//#include <vlib/vlib.h>
 #include <vlib/unix/plugin.h>
 #include <linux-cp/lcp_nl.h>
 #include <linux-cp/lcp_interface.h>
@@ -1333,7 +1332,6 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
   lcp_router_route_mk_prefix (rr, &pfx);
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
-  nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
   /* Skip any kernel routes and IPv6 LL or multicast routes */
   if (rproto == RTPROT_KERNEL ||
       (FIB_PROTOCOL_IP6 == pfx.fp_proto &&
@@ -1361,6 +1359,8 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 
   if (0 != vec_len (np.paths))
     {
+      nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
+
       if (rtype == RTN_MULTICAST)
 	{
 	  /* it's not clear to me how linux expresses the RPF paramters
@@ -1424,6 +1424,16 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
       LCP_ROUTER_DBG ("no paths for route: %d:%U %U",
 		      rtnl_route_get_table (rr), format_fib_prefix, &pfx,
 		      format_fib_entry_flags, entry_flags);
+
+      nlt =
+	lcp_router_table_find (lcp_router_table_k2f (table_id), pfx.fp_proto);
+
+      if (is_replace && nlt)
+	{
+	  fib_source_t fib_src;
+	  fib_src = lcp_router_proto_fib_source (rproto);
+	  fib_table_entry_delete (nlt->nlt_fib_index, &pfx, fib_src);
+	}
     }
   vec_free (np.paths);
 }
@@ -1543,12 +1553,24 @@ const nl_vft_t lcp_router_vft = {
 			     .cb = lcp_router_route_sync_end },
 };
 
+static void
+lcp_lcp_router_interface_del_cb (lcp_itf_pair_t *lip)
+{
+  lcp_router_ip6_mroutes_add_del (lip->lip_phy_sw_if_index, 0);
+}
+
 static clib_error_t *
 lcp_router_init (vlib_main_t *vm)
 {
   lcp_router_logger = vlib_log_register_class ("linux-cp", "router");
 
   nl_register_vft (&lcp_router_vft);
+
+  lcp_itf_pair_vft_t lcp_router_interface_del_vft = {
+    .pair_del_fn = lcp_lcp_router_interface_del_cb,
+  };
+
+  lcp_itf_pair_register_vft (&lcp_router_interface_del_vft);
 
   /*
    * allocate 2 route sources. The low priority source will be for

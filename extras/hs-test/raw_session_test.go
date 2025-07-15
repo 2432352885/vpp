@@ -22,7 +22,7 @@ func VppEchoTcpTest(s *VethsSuite) {
 
 func testVppEcho(s *VethsSuite, proto string) {
 	serverVethAddress := s.Interfaces.Server.Ip4AddressString()
-	uri := proto + "://" + serverVethAddress + "/12344"
+	uri := proto + "://" + serverVethAddress + "/" + s.Ports.Port1
 
 	serverCommand := "vpp_echo server TX=RX" +
 		" socket-name " + s.Containers.ServerApp.GetContainerWorkDir() + "/var/run/app_ns_sockets/default" +
@@ -35,6 +35,7 @@ func testVppEcho(s *VethsSuite, proto string) {
 		" socket-name " + s.Containers.ClientApp.GetContainerWorkDir() + "/var/run/app_ns_sockets/default" +
 		" use-app-socket-api uri " + uri
 	s.Log(clientCommand)
-	o := s.Containers.ClientApp.Exec(true, clientCommand)
+	o, err := s.Containers.ClientApp.Exec(true, clientCommand)
+	s.AssertNil(err)
 	s.Log(o)
 }

@@ -146,6 +146,7 @@ compile_commands.json
 /extras/hs-test/.goimports.ok
 /extras/hs-test/summary/
 /extras/hs-test/.last_state_hash
+/extras/hs-test/.kind_deps.ok
 
 # ./configure
 /CMakeFiles
@@ -159,5 +160,7 @@ compile_commands.json
 /cmake_install.cmake
 /startup.conf
 /startup.vpp
+/install_manifest.txt
+
 # log file archives
 /archives

@@ -325,7 +325,7 @@ VLIB_NODE_FN (srv6_end_m_gtp4_e)
   srv6_end_main_v4_t *sm = &srv6_end_main_v4;
   ip6_sr_main_t *sm2 = &sr_main;
   u32 n_left_from, next_index, *from, *to_next;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
 
   u32 good_n = 0, bad_n = 0;
 
@@ -374,7 +374,7 @@ VLIB_NODE_FN (srv6_end_m_gtp4_e)
 
 	  len0 = vlib_buffer_length_in_chain (vm, b0);
 
-	  if ((ip6srv0->ip.protocol == IPPROTO_IPV6_ROUTE &&
+	  if ((ip6srv0->ip.protocol == IP_PROTOCOL_IPV6_ROUTE &&
 	       len0 <
 		 sizeof (ip6srv_combo_header_t) + ip6srv0->sr.length * 8) ||
 	      (len0 < sizeof (ip6_header_t)))
@@ -402,7 +402,7 @@ VLIB_NODE_FN (srv6_end_m_gtp4_e)
 	      void *p;
 	      uword plen;
 
-	      if (ip6srv0->ip.protocol == IPPROTO_IPV6_ROUTE)
+	      if (ip6srv0->ip.protocol == IP_PROTOCOL_IPV6_ROUTE)
 		{
 		  tag = ip6srv0->sr.tag;
 		}
@@ -513,7 +513,7 @@ VLIB_NODE_FN (srv6_end_m_gtp4_e)
 		    }
 		}
 
-	      if (ip6srv0->ip.protocol == IPPROTO_IPV6_ROUTE)
+	      if (ip6srv0->ip.protocol == IP_PROTOCOL_IPV6_ROUTE)
 		{
 		  vlib_buffer_advance (b0,
 				       (word) sizeof (ip6srv_combo_header_t) +
@@ -1327,7 +1327,7 @@ VLIB_NODE_FN (srv6_end_m_gtp6_e)
   srv6_end_main_v6_t *sm = &srv6_end_main_v6;
   ip6_sr_main_t *sm2 = &sr_main;
   u32 n_left_from, next_index, *from, *to_next;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
 
   u32 good_n = 0, bad_n = 0;
 
@@ -1384,7 +1384,7 @@ VLIB_NODE_FN (srv6_end_m_gtp6_e)
 
 	  len0 = vlib_buffer_length_in_chain (vm, b0);
 
-	  if ((ip6srv0->ip.protocol != IPPROTO_IPV6_ROUTE) ||
+	  if ((ip6srv0->ip.protocol != IP_PROTOCOL_IPV6_ROUTE) ||
 	      (len0 < sizeof (ip6srv_combo_header_t) + 8 * ip6srv0->sr.length))
 	    {
 	      next0 = SRV6_END_M_GTP6_E_NEXT_DROP;
@@ -2088,7 +2088,7 @@ VLIB_NODE_FN (srv6_end_m_gtp6_d)
   srv6_end_main_v6_decap_t *sm = &srv6_end_main_v6_decap;
   ip6_sr_main_t *sm2 = &sr_main;
   u32 n_left_from, next_index, *from, *to_next;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
   ip6_sr_localsid_t *ls0;
   srv6_end_gtp6_d_param_t *ls_param;
 
@@ -2238,7 +2238,7 @@ VLIB_NODE_FN (srv6_end_m_gtp6_d_di)
   srv6_end_main_v6_decap_di_t *sm = &srv6_end_main_v6_decap_di;
   ip6_sr_main_t *sm2 = &sr_main;
   u32 n_left_from, next_index, *from, *to_next;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
   srv6_end_gtp6_d_param_t *ls_param;
 
   u32 good_n = 0, bad_n = 0;
@@ -2686,7 +2686,7 @@ VLIB_NODE_FN (srv6_end_m_gtp6_dt)
   srv6_end_main_v6_dt_t *sm = &srv6_end_main_v6_dt;
   ip6_sr_main_t *sm2 = &sr_main;
   u32 n_left_from, next_index, *from, *to_next;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
 
   u32 good_n = 0, bad_n = 0;
 

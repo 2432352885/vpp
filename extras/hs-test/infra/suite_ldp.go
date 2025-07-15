@@ -7,11 +7,13 @@ import (
 	"strings"
 	"time"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
 var ldpTests = map[string][]func(s *LdpSuite){}
 var ldpSoloTests = map[string][]func(s *LdpSuite){}
+var ldpMWTests = map[string][]func(s *LdpSuite){}
 
 type LdpSuite struct {
 	HstSuite
@@ -25,26 +27,33 @@ type LdpSuite struct {
 		ServerApp *Container
 		ClientApp *Container
 	}
+	Ports struct {
+		Port1 string
+	}
 }
 
 func RegisterLdpTests(tests ...func(s *LdpSuite)) {
-	ldpTests[getTestFilename()] = tests
+	ldpTests[GetTestFilename()] = tests
 }
 func RegisterSoloLdpTests(tests ...func(s *LdpSuite)) {
-	ldpSoloTests[getTestFilename()] = tests
+	ldpSoloTests[GetTestFilename()] = tests
+}
+func RegisterLdpMWTests(tests ...func(s *LdpSuite)) {
+	ldpMWTests[GetTestFilename()] = tests
 }
 
 func (s *LdpSuite) SetupSuite() {
 	time.Sleep(1 * time.Second)
 	s.HstSuite.SetupSuite()
 	s.ConfigureNetworkTopology("2peerVeth")
-	s.LoadContainerTopology("2peerVethLdp")
+	s.LoadContainerTopology("2peerVeth")
 	s.Interfaces.Client = s.GetInterfaceByName("cln")
 	s.Interfaces.Server = s.GetInterfaceByName("srv")
 	s.Containers.ServerVpp = s.GetContainerByName("server-vpp")
 	s.Containers.ClientVpp = s.GetContainerByName("client-vpp")
 	s.Containers.ServerApp = s.GetContainerByName("server-app")
 	s.Containers.ClientApp = s.GetContainerByName("client-app")
+	s.Ports.Port1 = s.GeneratePort()
 }
 
 func (s *LdpSuite) SetupTest() {
@@ -72,17 +81,15 @@ func (s *LdpSuite) SetupTest() {
 	clientVpp, err := s.Containers.ClientVpp.newVppInstance(s.Containers.ClientVpp.AllocatedCpus, sessionConfig)
 	s.AssertNotNil(clientVpp, fmt.Sprint(err))
 
-	s.Containers.ServerVpp.AddEnvVar("VCL_CONFIG", s.Containers.ServerVpp.GetContainerWorkDir()+"/vcl.conf")
-	s.Containers.ClientVpp.AddEnvVar("VCL_CONFIG", s.Containers.ClientVpp.GetContainerWorkDir()+"/vcl.conf")
-
 	for _, container := range s.StartedContainers {
+		container.AddEnvVar("VCL_CONFIG", container.GetContainerWorkDir()+"/vcl.conf")
 		container.AddEnvVar("LD_PRELOAD", "/usr/lib/libvcl_ldpreload.so")
 		container.AddEnvVar("LDP_DEBUG", "0")
 		container.AddEnvVar("VCL_DEBUG", "0")
 	}
 
-	s.CreateVclConfig(s.Containers.ServerVpp)
-	s.CreateVclConfig(s.Containers.ClientVpp)
+	s.CreateVclConfig(s.Containers.ServerApp)
+	s.CreateVclConfig(s.Containers.ClientApp)
 	s.SetupServerVpp(s.Containers.ServerVpp)
 	s.setupClientVpp(s.Containers.ClientVpp)
 
@@ -96,13 +103,19 @@ func (s *LdpSuite) SetupTest() {
 	}
 }
 
-func (s *LdpSuite) TearDownTest() {
+func (s *LdpSuite) TeardownTest() {
+	defer s.HstSuite.TeardownTest()
+	if CurrentSpecReport().Failed() {
+		s.CollectIperfLogs(s.Containers.ServerApp)
+		s.CollectRedisServerLogs(s.Containers.ServerApp)
+		s.Log(s.Containers.ServerVpp.VppInstance.Vppctl("show error"))
+		s.Log(s.Containers.ClientVpp.VppInstance.Vppctl("show error"))
+	}
+
 	for _, container := range s.StartedContainers {
 		delete(container.EnvVars, "LD_PRELOAD")
 		delete(container.EnvVars, "VCL_CONFIG")
 	}
-	s.HstSuite.TearDownTest()
-
 }
 
 func (s *LdpSuite) CreateVclConfig(container *Container) {
@@ -127,7 +140,9 @@ func (s *LdpSuite) SetupServerVpp(serverContainer *Container) {
 	serverVpp := serverContainer.VppInstance
 	s.AssertNil(serverVpp.Start())
 
-	idx, err := serverVpp.createAfPacket(s.Interfaces.Server)
+	numCpus := uint16(len(serverContainer.AllocatedCpus))
+	numWorkers := uint16(max(numCpus-1, 1))
+	idx, err := serverVpp.createAfPacket(s.Interfaces.Server, false, WithNumRxQueues(numWorkers), WithNumTxQueues(numCpus))
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertNotEqual(0, idx)
 }
@@ -136,7 +151,9 @@ func (s *LdpSuite) setupClientVpp(clientContainer *Container) {
 	clientVpp := clientContainer.VppInstance
 	s.AssertNil(clientVpp.Start())
 
-	idx, err := clientVpp.createAfPacket(s.Interfaces.Client)
+	numCpus := uint16(len(clientContainer.AllocatedCpus))
+	numWorkers := uint16(max(numCpus-1, 1))
+	idx, err := clientVpp.createAfPacket(s.Interfaces.Client, false, WithNumRxQueues(numWorkers), WithNumTxQueues(numCpus))
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertNotEqual(0, idx)
 }
@@ -150,11 +167,11 @@ var _ = Describe("LdpSuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	// https://onsi.github.io/ginkgo/#dynamically-generating-specs
@@ -181,10 +198,10 @@ var _ = Describe("LdpSuiteSolo", Ordered, ContinueOnFailure, Serial, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	// https://onsi.github.io/ginkgo/#dynamically-generating-specs
@@ -195,6 +212,36 @@ var _ = Describe("LdpSuiteSolo", Ordered, ContinueOnFailure, Serial, func() {
 			funcValue := runtime.FuncForPC(pc)
 			testName := filename + "/" + strings.Split(funcValue.Name(), ".")[2]
 			It(testName, Label("SOLO"), func(ctx SpecContext) {
+				s.Log(testName + ": BEGIN")
+				test(&s)
+			}, SpecTimeout(TestTimeout))
+		}
+	}
+})
+
+var _ = Describe("LdpMWSuite", Ordered, ContinueOnFailure, Serial, func() {
+	var s LdpSuite
+	BeforeAll(func() {
+		s.SetupSuite()
+	})
+	BeforeEach(func() {
+		s.SkipIfNotEnoguhCpus = true
+	})
+	AfterAll(func() {
+		s.TeardownSuite()
+	})
+	AfterEach(func() {
+		s.TeardownTest()
+	})
+
+	// https://onsi.github.io/ginkgo/#dynamically-generating-specs
+	for filename, tests := range ldpMWTests {
+		for _, test := range tests {
+			test := test
+			pc := reflect.ValueOf(test).Pointer()
+			funcValue := runtime.FuncForPC(pc)
+			testName := filename + "/" + strings.Split(funcValue.Name(), ".")[2]
+			It(testName, Label("SOLO", "VPP Multi-Worker"), func(ctx SpecContext) {
 				s.Log(testName + ": BEGIN")
 				test(&s)
 			}, SpecTimeout(TestTimeout))

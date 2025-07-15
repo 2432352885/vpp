@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
@@ -25,13 +26,17 @@ type VethsSuite struct {
 		ServerApp *Container
 		ClientApp *Container
 	}
+	Ports struct {
+		Port1 string
+		Port2 string
+	}
 }
 
 func RegisterVethTests(tests ...func(s *VethsSuite)) {
-	vethTests[getTestFilename()] = tests
+	vethTests[GetTestFilename()] = tests
 }
 func RegisterSoloVethTests(tests ...func(s *VethsSuite)) {
-	vethSoloTests[getTestFilename()] = tests
+	vethSoloTests[GetTestFilename()] = tests
 }
 
 func (s *VethsSuite) SetupSuite() {
@@ -45,6 +50,8 @@ func (s *VethsSuite) SetupSuite() {
 	s.Containers.ClientVpp = s.GetContainerByName("client-vpp")
 	s.Containers.ServerApp = s.GetContainerByName("server-app")
 	s.Containers.ClientApp = s.GetContainerByName("client-app")
+	s.Ports.Port1 = s.GeneratePort()
+	s.Ports.Port2 = s.GeneratePort()
 }
 
 func (s *VethsSuite) SetupTest() {
@@ -84,7 +91,7 @@ func (s *VethsSuite) SetupServerVpp() {
 	serverVpp := s.Containers.ServerVpp.VppInstance
 	s.AssertNil(serverVpp.Start())
 
-	idx, err := serverVpp.createAfPacket(s.Interfaces.Server)
+	idx, err := serverVpp.createAfPacket(s.Interfaces.Server, false)
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertNotEqual(0, idx)
 }
@@ -93,7 +100,7 @@ func (s *VethsSuite) setupClientVpp() {
 	clientVpp := s.GetContainerByName("client-vpp").VppInstance
 	s.AssertNil(clientVpp.Start())
 
-	idx, err := clientVpp.createAfPacket(s.Interfaces.Client)
+	idx, err := clientVpp.createAfPacket(s.Interfaces.Client, false)
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertNotEqual(0, idx)
 }
@@ -107,11 +114,11 @@ var _ = Describe("VethsSuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	// https://onsi.github.io/ginkgo/#dynamically-generating-specs
@@ -138,10 +145,10 @@ var _ = Describe("VethsSuiteSolo", Ordered, ContinueOnFailure, Serial, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	// https://onsi.github.io/ginkgo/#dynamically-generating-specs

@@ -26,6 +26,7 @@ alloc
 allocatable
 allocator
 allowlist
+alpn
 Altivec
 amine
 analyse
@@ -284,6 +285,8 @@ dpdk
 dpkg
 dpo
 dport
+dropmon
+DROPMON
 dryrun
 DS
 dsa
@@ -402,6 +405,7 @@ geneve
 Geneve
 gerrit
 Gerrit
+getaffinity
 gethostbyname
 gettingsources
 gettingstarted
@@ -504,6 +508,7 @@ Init
 initiatehost
 inline
 inlines
+insmod
 instantiation
 Instantiation
 Integrations
@@ -690,6 +695,7 @@ mldv
 mmap
 modelled
 modernisation
+modprobe
 modularity
 Monroy
 mortem
@@ -896,6 +902,8 @@ Promisc
 proto
 proxying
 ps
+psample
+PSAMPLE
 pseudocode
 Pseudocode
 psp
@@ -1003,6 +1011,7 @@ scanf
 scapy
 Scapy
 SCHED_RR
+sched
 sclass
 scooby
 screenshot
@@ -1021,6 +1030,8 @@ setjmp
 settingupenvironment
 setUp
 setUpClass
+sflow
+sFlow
 sfr
 sha
 Shamir
@@ -1124,6 +1135,7 @@ Tahr
 tapcli
 tcp
 tcpcontrolbits
+taskset
 te
 teardown
 tearDown
@@ -1236,6 +1248,7 @@ usergroup
 Usergroup
 Usermode
 username
+USERSOCK
 userspace
 Userspace
 usr
@@ -1381,5 +1394,3 @@ zoomout
 zx
 µs
 oflags
-sflow
-sFlow

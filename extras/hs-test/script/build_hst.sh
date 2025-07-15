@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+BUILD_AS=$3
+
 if [ "$(lsb_release -is)" != Ubuntu ]; then
 	echo "Host stack test framework is supported only on Ubuntu"
 	exit 1
@@ -38,16 +40,22 @@ fi
 OS_ARCH="$(uname -m)"
 DOCKER_BUILD_DIR="/scratch/docker-build"
 DOCKER_CACHE_DIR="${DOCKER_BUILD_DIR}/docker_cache"
+DOCKER_LOGIN_SCRIPT="/scratch/nomad/.docker-ro/dlogin.sh"
+REGISTRY_PORT=5001
+if [ -x "$DOCKER_LOGIN_SCRIPT" ] ; then
+  $DOCKER_LOGIN_SCRIPT
+fi
 
-if [ -d "${DOCKER_BUILD_DIR}" ] ; then
-  mkdir -p "${DOCKER_CACHE_DIR}"
-  DOCKER_HST_BUILDER="hst_builder"
-  set -x
-  if ! docker buildx ls --format "{{.Name}}" | grep -q "${DOCKER_HST_BUILDER}"; then
-    docker buildx create --use --driver-opt env.http_proxy="$HTTP_PROXY" --driver-opt env.https_proxy="$HTTP_PROXY" --driver-opt '"env.no_proxy='"$NO_PROXY"'"' --name=${DOCKER_HST_BUILDER} --driver=docker-container --use --bootstrap || true
+# Set up the local registry before creating containers
+echo "=== Setting up local registry ==="
+if [ -x "$(dirname "$0")/../docker/setup-local-registry.sh" ]; then
+  "$(dirname "$0")/../docker/setup-local-registry.sh" "$REGISTRY_PORT"
+else
+  echo "Warning: setup-local-registry.sh not found or not executable"
+  echo "Attempting to create and use local registry at localhost:5000"
+  if ! docker ps | grep -q "local-registry"; then
+    docker run -d --restart=always -p $REGISTRY_PORT:5000 --name local-registry registry:2
   fi
-  set -x
-  DOCKER_CACHE_ARGS="--builder=${DOCKER_HST_BUILDER} --load --cache-to type=local,dest=${DOCKER_CACHE_DIR},mode=max --cache-from type=local,src=${DOCKER_CACHE_DIR}"
 fi
 
 echo "Taking build objects from ${VPP_BUILD_ROOT}"
@@ -65,51 +73,36 @@ rm -rf vpp-data/bin/* || true
 rm -rf vpp-data/lib/* || true
 
 declare -i res=0
-cp ${VPP_BUILD_ROOT}/bin/* ${bin}
+sudo -u $BUILD_AS cp ${VPP_BUILD_ROOT}/bin/* ${bin}
 res+=$?
-cp -r ${VPP_BUILD_ROOT}/lib/"${OS_ARCH}"-linux-gnu/* ${lib}
+sudo -u $BUILD_AS cp -r ${VPP_BUILD_ROOT}/lib/"${OS_ARCH}"-linux-gnu/* ${lib}
 res+=$?
 if [ "$res" -ne 0 ]; then
 	echo "Failed to copy VPP files. Is VPP built? Try running 'make build' in VPP directory."
 	exit 1
 fi
 
-docker_build () {
-    tag=$1
-    dockername=$2
-    set -ex
-    # shellcheck disable=2086
-    docker buildx build ${DOCKER_CACHE_ARGS}  \
-      --build-arg UBUNTU_VERSION              \
-      --build-arg OS_ARCH="$OS_ARCH"          \
-      --build-arg http_proxy="$HTTP_PROXY"    \
-      --build-arg https_proxy="$HTTP_PROXY"   \
-      --build-arg HTTP_PROXY="$HTTP_PROXY"    \
-      --build-arg HTTPS_PROXY="$HTTP_PROXY"   \
-      -t "$tag" -f docker/Dockerfile."$dockername" .
-    set +ex
-}
+# Use the build-images.sh script to build all containers
+echo "=== Building all containers using build-images.sh ==="
+(
+    # Export necessary environment variables for build-images.sh
+    export BASE_TAG="localhost:$REGISTRY_PORT/vpp-test-base:latest"
+    export OS_ARCH
+    export UBUNTU_VERSION
+    export HTTP_PROXY
+    export HTTPS_PROXY
+    export NO_PROXY
+    export DOCKER_CACHE_DIR="${DOCKER_CACHE_DIR}"
+    export DOCKER_HST_BUILDER="${DOCKER_HST_BUILDER}"
 
-docker_build hs-test/vpp vpp
-docker_build hs-test/nginx-ldp nginx
-docker_build hs-test/nginx-server nginx-server
-docker_build hs-test/curl curl
-docker_build hs-test/envoy envoy
-docker_build hs-test/nginx-http3 nginx-http3
-docker_build hs-test/ab ab
-docker_build hs-test/wrk wrk
+    # Run the build script
+    ./script/build-images.sh
+)
 
-# make it multi-user friendly
-if [ -d "${DOCKER_CACHE_DIR}" ] ; then
-  chgrp -R docker "${DOCKER_CACHE_DIR}"
-  chmod -R g+rwx "${DOCKER_CACHE_DIR}"
-fi
-
-# cleanup detached images
-images=$(docker images --filter "dangling=true" -q --no-trunc)
-if [ "$images" != "" ]; then
-		# shellcheck disable=SC2086
-    docker rmi $images
+# Check if the build was successful
+if [ $? -ne 0 ]; then
+    echo "Failed to build Docker images. Check the output above for errors."
+    exit 1
 fi
 
 echo "$current_state_hash" > "$LAST_STATE_FILE"

@@ -51,12 +51,18 @@ typedef struct
 
 #define http_token_lit(s) (s), sizeof (s) - 1
 
+#define foreach_http_method                                                   \
+  _ (GET, "GET")                                                              \
+  _ (POST, "POST")                                                            \
+  _ (PUT, "PUT")                                                              \
+  _ (CONNECT, "CONNECT")                                                      \
+  _ (UNKNOWN, "UNKNOWN") /* for internal use */
+
 typedef enum http_req_method_
 {
-  HTTP_REQ_GET = 0,
-  HTTP_REQ_POST,
-  HTTP_REQ_CONNECT,
-  HTTP_REQ_UNKNOWN, /* for internal use */
+#define _(s, str) HTTP_REQ_##s,
+  foreach_http_method
+#undef _
 } http_req_method_t;
 
 typedef enum http_msg_type_
@@ -335,7 +341,10 @@ typedef enum http_upgrade_proto_
 typedef enum http_msg_data_type_
 {
   HTTP_MSG_DATA_INLINE,
-  HTTP_MSG_DATA_PTR
+  HTTP_MSG_DATA_PTR,
+  HTTP_MSG_DATA_STREAMING,
+  /* The value below is used for boundary checks of http_msg_data_type_t */
+  HTTP_MSG_DATA_N_TYPES,
 } http_msg_data_type_t;
 
 typedef struct http_field_line_
@@ -714,11 +723,16 @@ always_inline void
 http_reset_header_table (http_header_table_t *ht)
 {
   int i;
+  hash_pair_t *p;
   for (i = 0; i < vec_len (ht->concatenated_values); i++)
     vec_free (ht->concatenated_values[i]);
   vec_reset_length (ht->concatenated_values);
   vec_reset_length (ht->values);
   vec_reset_length (ht->buf);
+  hash_foreach_pair (p, ht->value_by_name, ({
+		       void *k = uword_to_pointer (p->key, void *);
+		       clib_mem_free (k);
+		     }));
   hash_free (ht->value_by_name);
 }
 
@@ -742,11 +756,16 @@ always_inline void
 http_free_header_table (http_header_table_t *ht)
 {
   int i;
+  hash_pair_t *p;
   for (i = 0; i < vec_len (ht->concatenated_values); i++)
     vec_free (ht->concatenated_values[i]);
   vec_free (ht->concatenated_values);
   vec_free (ht->values);
   vec_free (ht->buf);
+  hash_foreach_pair (p, ht->value_by_name, ({
+		       void *k = uword_to_pointer (p->key, void *);
+		       clib_mem_free (k);
+		     }));
   hash_free (ht->value_by_name);
 }
 
@@ -888,6 +907,27 @@ http_get_header (http_header_table_t *header_table, const char *name,
     }
 
   return 0;
+}
+
+/**
+ * Print all headers in http header table.
+ *
+ * @note arg0 - http_header_table_t *ht, arg1 - char *line_prefix
+ */
+always_inline u8 *
+format_http_header_table (u8 *s, va_list *va)
+{
+  http_header_table_t *ht = va_arg (*va, http_header_table_t *);
+  char *prefix = va_arg (*va, char *);
+  void *v = (void *) ht->value_by_name;
+  hash_t *h = hash_header (v);
+  hash_pair_t *p;
+
+  hash_foreach_pair (p, v, {
+    s = format (s, "%s%U\n", prefix, h->format_pair, h->format_pair_arg, v, p);
+  });
+
+  return s;
 }
 
 typedef struct

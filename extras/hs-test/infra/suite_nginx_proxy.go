@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
@@ -14,7 +15,6 @@ var nginxProxySoloTests = map[string][]func(s *NginxProxySuite){}
 
 type NginxProxySuite struct {
 	HstSuite
-	proxyPort  uint16
 	maxTimeout int
 	Interfaces struct {
 		Server *NetInterface
@@ -26,13 +26,19 @@ type NginxProxySuite struct {
 		Vpp                  *Container
 		Curl                 *Container
 	}
+	Ports struct {
+		Proxy     uint16
+		Upstream1 string
+		Upstream2 string
+		Upstream3 string
+	}
 }
 
 func RegisterNginxProxyTests(tests ...func(s *NginxProxySuite)) {
-	nginxProxyTests[getTestFilename()] = tests
+	nginxProxyTests[GetTestFilename()] = tests
 }
 func RegisterNginxProxySoloTests(tests ...func(s *NginxProxySuite)) {
-	nginxProxySoloTests[getTestFilename()] = tests
+	nginxProxySoloTests[GetTestFilename()] = tests
 }
 
 func (s *NginxProxySuite) SetupSuite() {
@@ -51,6 +57,10 @@ func (s *NginxProxySuite) SetupSuite() {
 	s.Containers.NginxServerTransient = s.GetTransientContainerByName("nginx-server")
 	s.Containers.Vpp = s.GetContainerByName("vpp")
 	s.Containers.Curl = s.GetContainerByName("curl")
+	s.Ports.Proxy = s.GeneratePortAsInt()
+	s.Ports.Upstream1 = s.GeneratePort()
+	s.Ports.Upstream2 = s.GeneratePort()
+	s.Ports.Upstream3 = s.GeneratePort()
 }
 
 func (s *NginxProxySuite) SetupTest() {
@@ -68,7 +78,6 @@ func (s *NginxProxySuite) SetupTest() {
 
 	// nginx proxy
 	s.AssertNil(s.Containers.NginxProxy.Create())
-	s.proxyPort = 80
 
 	// nginx HTTP server
 	s.AssertNil(s.Containers.NginxServerTransient.Create())
@@ -76,10 +85,16 @@ func (s *NginxProxySuite) SetupTest() {
 		LogPrefix string
 		Address   string
 		Timeout   int
+		Upstream1 string
+		Upstream2 string
+		Upstream3 string
 	}{
 		LogPrefix: s.Containers.NginxServerTransient.Name,
 		Address:   s.Interfaces.Server.Ip4AddressString(),
 		Timeout:   s.maxTimeout,
+		Upstream1: s.Ports.Upstream1,
+		Upstream2: s.Ports.Upstream2,
+		Upstream3: s.Ports.Upstream3,
 	}
 	s.Containers.NginxServerTransient.CreateConfigFromTemplate(
 		"/nginx.conf",
@@ -88,8 +103,8 @@ func (s *NginxProxySuite) SetupTest() {
 	)
 
 	s.AssertNil(vpp.Start())
-	s.AssertNil(vpp.CreateTap(s.Interfaces.Client, 1, 1))
-	s.AssertNil(vpp.CreateTap(s.Interfaces.Server, 1, 2))
+	s.AssertNil(vpp.CreateTap(s.Interfaces.Client, false, 1))
+	s.AssertNil(vpp.CreateTap(s.Interfaces.Server, false, 2))
 
 	if *DryRun {
 		s.LogStartedContainers()
@@ -101,12 +116,12 @@ func (s *NginxProxySuite) SetupTest() {
 	s.AssertNil(s.Containers.NginxServerTransient.Start())
 }
 
-func (s *NginxProxySuite) TearDownTest() {
+func (s *NginxProxySuite) TeardownTest() {
+	defer s.HstSuite.TeardownTest()
 	if CurrentSpecReport().Failed() {
 		s.CollectNginxLogs(s.Containers.NginxProxy)
 		s.CollectNginxLogs(s.Containers.NginxServerTransient)
 	}
-	s.HstSuite.TearDownTest()
 }
 
 func (s *NginxProxySuite) CreateNginxProxyConfig(container *Container, multiThreadWorkers bool) {
@@ -122,12 +137,18 @@ func (s *NginxProxySuite) CreateNginxProxyConfig(container *Container, multiThre
 		Proxy     string
 		Server    string
 		Port      uint16
+		Upstream1 string
+		Upstream2 string
+		Upstream3 string
 	}{
 		Workers:   workers,
 		LogPrefix: container.Name,
 		Proxy:     s.Interfaces.Client.Peer.Ip4AddressString(),
 		Server:    s.Interfaces.Server.Ip4AddressString(),
-		Port:      s.proxyPort,
+		Port:      s.Ports.Proxy,
+		Upstream1: s.Ports.Upstream1,
+		Upstream2: s.Ports.Upstream2,
+		Upstream3: s.Ports.Upstream3,
 	}
 	container.CreateConfigFromTemplate(
 		"/nginx.conf",
@@ -137,7 +158,7 @@ func (s *NginxProxySuite) CreateNginxProxyConfig(container *Container, multiThre
 }
 
 func (s *NginxProxySuite) ProxyPort() uint16 {
-	return s.proxyPort
+	return s.Ports.Proxy
 }
 
 func (s *NginxProxySuite) ProxyAddr() string {
@@ -186,10 +207,10 @@ var _ = Describe("NginxProxySuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range nginxProxyTests {
@@ -215,10 +236,10 @@ var _ = Describe("NginxProxySuiteSolo", Ordered, ContinueOnFailure, Serial, func
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range nginxProxySoloTests {

@@ -136,9 +136,10 @@ typedef struct vls_local_
 {
   int vls_wrk_index;		      /**< vls wrk index, 1 per process */
   volatile int vls_mt_n_threads;      /**< number of threads detected */
+  volatile int vls_mt_needs_locks;    /**< mt single vcl wrk needs locks */
   clib_rwlock_t vls_pool_lock;	      /**< per process/wrk vls pool locks */
   pthread_mutex_t vls_mt_mq_mlock;    /**< vcl mq lock */
-  pthread_mutex_t vls_mt_spool_mlock; /**< vcl select or pool lock */
+  pthread_rwlock_t vls_mt_spool_rwlock; /**< vcl select or pool rwlock */
   volatile u8 select_mp_check;	      /**< flag set if select checks done */
   struct sigaction old_sa;	      /**< old sigaction to restore */
 } vls_process_local_t;
@@ -155,6 +156,37 @@ typedef struct vls_main_
 } vls_main_t;
 
 vls_main_t *vlsm;
+
+static pthread_key_t vls_mt_pthread_stop_key;
+
+#define foreach_mt_lock_type                                                  \
+  _ (LOCK_MQ, "mq")                                                           \
+  _ (RLOCK_SPOOL, "rlock_spool")                                              \
+  _ (WLOCK_SPOOL, "wlock_spool")                                              \
+  _ (RLOCK_POOL, "rlock_pool")                                                \
+  _ (WLOCK_POOL, "wlock_pool")
+
+enum vls_mt_lock_type_bit_
+{
+#define _(sym, str) VLS_MT_BIT_##sym,
+  foreach_mt_lock_type
+#undef _
+};
+
+typedef enum vls_mt_lock_type_
+{
+#define _(sym, str) VLS_MT_##sym = 1 << VLS_MT_BIT_##sym,
+  foreach_mt_lock_type
+#undef _
+} vls_mt_lock_type_t;
+
+typedef struct vls_mt_pthread_local_
+{
+  vls_mt_lock_type_t locks_acq;
+} vls_mt_pthread_local_t;
+
+static __thread vls_mt_pthread_local_t vls_mt_pthread_local;
+#define vlspt (&vls_mt_pthread_local)
 
 typedef enum
 {
@@ -265,29 +297,56 @@ vls_shared_data_pool_runlock (void)
 static inline void
 vls_mt_pool_rlock (void)
 {
-  if (vlsl->vls_mt_n_threads > 1)
-    clib_rwlock_reader_lock (&vlsl->vls_pool_lock);
+  if (vlsl->vls_mt_needs_locks)
+    {
+      clib_rwlock_reader_lock (&vlsl->vls_pool_lock);
+      vlspt->locks_acq |= VLS_MT_RLOCK_POOL;
+    }
 }
 
 static inline void
 vls_mt_pool_runlock (void)
 {
-  if (vlsl->vls_mt_n_threads > 1)
-    clib_rwlock_reader_unlock (&vlsl->vls_pool_lock);
+  if (vlspt->locks_acq & VLS_MT_RLOCK_POOL)
+    {
+      clib_rwlock_reader_unlock (&vlsl->vls_pool_lock);
+      vlspt->locks_acq &= ~VLS_MT_RLOCK_POOL;
+    }
 }
 
 static inline void
 vls_mt_pool_wlock (void)
 {
-  if (vlsl->vls_mt_n_threads > 1)
-    clib_rwlock_writer_lock (&vlsl->vls_pool_lock);
+  if (vlsl->vls_mt_needs_locks)
+    {
+      clib_rwlock_writer_lock (&vlsl->vls_pool_lock);
+      vlspt->locks_acq |= VLS_MT_WLOCK_POOL;
+    }
 }
 
 static inline void
 vls_mt_pool_wunlock (void)
 {
-  if (vlsl->vls_mt_n_threads > 1)
-    clib_rwlock_writer_unlock (&vlsl->vls_pool_lock);
+  if (vlspt->locks_acq & VLS_MT_WLOCK_POOL)
+    {
+      clib_rwlock_writer_unlock (&vlsl->vls_pool_lock);
+      vlspt->locks_acq &= ~VLS_MT_WLOCK_POOL;
+    }
+}
+
+static inline void
+vls_mt_pool_unlock (void)
+{
+  if (vlspt->locks_acq & VLS_MT_RLOCK_POOL)
+    {
+      clib_rwlock_reader_unlock (&vlsl->vls_pool_lock);
+      vlspt->locks_acq &= ~VLS_MT_RLOCK_POOL;
+    }
+  else if (vlspt->locks_acq & VLS_MT_WLOCK_POOL)
+    {
+      clib_rwlock_writer_unlock (&vlsl->vls_pool_lock);
+      vlspt->locks_acq &= ~VLS_MT_WLOCK_POOL;
+    }
 }
 
 typedef enum
@@ -298,16 +357,12 @@ typedef enum
   VLS_MT_OP_XPOLL,
 } vls_mt_ops_t;
 
-typedef enum
-{
-  VLS_MT_LOCK_MQ = 1 << 0,
-  VLS_MT_LOCK_SPOOL = 1 << 1
-} vls_mt_lock_type_t;
-
 static void
 vls_mt_add (void)
 {
+  vlsl->vls_mt_needs_locks = 1;
   vlsl->vls_mt_n_threads += 1;
+  vlspt->locks_acq = 0;
 
   /* If multi-thread workers are supported, for each new thread register a new
    * vcl worker with vpp. Otherwise, all threads use the same vcl worker, so
@@ -323,43 +378,116 @@ vls_mt_add (void)
   /* Only allow new pthread to be cancled in vls_mt_mq_lock */
   if (vlsl->vls_mt_n_threads >= 2)
     pthread_setcancelstate (PTHREAD_CANCEL_DISABLE, NULL);
+
+  if (pthread_setspecific (vls_mt_pthread_stop_key, vcl_worker_get_current ()))
+    VDBG (0, "failed to setup key value");
 }
 
 static inline void
 vls_mt_mq_lock (void)
 {
   pthread_mutex_lock (&vlsl->vls_mt_mq_mlock);
+  vlspt->locks_acq |= VLS_MT_LOCK_MQ;
 }
 
 static inline int
 vls_mt_mq_trylock (void)
 {
-  return pthread_mutex_trylock (&vlsl->vls_mt_mq_mlock);
+  int rv = pthread_mutex_trylock (&vlsl->vls_mt_mq_mlock);
+  vlspt->locks_acq |= rv ? 0 : VLS_MT_LOCK_MQ;
+  return rv;
 }
 
 static inline void
 vls_mt_mq_unlock (void)
 {
   pthread_mutex_unlock (&vlsl->vls_mt_mq_mlock);
+  vlspt->locks_acq &= ~VLS_MT_LOCK_MQ;
 }
 
 static inline void
-vls_mt_spool_lock (void)
+vls_mt_spool_rlock (void)
 {
-  pthread_mutex_lock (&vlsl->vls_mt_spool_mlock);
+  pthread_rwlock_rdlock (&vlsl->vls_mt_spool_rwlock);
+  vlspt->locks_acq |= VLS_MT_RLOCK_SPOOL;
 }
 
 static inline void
-vls_mt_create_unlock (void)
+vls_mt_spool_wlock (void)
 {
-  pthread_mutex_unlock (&vlsl->vls_mt_spool_mlock);
+  pthread_rwlock_wrlock (&vlsl->vls_mt_spool_rwlock);
+  vlspt->locks_acq |= VLS_MT_WLOCK_SPOOL;
+}
+
+static inline void
+vls_mt_spool_runlock (void)
+{
+  pthread_rwlock_unlock (&vlsl->vls_mt_spool_rwlock);
+  vlspt->locks_acq &= ~VLS_MT_RLOCK_SPOOL;
+}
+
+static inline void
+vls_mt_spool_wunlock (void)
+{
+  pthread_rwlock_unlock (&vlsl->vls_mt_spool_rwlock);
+  vlspt->locks_acq &= ~VLS_MT_WLOCK_SPOOL;
+}
+
+static inline void
+vls_mt_spool_unlock (void)
+{
+  if (vlspt->locks_acq & VLS_MT_RLOCK_SPOOL)
+    vls_mt_spool_runlock ();
+  else if (vlspt->locks_acq & VLS_MT_WLOCK_SPOOL)
+    vls_mt_spool_wunlock ();
+}
+
+static void
+vls_mt_rel_locks ()
+{
+  if (vlspt->locks_acq & VLS_MT_LOCK_MQ)
+    vls_mt_mq_unlock ();
+  if (vlspt->locks_acq & (VLS_MT_RLOCK_SPOOL | VLS_MT_WLOCK_SPOOL))
+    vls_mt_spool_unlock ();
 }
 
 static void
 vls_mt_locks_init (void)
 {
   pthread_mutex_init (&vlsl->vls_mt_mq_mlock, NULL);
-  pthread_mutex_init (&vlsl->vls_mt_spool_mlock, NULL);
+  pthread_rwlock_init (&vlsl->vls_mt_spool_rwlock, NULL);
+}
+
+static void
+vls_mt_del (void *arg)
+{
+  vcl_worker_t *wrk = (vcl_worker_t *) arg;
+
+  VDBG (0, "vls worker %u vcl worker %u nthreads %u cleaning up pthread",
+	vlsl->vls_wrk_index, vcl_get_worker_index (), vlsl->vls_mt_n_threads);
+
+  if (wrk != vcl_worker_get_current ())
+    {
+      VDBG (0, "vls_mt_del called with wrong worker %u != %u", wrk->wrk_index,
+	    vcl_get_worker_index ());
+      return;
+    }
+
+  vlsl->vls_mt_n_threads -= 1;
+
+  /* drop locks if any held */
+  vls_mt_rel_locks ();
+  vls_mt_pool_unlock ();
+
+  if (vls_mt_wrk_supported ())
+    {
+      vppcom_worker_unregister ();
+    }
+  else
+    {
+      if (!vlsl->vls_mt_n_threads)
+	vppcom_worker_unregister ();
+    }
 }
 
 u8
@@ -371,14 +499,14 @@ vls_is_shared (vcl_locked_session_t * vls)
 static inline void
 vls_lock (vcl_locked_session_t * vls)
 {
-  if ((vlsl->vls_mt_n_threads > 1) || vls_is_shared (vls))
+  if (vlsl->vls_mt_needs_locks || vls_is_shared (vls))
     clib_spinlock_lock (&vls->lock);
 }
 
 static inline int
 vls_trylock (vcl_locked_session_t *vls)
 {
-  if ((vlsl->vls_mt_n_threads > 1) || vls_is_shared (vls))
+  if (vlsl->vls_mt_needs_locks || vls_is_shared (vls))
     return !clib_spinlock_trylock (&vls->lock);
   return 0;
 }
@@ -386,7 +514,7 @@ vls_trylock (vcl_locked_session_t *vls)
 static inline void
 vls_unlock (vcl_locked_session_t * vls)
 {
-  if ((vlsl->vls_mt_n_threads > 1) || vls_is_shared (vls))
+  if (vlsl->vls_mt_needs_locks || vls_is_shared (vls))
     clib_spinlock_unlock (&vls->lock);
 }
 
@@ -1025,7 +1153,7 @@ vcl_session_is_write_nonblk (vcl_session_t *s)
 }
 
 static void
-vls_mt_acq_locks (vcl_locked_session_t * vls, vls_mt_ops_t op, int *locks_acq)
+vls_mt_acq_locks (vcl_locked_session_t *vls, vls_mt_ops_t op)
 {
   vcl_worker_t *wrk = vcl_worker_get_current ();
   vcl_session_t *s = 0;
@@ -1048,8 +1176,7 @@ vls_mt_acq_locks (vcl_locked_session_t * vls, vls_mt_ops_t op, int *locks_acq)
 	  /* might get data while waiting for lock */
 	  is_nonblk = vcl_session_read_ready (s) != 0;
 	}
-      if (!is_nonblk)
-	*locks_acq |= VLS_MT_LOCK_MQ;
+      vls_mt_spool_rlock ();
       break;
     case VLS_MT_OP_WRITE:
       ASSERT (s);
@@ -1059,29 +1186,18 @@ vls_mt_acq_locks (vcl_locked_session_t * vls, vls_mt_ops_t op, int *locks_acq)
 	  /* might get space while waiting for lock */
 	  is_nonblk = vcl_session_is_write_nonblk (s);
 	}
-      if (!is_nonblk)
-	*locks_acq |= VLS_MT_LOCK_MQ;
+      vls_mt_spool_rlock ();
       break;
     case VLS_MT_OP_XPOLL:
       vls_mt_mq_lock ();
-      *locks_acq |= VLS_MT_LOCK_MQ;
+      vls_mt_spool_rlock ();
       break;
     case VLS_MT_OP_SPOOL:
-      vls_mt_spool_lock ();
-      *locks_acq |= VLS_MT_LOCK_SPOOL;
+      vls_mt_spool_wlock ();
       break;
     default:
       break;
     }
-}
-
-static void
-vls_mt_rel_locks (int locks_acq)
-{
-  if (locks_acq & VLS_MT_LOCK_MQ)
-    vls_mt_mq_unlock ();
-  if (locks_acq & VLS_MT_LOCK_SPOOL)
-    vls_mt_create_unlock ();
 }
 
 static inline u8
@@ -1198,7 +1314,6 @@ vls_mt_detect (void)
 }
 
 #define vls_mt_guard(_vls, _op)                                               \
-  int _locks_acq = 0;                                                         \
   if (vls_mt_wrk_supported ())                                                \
     {                                                                         \
       if (PREDICT_FALSE (_vls &&                                              \
@@ -1212,13 +1327,13 @@ vls_mt_detect (void)
     }                                                                         \
   else                                                                        \
     {                                                                         \
-      if (PREDICT_FALSE (vlsl->vls_mt_n_threads > 1))                         \
-	vls_mt_acq_locks (_vls, _op, &_locks_acq);                            \
+      if (PREDICT_FALSE (vlsl->vls_mt_needs_locks))                           \
+	vls_mt_acq_locks (_vls, _op);                                         \
     }
 
-#define vls_mt_unguard()						\
-  if (PREDICT_FALSE (_locks_acq))					\
-    vls_mt_rel_locks (_locks_acq)
+#define vls_mt_unguard()                                                      \
+  if (PREDICT_FALSE (vlspt->locks_acq))                                       \
+  vls_mt_rel_locks ()
 
 int
 vls_write (vls_handle_t vlsh, void *buf, size_t nbytes)
@@ -2096,7 +2211,7 @@ vls_mt_mq_wait_lock (vcl_session_handle_t vcl_sh)
   uword *vlshp;
 
   /* If mt wrk supported or single threaded just return */
-  if (vls_mt_wrk_supported () || (vlsl->vls_mt_n_threads <= 1))
+  if (vls_mt_wrk_supported () || !vlsl->vls_mt_needs_locks)
     return;
 
   wrk = vls_worker_get_current ();
@@ -2118,25 +2233,39 @@ vls_mt_mq_wait_lock (vcl_session_handle_t vcl_sh)
 	}
     }
 
+  vls_mt_pool_runlock ();
+
   vls_mt_mq_unlock ();
+
+  /* Only lock taken should be spool reader. Needed because VCL is probably
+   * touching a session while waiting for events */
 }
 
 static inline void
 vls_mt_mq_wait_unlock (vcl_session_handle_t vcl_sh)
 {
-  if (vls_mt_wrk_supported () || (vlsl->vls_mt_n_threads <= 1))
+  if (vls_mt_wrk_supported () || !vlsl->vls_mt_needs_locks)
     return;
 
-  vls_mt_mq_lock ();
+  vls_mt_spool_runlock ();
 
-  /* writers can grab lock now */
-  vls_mt_pool_runlock ();
+  /* No locks should be taken by pthread at this point. So writers to spool,
+   * which were blocked until now, should be able to proceed */
+
+  vls_mt_mq_lock ();
+  vls_mt_spool_rlock ();
 }
 
 int
 vls_app_create (char *app_name)
 {
   int rv;
+
+  if (pthread_key_create (&vls_mt_pthread_stop_key, vls_mt_del))
+    {
+      VDBG (0, "failed to add pthread cleanup function");
+      return -1;
+    }
 
   if ((rv = vppcom_app_create (app_name)))
     return rv;
@@ -2153,6 +2282,9 @@ vls_app_create (char *app_name)
   vls_worker_alloc ();
   vlsl->vls_wrk_index = vcl_get_worker_index ();
   vlsl->vls_mt_n_threads = 1;
+  vlspt->locks_acq = 0;
+  if (pthread_setspecific (vls_mt_pthread_stop_key, vcl_worker_get_current ()))
+    VDBG (0, "failed to setup key value");
   clib_rwlock_init (&vlsl->vls_pool_lock);
   vls_mt_locks_init ();
   vcm->wrk_rpc_fn = vls_rpc_handler;
@@ -2173,15 +2305,6 @@ unsigned char
 vls_mt_wrk_supported (void)
 {
   return vcm->cfg.mt_wrk_supported;
-}
-
-int
-vls_use_real_epoll (void)
-{
-  if (vcl_get_worker_index () == ~0)
-    return 0;
-
-  return vcl_worker_get_current ()->vcl_needs_real_epoll;
 }
 
 int
@@ -2228,6 +2351,14 @@ vls_get_libc_epfd (vls_handle_t ep_vlsh)
   vls_mt_pool_runlock ();
 
   return rv;
+}
+
+void
+vls_set_epoll_fns (vls_epoll_fns_t ep_fns)
+{
+  vcm->vcl_epoll_create1 = ep_fns.epoll_create1_fn;
+  vcm->vcl_epoll_ctl = ep_fns.epoll_ctl_fn;
+  vcm->vcl_epoll_wait = ep_fns.epoll_wait_fn;
 }
 
 void

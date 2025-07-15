@@ -522,6 +522,7 @@ list(APPEND VNET_API_FILES bfd/bfd.api)
 
 list(APPEND VNET_SOURCES
   crypto/cli.c
+  crypto/config.c
   crypto/crypto.c
   crypto/format.c
   crypto/main.c
@@ -973,9 +974,11 @@ list(APPEND VNET_SOURCES
   session/application.c
   session/application_worker.c
   session/session_cli.c
+  session/application_eventing.c
   session/application_interface.c
   session/application_local.c
   session/application_namespace.c
+  session/application_crypto.c
   session/segment_manager.c
   session/session_api.c
   session/session_sdl.c
@@ -991,8 +994,10 @@ list(APPEND VNET_HEADERS
   session/transport.h
   session/transport_types.h
   session/application_interface.h
+  session/application_eventing.h
   session/application_local.h
   session/application_namespace.h
+  session/application_crypto.h
   session/session_debug.h
   session/segment_manager.h
   session/mma_template.h
@@ -1017,6 +1022,7 @@ list(APPEND VNET_HEADERS
   tls/tls_inlines.h
   tls/tls_record.h
   tls/tls_test.h
+  tls/tls_types.h
 )
 
 

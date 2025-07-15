@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 
-	. "github.com/onsi/ginkgo/v2"
+	. "fd.io/hs-test/infra/common"
 )
 
 var CgroupPath = "/sys/fs/cgroup/"
@@ -20,10 +19,11 @@ type CpuContext struct {
 }
 
 type CpuAllocatorT struct {
-	cpus              []int
-	runningInCi       bool
-	buildNumber       int
-	maxContainerCount int
+	cpus    []int
+	numa0   []int
+	numa1   []int
+	lastCpu int
+	suite   *HstSuite
 }
 
 func iterateAndAppend(start int, end int, slice []int) []int {
@@ -35,64 +35,48 @@ func iterateAndAppend(start int, end int, slice []int) []int {
 
 var cpuAllocator *CpuAllocatorT = nil
 
-func (c *CpuAllocatorT) Allocate(containerCount int, nCpus int, offset int) (*CpuContext, error) {
+func (c *CpuAllocatorT) Allocate(nCpus int, offset int) (*CpuContext, error) {
 	var cpuCtx CpuContext
 	// indexes, not actual cores
 	var minCpu, maxCpu int
 
-	if c.runningInCi {
-		minCpu = ((c.buildNumber) * c.maxContainerCount * nCpus) + offset
-		maxCpu = ((c.buildNumber + 1) * c.maxContainerCount * nCpus) - 1 + offset
-	} else {
-		minCpu = ((GinkgoParallelProcess() - 1) * c.maxContainerCount * nCpus) + offset
-		maxCpu = (GinkgoParallelProcess() * c.maxContainerCount * nCpus) - 1 + offset
-	}
+	minCpu = offset
+	maxCpu = nCpus - 1 + offset
 
 	if len(c.cpus)-1 < maxCpu {
-		err := fmt.Errorf("could not allocate %d CPUs; available count: %d; attempted to allocate cores with index %d-%d; max index: %d;\n"+
-			"available cores: %v", nCpus*containerCount, len(c.cpus), minCpu, maxCpu, len(c.cpus)-1, c.cpus)
+		msg := fmt.Sprintf("could not allocate %d CPUs; available count: %d; attempted to allocate cores with index %d-%d; max index: %d;\n"+
+			"available cores: %v", nCpus, len(c.cpus), minCpu, maxCpu, len(c.cpus)-1, c.cpus)
+		if c.suite.SkipIfNotEnoguhCpus {
+			c.suite.Skip("skipping: " + msg)
+		}
+		err := fmt.Errorf(msg)
 		return nil, err
 	}
 
-	if containerCount == 1 {
-		cpuCtx.cpus = c.cpus[minCpu : minCpu+nCpus]
-	} else if containerCount > 1 && containerCount <= c.maxContainerCount {
-		cpuCtx.cpus = c.cpus[minCpu+(nCpus*(containerCount-1)) : minCpu+(nCpus*containerCount)]
+	if NumaAwareCpuAlloc {
+		if len(c.numa0) > maxCpu {
+			c.suite.Log("Allocating CPUs from numa #0")
+			cpuCtx.cpus = c.numa0[minCpu : minCpu+nCpus]
+		} else if len(c.numa1) > maxCpu {
+			c.suite.Log("Allocating CPUs from numa #1")
+			cpuCtx.cpus = c.numa1[minCpu : minCpu+nCpus]
+		} else {
+			err := fmt.Errorf("could not allocate %d CPUs; not enough CPUs in either numa node", nCpus)
+			return nil, err
+		}
 	} else {
-		return nil, fmt.Errorf("too many containers; CPU allocation for >%d containers is not implemented", c.maxContainerCount)
+		cpuCtx.cpus = c.cpus[minCpu : minCpu+nCpus]
 	}
+
+	c.lastCpu = minCpu + nCpus
 	cpuCtx.cpuAllocator = c
 	return &cpuCtx, nil
 }
 
 func (c *CpuAllocatorT) readCpus() error {
-	var first, second, third, fourth int
-	var file *os.File
-	var err error
+	var first, second int
 
-	if c.runningInCi {
-		// non-debug build runs on node0, debug on node1
-		if *IsDebugBuild {
-			file, err = os.Open("/sys/devices/system/node/node1/cpulist")
-		} else {
-			file, err = os.Open("/sys/devices/system/node/node0/cpulist")
-		}
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		sc := bufio.NewScanner(file)
-		sc.Scan()
-		line := sc.Text()
-		_, err = fmt.Sscanf(line, "%d-%d,%d-%d", &first, &second, &third, &fourth)
-		if err != nil {
-			return err
-		}
-
-		c.cpus = iterateAndAppend(first, second, c.cpus)
-		c.cpus = iterateAndAppend(third, fourth, c.cpus)
-	} else if NumaAwareCpuAlloc {
+	if NumaAwareCpuAlloc {
 		var range1, range2 int
 		var tmpCpus []int
 
@@ -124,7 +108,7 @@ func (c *CpuAllocatorT) readCpus() error {
 			line := sc.Text()
 
 			for _, coreRange := range strings.Split(line, ",") {
-				if strings.IndexRune(coreRange, '-') != -1 {
+				if strings.ContainsRune(coreRange, '-') {
 					_, err = fmt.Sscanf(coreRange, "%d-%d", &range1, &range2)
 					if err != nil {
 						return err
@@ -144,13 +128,12 @@ func (c *CpuAllocatorT) readCpus() error {
 				tmpCpus = tmpCpus[1:]
 			}
 
-			// make c.cpus divisible by maxContainerCount * nCpus, so we don't have to check which numa will be used
-			// and we can use offsets
-			countToRemove := len(tmpCpus) % (c.maxContainerCount * *NConfiguredCpus)
-			if countToRemove >= len(tmpCpus) {
-				return fmt.Errorf("requested too much CPUs per container (%d) should be no more than %d", *NConfiguredCpus, len(tmpCpus)/c.maxContainerCount)
+			c.cpus = append(c.cpus, tmpCpus...)
+			if i == 0 {
+				c.numa0 = append(c.numa0, tmpCpus...)
+			} else {
+				c.numa1 = append(c.numa1, tmpCpus...)
 			}
-			c.cpus = append(c.cpus, tmpCpus[:len(tmpCpus)-countToRemove]...)
 			tmpCpus = tmpCpus[:0]
 		}
 	} else {
@@ -199,17 +182,6 @@ func CpuAllocator() (*CpuAllocatorT, error) {
 	if cpuAllocator == nil {
 		var err error
 		cpuAllocator = new(CpuAllocatorT)
-		cpuAllocator.maxContainerCount = 4
-		buildNumberStr := os.Getenv("BUILD_NUMBER")
-
-		if buildNumberStr != "" {
-			cpuAllocator.runningInCi = true
-			// get last digit of build number
-			cpuAllocator.buildNumber, err = strconv.Atoi(buildNumberStr[len(buildNumberStr)-1:])
-			if err != nil {
-				return nil, err
-			}
-		}
 		err = cpuAllocator.readCpus()
 		if err != nil {
 			return nil, err

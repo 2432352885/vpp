@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	. "fd.io/hs-test/infra"
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -26,12 +26,16 @@ var _ = ReportAfterSuite("VPP version under test", func(report Report) {
 })
 
 func TestHst(t *testing.T) {
-	if *IsVppDebug {
-		// 30 minute timeout so that the framework won't timeout while debugging
+	// if we're debugging/running a coverage build and timeout isn't overridden,
+	// set test timeout to 30 minutes. Also impacts AssertChannelClosed()
+	if (*IsVppDebug || *IsCoverage || *PerfTesting) && *Timeout == 5 {
 		TestTimeout = time.Minute * 30
+		fmt.Printf("[Debugging or coverage build, TestTimeout is set to %s]\n", TestTimeout.String())
 	} else {
-		TestTimeout = time.Minute * 5
+		TestTimeout = time.Minute * time.Duration(*Timeout)
 	}
+
+	RunningInCi = os.Getenv("BUILD_NUMBER") != ""
 
 	output, err := os.ReadFile("/sys/devices/system/node/online")
 	if err == nil && strings.Contains(string(output), "-") {

@@ -31,7 +31,7 @@ typedef struct
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   u32 session_index;
-  u32 thread_index;
+  clib_thread_index_t thread_index;
   u32 rx_offset;
   u32 vpp_session_index;
   u64 to_recv;
@@ -41,7 +41,7 @@ typedef struct
 typedef struct
 {
   hcc_session_t *sessions;
-  u32 thread_index;
+  clib_thread_index_t thread_index;
 } hcc_worker_t;
 
 typedef struct
@@ -76,7 +76,7 @@ typedef enum
 static hcc_main_t hcc_main;
 
 static hcc_worker_t *
-hcc_worker_get (u32 thread_index)
+hcc_worker_get (clib_thread_index_t thread_index)
 {
   return vec_elt_at_index (hcc_main.wrk, thread_index);
 }
@@ -92,7 +92,7 @@ hcc_session_alloc (hcc_worker_t *wrk)
 }
 
 static hcc_session_t *
-hcc_session_get (u32 hs_index, u32 thread_index)
+hcc_session_get (u32 hs_index, clib_thread_index_t thread_index)
 {
   hcc_worker_t *wrk = hcc_worker_get (thread_index);
   return pool_elt_at_index (wrk->sessions, hs_index);
@@ -167,7 +167,8 @@ hcc_ts_connected_callback (u32 app_index, u32 hc_index, session_t *as,
   msg.method_type = HTTP_REQ_GET;
   /* request target */
   msg.data.target_path_offset = 0;
-  msg.data.target_path_len = vec_len (hcm->http_query);
+  /* request target len must be without null termination */
+  msg.data.target_path_len = strlen ((char *) hcm->http_query);
   /* custom headers */
   msg.data.headers_offset = msg.data.target_path_len;
   msg.data.headers_len = headers.tail_offset;
@@ -179,7 +180,7 @@ hcc_ts_connected_callback (u32 app_index, u32 hc_index, session_t *as,
     msg.data.target_path_len + msg.data.headers_len + msg.data.body_len;
 
   svm_fifo_seg_t segs[3] = { { (u8 *) &msg, sizeof (msg) },
-			     { hcm->http_query, vec_len (hcm->http_query) },
+			     { hcm->http_query, msg.data.target_path_len },
 			     { headers_buf, msg.data.headers_len } };
 
   rv = svm_fifo_enqueue_segments (as->tx_fifo, segs, 3, 0 /* allow partial */);

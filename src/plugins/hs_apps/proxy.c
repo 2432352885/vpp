@@ -20,6 +20,7 @@
 #include <hs_apps/proxy.h>
 #include <vnet/tcp/tcp.h>
 #include <http/http_header_names.h>
+#include <vnet/tls/tls_types.h>
 
 proxy_main_t proxy_main;
 
@@ -112,7 +113,8 @@ proxy_do_connect (vnet_connect_args_t *a)
 static void
 proxy_handle_connects_rpc (void *args)
 {
-  u32 thread_index = pointer_to_uword (args), n_connects = 0, n_pending;
+  clib_thread_index_t thread_index = pointer_to_uword (args), n_connects = 0,
+		      n_pending;
   proxy_worker_t *wrk;
   u32 max_connects;
 
@@ -913,7 +915,7 @@ active_open_connected_callback (u32 app_index, u32 opaque,
       ps->ao_disconnected = 1;
       if (ps->po.is_http)
 	{
-	  session_send_rpc_evt_to_thread (
+	  session_send_rpc_evt_to_thread_force (
 	    session_thread_from_handle (ps->po.session_handle),
 	    active_open_send_http_resp_rpc,
 	    uword_to_pointer (ps->ps_index, void *));
@@ -1265,22 +1267,33 @@ proxy_server_listen ()
   clib_memcpy (&a->sep_ext, &pm->server_sep, sizeof (pm->server_sep));
   /* Make sure listener is marked connected for transports like udp */
   a->sep_ext.transport_flags = TRANSPORT_CFG_F_CONNECTED;
-  need_crypto = proxy_transport_needs_crypto (a->sep.transport_proto);
-  if (need_crypto)
-    {
-      transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
-	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
-	sizeof (transport_endpt_crypto_cfg_t));
-      ext_cfg->crypto.ckpair_index = pm->ckpair_index;
-    }
-  /* set http timeout for connect-proxy */
+
   if (pm->server_sep.transport_proto == TRANSPORT_PROTO_HTTP)
     {
+      /* set http timeout for connect-proxy */
       transport_endpt_cfg_http_t http_cfg = { pm->idle_timeout,
 					      HTTP_UDP_TUNNEL_DGRAM };
       transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
 	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
       clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
+      if (pm->server_sep.flags & SESSION_ENDPT_CFG_F_SECURE)
+	{
+	  transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
+	    &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	    sizeof (transport_endpt_crypto_cfg_t));
+	  ext_cfg->crypto.ckpair_index = pm->ckpair_index;
+	}
+    }
+  else
+    {
+      need_crypto = proxy_transport_needs_crypto (a->sep.transport_proto);
+      if (need_crypto)
+	{
+	  transport_endpt_ext_cfg_t *ext_cfg = session_endpoint_add_ext_cfg (
+	    &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	    sizeof (transport_endpt_crypto_cfg_t));
+	  ext_cfg->crypto.ckpair_index = pm->ckpair_index;
+	}
     }
 
   rv = vnet_listen (a);

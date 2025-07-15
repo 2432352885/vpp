@@ -135,10 +135,10 @@ tso_segment_vxlan_tunnel_headers_fixup (vlib_main_t *vm, vlib_buffer_t *b)
       ip4->length = clib_host_to_net_u16 (
 	b->current_length - (outer_l3_hdr_offset - b->current_data));
       ip4->checksum = ip4_header_checksum (ip4);
+      udp->length = clib_host_to_net_u16 (
+	b->current_length - (outer_l4_hdr_offset - b->current_data));
       if (vnet_buffer (b)->oflags & VNET_BUFFER_OFFLOAD_F_OUTER_UDP_CKSUM)
 	{
-	  udp->length = clib_host_to_net_u16 (
-	    b->current_length - (outer_l4_hdr_offset - b->current_data));
 	  // udp checksum is 0, in udp tunnel
 	  udp->checksum = 0;
 	}
@@ -151,11 +151,11 @@ tso_segment_vxlan_tunnel_headers_fixup (vlib_main_t *vm, vlib_buffer_t *b)
     {
       ip6->payload_length = clib_host_to_net_u16 (
 	b->current_length - (outer_l4_hdr_offset - b->current_data));
+      udp->length = ip6->payload_length;
 
       if (vnet_buffer (b)->oflags & VNET_BUFFER_OFFLOAD_F_OUTER_UDP_CKSUM)
 	{
 	  int bogus;
-	  udp->length = ip6->payload_length;
 	  // udp checksum is 0, in udp tunnel
 	  udp->checksum = 0;
 	  udp->checksum =
@@ -471,7 +471,7 @@ drop_one_buffer_and_count (vlib_main_t * vm, vnet_main_t * vnm,
 			   vlib_node_runtime_t * node, u32 * pbi0,
 			   u32 sw_if_index, u32 drop_error_code)
 {
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
 
   vlib_simple_counter_main_t *cm;
   cm =
@@ -498,7 +498,7 @@ vnet_gso_node_inline (vlib_main_t * vm,
   u32 *from = vlib_frame_vector_args (frame);
   u32 n_left_from = frame->n_vectors;
   u32 *from_end = from + n_left_from;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
   vnet_interface_main_t *im = &vnm->interface_main;
   vnet_interface_per_thread_data_t *ptd =
     vec_elt_at_index (im->per_thread_data, thread_index);

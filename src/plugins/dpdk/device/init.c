@@ -18,7 +18,7 @@
 #include <vppinfra/format.h>
 #include <vppinfra/bitmap.h>
 #include <vppinfra/linux/sysfs.h>
-#include <vlib/unix/unix.h>
+#include <vlib/file.h>
 #include <vlib/log.h>
 
 #include <vnet/vnet.h>
@@ -1384,6 +1384,15 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
       tmp = format (0, "--file-prefix%c", 0);
       vec_add1 (conf->eal_init_args, tmp);
       tmp = format (0, "vpp%c", 0);
+      vec_add1 (conf->eal_init_args, tmp);
+    }
+
+  /* Remap main lcore onto DPDK lcore 0 if it exceeds the max lcore index */
+  if (tm->main_lcore >= RTE_MAX_LCORE)
+    {
+      tmp = format (0, "--lcores%c", 0);
+      vec_add1 (conf->eal_init_args, tmp);
+      tmp = format (0, "0@%u%c", tm->main_lcore, 0);
       vec_add1 (conf->eal_init_args, tmp);
     }
 #endif

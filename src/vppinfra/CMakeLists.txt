@@ -128,6 +128,7 @@ set(VPPINFRA_HEADERS
   bihash_32_8.h
   bihash_40_8.h
   bihash_48_8.h
+  bihash_56_8.h
   bihash_8_8.h
   bihash_8_16.h
   bihash_24_16.h
@@ -193,8 +194,8 @@ set(VPPINFRA_HEADERS
   random.h
   random_isaac.h
   rbtree.h
+  ring.h
   serialize.h
-  smp.h
   socket.h
   sparse_vec.h
   stack.h

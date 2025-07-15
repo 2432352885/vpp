@@ -39,6 +39,7 @@
 
 #include <vlib/vlib.h>
 #include <vlib/stats/stats.h>
+#include <vlib/file.h>
 #include <vlib/unix/unix.h>
 #include <vppinfra/callback.h>
 #include <vppinfra/cpu.h>
@@ -979,8 +980,8 @@ show_cpu (vlib_main_t * vm, unformat_input_t * input,
   _("Model name", "%U", format_cpu_model_name);
   _("Microarch model (family)", "%U", format_cpu_uarch);
   _("Flags", "%U", format_cpu_flags);
-  _("Base frequency", "%.2f GHz",
-    ((f64) vm->clib_time.clocks_per_second) * 1e-9);
+  _ ("Base frequency", "%.4f GHz",
+     ((f64) vm->clib_time.clocks_per_second) * 1e-9);
 #undef _
   return 0;
 }
@@ -1226,20 +1227,20 @@ restart_cmd_fn (vlib_main_t * vm, unformat_input_t * input,
 {
   vlib_global_main_t *vgm = vlib_get_global_main ();
   clib_file_main_t *fm = &file_main;
-  clib_file_t *f;
 
   /* environ(7) does not indicate a header for this */
   extern char **environ;
 
   /* Close all known open files */
-  pool_foreach (f, fm->file_pool)
-     {
+  pool_foreach_pointer (f, fm->file_pool)
+    {
       if (f->file_descriptor > 2)
         close(f->file_descriptor);
     }
 
   /* Exec ourself */
-  execve (vgm->name, (char **) vgm->argv, environ);
+  if (execve ((void *) vgm->argv[0], (char **) vgm->argv, environ))
+    return clib_error_return_unix (0, "execve failed");
 
   return 0;
 }

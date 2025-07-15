@@ -37,6 +37,7 @@ extern http_tw_ctx_t http_tw_ctx;
 
 void http_timers_init (vlib_main_t *vm, http_conn_timeout_fn *rpc_cb,
 		       http_conn_invalidate_timer_fn *invalidate_cb);
+void http_timers_set_state (vlib_main_t *vm, bool enabled);
 
 static inline void
 http_conn_timer_start (http_conn_t *hc)
@@ -45,8 +46,8 @@ http_conn_timer_start (http_conn_t *hc)
   u32 hs_handle;
 
   ASSERT (hc->timer_handle == HTTP_TIMER_HANDLE_INVALID);
-  ASSERT (hc->h_hc_index <= 0x00FFFFFF);
-  hs_handle = hc->c_thread_index << 24 | hc->h_hc_index;
+  ASSERT (hc->hc_hc_index <= 0x00FFFFFF);
+  hs_handle = hc->c_thread_index << 24 | hc->hc_hc_index;
 
   clib_spinlock_lock (&twc->tw_lock);
   hc->timer_handle =
@@ -80,8 +81,8 @@ http_conn_timer_update (http_conn_t *hc)
     tw_timer_update_2t_1w_2048sl (&twc->tw, hc->timer_handle, hc->timeout);
   else
     {
-      ASSERT (hc->h_hc_index <= 0x00FFFFFF);
-      hs_handle = hc->c_thread_index << 24 | hc->h_hc_index;
+      ASSERT (hc->hc_hc_index <= 0x00FFFFFF);
+      hs_handle = hc->c_thread_index << 24 | hc->hc_hc_index;
       hc->timer_handle =
 	tw_timer_start_2t_1w_2048sl (&twc->tw, hs_handle, 0, hc->timeout);
     }

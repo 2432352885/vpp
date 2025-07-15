@@ -22,7 +22,7 @@
 #include <dpdk/device/dpdk.h>
 #include <dpdk/device/dpdk_priv.h>
 #include <vppinfra/error.h>
-#include <vlib/unix/unix.h>
+#include <vlib/file.h>
 
 #define foreach_dpdk_tx_func_error			\
   _(PKT_DROP, "Tx packet drops (dpdk tx failure)")
@@ -280,7 +280,7 @@ VNET_DEVICE_CLASS_TX_FN (dpdk_device_class) (vlib_main_t * vm,
   u32 n_packets = f->n_vectors;
   u32 n_left;
   u32 n_prep;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
   int queue_id = tf->queue_id;
   u8 is_shared = tf->shared_queue;
   u8 offload_enabled = 0;
@@ -729,7 +729,7 @@ dpdk_interface_rx_mode_change (vnet_main_t *vnm, u32 hw_if_index, u32 qid,
   else if (mode == VNET_HW_IF_RX_MODE_POLLING)
     {
       rxq = vec_elt_at_index (xd->rx_queues, qid);
-      f = pool_elt_at_index (fm->file_pool, rxq->clib_file_index);
+      f = clib_file_get (fm, rxq->clib_file_index);
       fm->file_update (f, UNIX_FILE_UPDATE_DELETE);
     }
   else if (!(xd->flags & DPDK_DEVICE_FLAG_INT_UNMASKABLE))
@@ -737,7 +737,7 @@ dpdk_interface_rx_mode_change (vnet_main_t *vnm, u32 hw_if_index, u32 qid,
   else
     {
       rxq = vec_elt_at_index (xd->rx_queues, qid);
-      f = pool_elt_at_index (fm->file_pool, rxq->clib_file_index);
+      f = clib_file_get (fm, rxq->clib_file_index);
       fm->file_update (f, UNIX_FILE_UPDATE_ADD);
     }
   if (rv)

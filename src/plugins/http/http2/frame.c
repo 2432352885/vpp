@@ -142,7 +142,7 @@ http2_frame_read_window_update (u32 *increment, u8 *payload, u32 payload_len)
 
   value = (u32 *) payload;
 
-  if (value == 0)
+  if (*value == 0)
     return HTTP2_ERROR_PROTOCOL_ERROR;
 
   *increment = clib_net_to_host_u32 (*value) & 0x7FFFFFFF;
@@ -204,15 +204,13 @@ http2_frame_write_rst_stream (http2_error_t error_code, u32 stream_id,
   clib_memcpy_fast (p, &value, RST_STREAM_LENGTH);
 }
 
-#define GOAWAY_MIN_SIZE 8
-
 __clib_export http2_error_t
 http2_frame_read_goaway (u32 *error_code, u32 *last_stream_id, u8 *payload,
 			 u32 payload_len)
 {
   u32 *value;
 
-  if (payload_len < GOAWAY_MIN_SIZE)
+  if (payload_len < HTTP2_GOAWAY_MIN_SIZE)
     return HTTP2_ERROR_FRAME_SIZE_ERROR;
 
   value = (u32 *) payload;
@@ -222,7 +220,6 @@ http2_frame_read_goaway (u32 *error_code, u32 *last_stream_id, u8 *payload,
   value = (u32 *) payload;
   *error_code = clib_net_to_host_u32 (*value);
 
-  /* TODO: Additional Debug Data */
   return HTTP2_ERROR_NO_ERROR;
 }
 
@@ -233,20 +230,36 @@ http2_frame_write_goaway (http2_error_t error_code, u32 last_stream_id,
   u8 *p;
   u32 value;
 
-  ASSERT (last_stream_id > 0 && last_stream_id <= 0x7FFFFFFF);
+  ASSERT (last_stream_id <= 0x7FFFFFFF);
 
   http2_frame_header_t fh = { .type = HTTP2_FRAME_TYPE_GOAWAY,
-			      .length = GOAWAY_MIN_SIZE };
+			      .length = HTTP2_GOAWAY_MIN_SIZE };
   p = http2_frame_header_alloc (dst);
   http2_frame_header_write (&fh, p);
 
-  vec_add2 (*dst, p, GOAWAY_MIN_SIZE);
+  vec_add2 (*dst, p, HTTP2_GOAWAY_MIN_SIZE);
   value = clib_host_to_net_u32 (last_stream_id);
   clib_memcpy_fast (p, &value, 4);
   p += 4;
   value = clib_host_to_net_u32 ((u32) error_code);
   clib_memcpy_fast (p, &value, 4);
   /* TODO: Additional Debug Data */
+}
+
+void
+http2_frame_write_ping (u8 is_resp, u8 *payload, u8 **dst)
+{
+  u8 *p;
+  http2_frame_header_t fh = {
+    .type = HTTP2_FRAME_TYPE_PING,
+    .length = HTTP2_PING_PAYLOAD_LEN,
+    .flags = is_resp ? HTTP2_FRAME_FLAG_ACK : 0,
+  };
+
+  p = http2_frame_header_alloc (dst);
+  http2_frame_header_write (&fh, p);
+  vec_add2 (*dst, p, HTTP2_PING_PAYLOAD_LEN);
+  clib_memcpy_fast (p, payload, HTTP2_PING_PAYLOAD_LEN);
 }
 
 #define PRIORITY_DATA_LEN 5
@@ -262,7 +275,7 @@ http2_frame_read_headers (u8 **headers, u32 *headers_len, u8 *payload,
       u8 pad_len = *payload++;
       if ((u32) pad_len >= payload_len)
 	return HTTP2_ERROR_PROTOCOL_ERROR;
-      *headers_len -= pad_len;
+      *headers_len -= (pad_len + 1);
     }
 
   if (flags & HTTP2_FRAME_FLAG_PRIORITY)
@@ -292,6 +305,19 @@ http2_frame_write_headers_header (u32 headers_len, u32 stream_id, u8 flags,
   http2_frame_header_write (&fh, dst);
 }
 
+void
+http2_frame_write_continuation_header (u32 headers_len, u32 stream_id,
+				       u8 flags, u8 *dst)
+{
+  ASSERT (stream_id > 0 && stream_id <= 0x7FFFFFFF);
+
+  http2_frame_header_t fh = { .type = HTTP2_FRAME_TYPE_CONTINUATION,
+			      .length = headers_len,
+			      .flags = flags,
+			      .stream_id = stream_id };
+  http2_frame_header_write (&fh, dst);
+}
+
 __clib_export http2_error_t
 http2_frame_read_data (u8 **data, u32 *data_len, u8 *payload, u32 payload_len,
 		       u8 flags)
@@ -303,7 +329,7 @@ http2_frame_read_data (u8 **data, u32 *data_len, u8 *payload, u32 payload_len,
       u8 pad_len = *payload++;
       if ((u32) pad_len >= payload_len)
 	return HTTP2_ERROR_PROTOCOL_ERROR;
-      *data_len -= pad_len;
+      *data_len -= (pad_len + 1);
     }
 
   *data = payload;

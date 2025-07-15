@@ -30,7 +30,7 @@
 #include <limits.h>
 
 #include <vlib/vlib.h>
-#include <vlib/unix/unix.h>
+#include <vlib/file.h>
 #include <vnet/plugin/plugin.h>
 #include <vnet/ethernet/ethernet.h>
 #include <vpp/app/version.h>
@@ -629,6 +629,7 @@ memif_master_conn_fd_error (clib_file_t * uf)
       err = clib_error_return (0, "connection fd error");
       memif_disconnect (mif, err);
       clib_error_free (err);
+      return 0;
     }
   else
     {

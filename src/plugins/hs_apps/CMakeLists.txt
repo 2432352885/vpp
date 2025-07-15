@@ -11,11 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if(NOT VPP_BUILD_VCL)
+  return()
+endif()
+
 ##############################################################################
 # vpp builtin hs apps
 ##############################################################################
 add_vpp_plugin(hs_apps
   SOURCES
+  alpn_client.c
+  alpn_server.c
   echo_client.c
   echo_server.c
   hs_apps.c
@@ -71,7 +77,6 @@ if(VPP_BUILD_VCL_TESTS)
       "vcl/${test}.c"
       vcl/vcl_test_protos.c
       LINK_LIBRARIES vppcom pthread ${EPOLL_LIB}
-      NO_INSTALL
     )
   endforeach()
 

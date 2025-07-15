@@ -32,6 +32,8 @@
 #endif
 
 #define VPPCOM_DEBUG vcm->debug
+#define VCL_EP_SAPIFD_EVT ((u32) ~0)
+#define VCL_EP_PIPEFD_EVT ((u32) (~0 - 1))
 
 extern __thread uword __vcl_worker_index;
 
@@ -184,7 +186,7 @@ typedef struct vcl_session_
 
   i32 vpp_error;
 
-#if VCL_ELOG
+#if (VCL_ELOG > 0)
   elog_track_t elog_track;
 #endif
 
@@ -318,13 +320,14 @@ typedef struct vcl_worker_
   int session_attr_op_rv;
   transport_endpt_attr_t session_attr_rv;
 
-  /** vcl needs next epoll_create to go to libc_epoll */
-  u8 vcl_needs_real_epoll;
   volatile int rpc_done;
 
   /* functions to be called pre/post wait if vcl managed by vls */
   vcl_worker_wait_mq_fn pre_wait_fn;
   vcl_worker_wait_mq_fn post_wait_fn;
+
+  /* mq_epfd signal pipes when wrk detached from vpp */
+  int detached_pipefds[2];
 } vcl_worker_t;
 
 STATIC_ASSERT (sizeof (session_disconnected_msg_t) <= 16,
@@ -359,10 +362,6 @@ typedef struct vppcom_main_t_
   /** Lock to protect worker registrations */
   clib_spinlock_t workers_lock;
 
-  /** Counter to determine order of execution of `vcl_api_retry_attach`
-   * function by multiple workers */
-  int reattach_count;
-
   /** Lock to protect segment hash table */
   clib_rwlock_t segment_table_lock;
 
@@ -377,13 +376,26 @@ typedef struct vppcom_main_t_
   vcl_rpc_fn_t *wrk_rpc_fn;
 
   /*
+   * Pointers to libc epoll fns to avoid loops when ldp is on
+   */
+  int (*vcl_epoll_create1) (int flags);
+  int (*vcl_epoll_ctl) (int epfd, int op, int fd, struct epoll_event *event);
+  int (*vcl_epoll_wait) (int epfd, struct epoll_event *events, int maxevents,
+			 int timeout);
+
+  clib_spinlock_t reattach_lock;
+  /** Counter to determine order of execution of `vcl_api_retry_attach`
+   * function by multiple workers */
+  int reattach_count;
+
+  /*
    * Binary api context
    */
 
   /* VNET_API_ERROR_FOO -> "Foo" hash table */
   uword *error_string_by_error_number;
 
-#ifdef VCL_ELOG
+#if (VCL_ELOG > 0)
   /* VPP Event-logger */
   elog_main_t elog_main;
   elog_track_t elog_track;
@@ -798,6 +810,12 @@ int vcl_session_share_fifos (vcl_session_t *s, svm_fifo_t *rxf,
 void vcl_worker_detach_sessions (vcl_worker_t *wrk);
 void vcl_worker_set_wait_mq_fns (vcl_worker_wait_mq_fn pre_wait,
 				 vcl_worker_wait_mq_fn post_wait);
+
+void vcl_worker_detached_start_signal_mq (vcl_worker_t *wrk);
+void vcl_worker_detached_signal_mq (vcl_worker_t *wrk);
+void vcl_worker_detached_stop_signal_mq (vcl_worker_t *wrk);
+
+void vcl_init_epoll_fns (void);
 
 /*
  * VCL Binary API

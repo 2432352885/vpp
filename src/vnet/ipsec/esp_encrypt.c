@@ -592,9 +592,9 @@ set_ip6_udp_cksum_offload (vlib_buffer_t *b, i16 l3_hdr_offset,
 {
   vnet_buffer (b)->l3_hdr_offset = l3_hdr_offset;
   vnet_buffer (b)->l4_hdr_offset = l4_hdr_offset;
-  vnet_buffer_offload_flags_set (b, VNET_BUFFER_OFFLOAD_F_UDP_CKSUM);
   b->flags |= (VNET_BUFFER_F_IS_IP6 | VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
 	       VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
+  vnet_buffer_offload_flags_set (b, VNET_BUFFER_OFFLOAD_F_UDP_CKSUM);
 }
 
 always_inline uword
@@ -607,7 +607,7 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 *from = vlib_frame_vector_args (frame);
   u32 n_left = frame->n_vectors;
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
-  u32 thread_index = vm->thread_index;
+  clib_thread_index_t thread_index = vm->thread_index;
   u16 buffer_data_size = vlib_buffer_get_default_data_size (vm);
   u32 current_sa_index = ~0, current_sa_packets = 0;
   u32 current_sa_bytes = 0, spi = 0;

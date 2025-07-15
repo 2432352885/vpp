@@ -565,6 +565,7 @@ typedef enum vnet_hw_interface_flags_t_
   _ (16, UDP_TNL_GSO, "udp-tnl-gso")                                          \
   _ (17, IP_TNL_GSO, "ip-tnl-gso")                                            \
   _ (18, TCP_LRO, "tcp-lro")                                                  \
+  _ (19, TX_FIXED_OFFSET, "fixed-offset") /* virtual interfaces */            \
   _ (30, INT_MODE, "int-mode")                                                \
   _ (31, MAC_FILTER, "mac-filter")
 
@@ -615,7 +616,7 @@ typedef struct
   u32 dev_instance;
 
   /* index of thread pollling this queue */
-  u32 thread_index;
+  clib_thread_index_t thread_index;
 
   /* file index of queue interrupt line */
   u32 file_index;
@@ -1069,6 +1070,7 @@ typedef struct
 
   /* feature_arc_index */
   u8 output_feature_arc_index;
+  u8 drop_feature_arc_index;
 
   /* fast lookup tables */
   u32 *hw_if_index_by_sw_if_index;

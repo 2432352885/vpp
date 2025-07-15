@@ -30,7 +30,7 @@
 
 #include <vppinfra/linux/sysfs.h>
 #include <vlib/vlib.h>
-#include <vlib/unix/unix.h>
+#include <vlib/file.h>
 #include <vnet/ip/ip.h>
 #include <vnet/devices/netlink.h>
 #include <vnet/ethernet/ethernet.h>
@@ -61,20 +61,6 @@ VNET_HW_INTERFACE_CLASS (af_packet_ip_device_hw_interface_class, static) = {
 /*defined in net/if.h but clashes with dpdk headers */
 unsigned int if_nametoindex (const char *ifname);
 
-#define AF_PACKET_OFFLOAD_FLAG_RXCKSUM (1 << 0)
-#define AF_PACKET_OFFLOAD_FLAG_TXCKSUM (1 << 1)
-#define AF_PACKET_OFFLOAD_FLAG_SG      (1 << 2)
-#define AF_PACKET_OFFLOAD_FLAG_TSO     (1 << 3)
-#define AF_PACKET_OFFLOAD_FLAG_UFO     (1 << 4)
-#define AF_PACKET_OFFLOAD_FLAG_GSO     (1 << 5)
-#define AF_PACKET_OFFLOAD_FLAG_GRO     (1 << 6)
-
-#define AF_PACKET_OFFLOAD_FLAG_MASK                                           \
-  (AF_PACKET_OFFLOAD_FLAG_RXCKSUM | AF_PACKET_OFFLOAD_FLAG_TXCKSUM |          \
-   AF_PACKET_OFFLOAD_FLAG_SG | AF_PACKET_OFFLOAD_FLAG_TSO |                   \
-   AF_PACKET_OFFLOAD_FLAG_UFO | AF_PACKET_OFFLOAD_FLAG_GSO |                  \
-   AF_PACKET_OFFLOAD_FLAG_GRO)
-
 #define AF_PACKET_IOCTL(fd, a, ...)                                           \
   if (ioctl (fd, a, __VA_ARGS__) < 0)                                         \
     {                                                                         \
@@ -83,7 +69,7 @@ unsigned int if_nametoindex (const char *ifname);
       goto done;                                                              \
     }
 
-static u32
+u32
 af_packet_get_if_capabilities (u8 *host_if_name)
 {
   struct ifreq ifr;
@@ -189,6 +175,7 @@ af_packet_fd_read_ready (clib_file_t * uf)
 static clib_error_t *
 af_packet_fd_error (clib_file_t *uf)
 {
+  af_packet_main_t *apm = &af_packet_main;
   clib_error_t *err = 0;
   u64 u64;
 
@@ -197,19 +184,8 @@ af_packet_fd_error (clib_file_t *uf)
   if (ret < 0)
     {
       err = clib_error_return_unix (0, "");
-      ELOG_TYPE_DECLARE (e) = {
-	.format = "af-packet-msg: fd %u reason %s",
-	.format_args = "i4T4",
-      };
-      struct
-      {
-	u32 fd;
-	u32 reason;
-      } *ed;
-      ed = ELOG_DATA (&vlib_global_main.elog_main, e);
-      ed->fd = uf->file_descriptor;
-      ed->reason =
-	elog_string (vlib_get_elog_main (), "%U", format_clib_error, err);
+      vlib_log_err (apm->log_class, "fd %u reason %U", uf->file_descriptor,
+		    format_clib_error, err);
 
       clib_error_free (err);
     }
@@ -458,6 +434,14 @@ error:
   return ret;
 }
 
+static u32
+af_packet_make_fanout_id (af_packet_if_t *apif)
+{
+  u16 if_hash =
+    hash_memory (apif->host_if_name, strlen ((char *) apif->host_if_name), 0);
+  return (apif->dev_instance & 0xffff) ^ (if_hash & 0xff00);
+}
+
 int
 af_packet_queue_init (vlib_main_t *vm, af_packet_if_t *apif,
 		      af_packet_create_if_arg_t *arg,
@@ -530,9 +514,9 @@ af_packet_queue_init (vlib_main_t *vm, af_packet_if_t *apif,
 
   if (rx_queue || tx_queue)
     {
-      ret =
-	create_packet_sock (apif->host_if_index, rx_req, tx_req, &fd, &ring,
-			    apif->dev_instance, &arg->flags, apif->version);
+      ret = create_packet_sock (apif->host_if_index, rx_req, tx_req, &fd,
+				&ring, af_packet_make_fanout_id (apif),
+				&arg->flags, apif->version);
 
       if (ret != 0)
 	goto error;
@@ -653,7 +637,8 @@ af_packet_create_if (af_packet_create_if_arg_t *arg)
   u8 hw_addr[6];
   vnet_sw_interface_t *sw;
   vnet_main_t *vnm = vnet_get_main ();
-  vnet_hw_if_caps_t caps = VNET_HW_IF_CAP_INT_MODE;
+  vnet_hw_if_caps_t caps =
+    VNET_HW_IF_CAP_INT_MODE | VNET_HW_IF_CAP_TX_FIXED_OFFSET;
   uword *p;
   uword if_index;
   u8 *host_if_name_dup = 0;

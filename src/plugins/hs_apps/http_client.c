@@ -6,9 +6,22 @@
 #include <vnet/session/application_interface.h>
 #include <vnet/session/session.h>
 #include <http/http.h>
+#include <http/http_header_names.h>
 #include <http/http_content_types.h>
 #include <http/http_status_codes.h>
 #include <vppinfra/unix.h>
+
+#define foreach_hc_s_flag                                                     \
+  _ (1, IS_CLOSED)                                                            \
+  _ (2, PRINTABLE_BODY)                                                       \
+  _ (4, CHUNKED_BODY)
+
+typedef enum hc_s_flag_
+{
+#define _(n, s) HC_S_FLAG_##s = n,
+  foreach_hc_s_flag
+#undef _
+} hc_s_flags;
 
 typedef struct
 {
@@ -22,20 +35,22 @@ typedef struct
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   u32 session_index;
-  u32 thread_index;
+  clib_thread_index_t thread_index;
   u64 to_recv;
-  u8 is_closed;
+  u8 session_flags;
   hc_stats_t stats;
   u64 data_offset;
-  u8 *resp_headers;
+  u64 body_recv;
+  http_header_table_t resp_headers;
   u8 *http_response;
   u8 *response_status;
+  FILE *file_ptr;
 } hc_session_t;
 
 typedef struct
 {
   hc_session_t *sessions;
-  u32 thread_index;
+  clib_thread_index_t thread_index;
   vlib_main_t *vlib_main;
   u8 *headers_buf;
   http_headers_ctx_t req_headers;
@@ -78,10 +93,13 @@ typedef struct
   u32 private_segment_size;
   u32 prealloc_fifos;
   u32 fifo_size;
+  u32 rx_fifo_size;
   u8 *appns_id;
   u64 appns_secret;
   clib_spinlock_t lock;
   bool was_transport_closed;
+  u32 ckpair_index;
+  u64 max_body_size;
 } hc_main_t;
 
 typedef enum
@@ -90,23 +108,36 @@ typedef enum
   HC_TRANSPORT_CLOSED,
   HC_REPLY_RECEIVED,
   HC_GENERIC_ERR,
+  HC_FOPEN_FAILED,
   HC_REPEAT_DONE,
 } hc_cli_signal_t;
 
+#define mime_printable_max_len 35
+const char mime_printable[][mime_printable_max_len] = {
+  "text/\0",
+  "application/json\0",
+  "application/javascript\0",
+  "application/x-yaml\0",
+  "application/x-www-form-urlencoded\0",
+  "application/xml\0",
+  "application/x-sh\0",
+  "application/x-tex\0",
+  "application/x-javascript\0",
+  "application/x-powershell\0"
+};
 static hc_main_t hc_main;
 static hc_stats_t hc_stats;
 
 static inline hc_worker_t *
-hc_worker_get (u32 thread_index)
+hc_worker_get (clib_thread_index_t thread_index)
 {
   return &hc_main.wrk[thread_index];
 }
 
 static inline hc_session_t *
-hc_session_get (u32 session_index, u32 thread_index)
+hc_session_get (u32 session_index, clib_thread_index_t thread_index)
 {
   hc_worker_t *wrk = hc_worker_get (thread_index);
-  wrk->vlib_main = vlib_get_main_by_index (thread_index);
   return pool_elt_at_index (wrk->sessions, session_index);
 }
 
@@ -159,8 +190,9 @@ hc_request (session_t *s, hc_worker_t *wrk, hc_session_t *hc_session,
   rv = svm_fifo_enqueue (s->tx_fifo, sizeof (wrk->msg), (u8 *) &wrk->msg);
   ASSERT (rv == sizeof (wrk->msg));
 
-  rv = svm_fifo_enqueue (s->tx_fifo, vec_len (hcm->target), hcm->target);
-  ASSERT (rv == vec_len (hcm->target));
+  rv =
+    svm_fifo_enqueue (s->tx_fifo, wrk->msg.data.target_path_len, hcm->target);
+  ASSERT (rv == wrk->msg.data.target_path_len);
 
   rv = svm_fifo_enqueue (s->tx_fifo, wrk->req_headers.tail_offset,
 			 wrk->headers_buf);
@@ -195,6 +227,7 @@ hc_session_connected_callback (u32 app_index, u32 hc_session_index,
   hc_worker_t *wrk;
   hc_session_t *hc_session;
   hc_http_header_t *header;
+  u8 *f = 0;
 
   if (err)
     {
@@ -206,12 +239,14 @@ hc_session_connected_callback (u32 app_index, u32 hc_session_index,
     }
 
   wrk = hc_worker_get (s->thread_index);
+
   hc_session = hc_session_alloc (wrk);
   clib_spinlock_lock_if_init (&hcm->lock);
   hcm->connected_counter++;
   clib_spinlock_unlock_if_init (&hcm->lock);
 
   hc_session->thread_index = s->thread_index;
+  hc_session->body_recv = 0;
   s->opaque = hc_session->session_index;
   wrk->session_index = hc_session->session_index;
 
@@ -231,6 +266,18 @@ hc_session_connected_callback (u32 app_index, u32 hc_session_index,
     {
       hc_session->stats.req_per_wrk = hcm->repeat_count;
       hcm->worker_index = s->thread_index;
+    }
+  if (hcm->filename)
+    {
+      f = format (0, "/tmp/%s%c", hcm->filename, 0);
+      hc_session->file_ptr = fopen ((char *) f, "w");
+      vec_free (f);
+      if (hc_session->file_ptr == NULL)
+	{
+	  vlib_process_signal_event_mt (wrk->vlib_main, hcm->cli_node_index,
+					HC_FOPEN_FAILED, 0);
+	  return -1;
+	}
     }
 
   if (!wrk->has_common_headers)
@@ -262,8 +309,8 @@ hc_session_connected_callback (u32 app_index, u32 hc_session_index,
 	wrk->msg.data.body_len = 0;
 
       wrk->msg.type = HTTP_MSG_REQUEST;
-      /* request target */
-      wrk->msg.data.target_path_len = vec_len (hcm->target);
+      /* request target len must be without null termination */
+      wrk->msg.data.target_path_len = strlen ((char *) hcm->target);
       /* custom headers */
       wrk->msg.data.headers_len = wrk->req_headers.tail_offset;
       /* total length */
@@ -284,9 +331,7 @@ hc_session_connected_callback (u32 app_index, u32 hc_session_index,
 	}
     }
 
-  if (hcm->repeat)
-    hc_session->stats.start =
-      vlib_time_now (vlib_get_main_by_index (s->thread_index));
+  hc_session->stats.start = vlib_time_now (wrk->vlib_main);
 
   return hc_request (s, wrk, hc_session, err);
 }
@@ -346,7 +391,7 @@ hc_session_reset_callback (session_t *s)
   int rv;
 
   hc_session = hc_session_get (s->opaque, s->thread_index);
-  hc_session->is_closed = 1;
+  hc_session->session_flags |= HC_S_FLAG_IS_CLOSED;
 
   a->handle = session_handle (s);
   a->app_index = hcm->app_index;
@@ -367,7 +412,7 @@ hc_rx_callback (session_t *s)
   session_error_t session_err = 0;
   int send_err = 0;
 
-  if (hc_session->is_closed)
+  if (hc_session->session_flags & HC_S_FLAG_IS_CLOSED)
     {
       clib_warning ("hc_session_index[%d] is closed", s->opaque);
       return -1;
@@ -379,6 +424,7 @@ hc_rx_callback (session_t *s)
 
   if (hc_session->to_recv == 0)
     {
+      http_reset_header_table (&hc_session->resp_headers);
       rv = svm_fifo_dequeue (s->rx_fifo, sizeof (msg), (u8 *) &msg);
       ASSERT (rv == sizeof (msg));
 
@@ -392,6 +438,7 @@ hc_rx_callback (session_t *s)
 
       if (msg.data.headers_len)
 	{
+	  http_init_header_table_buf (&hc_session->resp_headers, msg);
 
 	  if (!hcm->repeat)
 	    hc_session->response_status =
@@ -399,20 +446,43 @@ hc_rx_callback (session_t *s)
 
 	  svm_fifo_dequeue_drop (s->rx_fifo, msg.data.headers_offset);
 
-	  vec_validate (hc_session->resp_headers, msg.data.headers_len - 1);
-	  vec_set_len (hc_session->resp_headers, msg.data.headers_len);
 	  rv = svm_fifo_dequeue (s->rx_fifo, msg.data.headers_len,
-				 hc_session->resp_headers);
-
+				 hc_session->resp_headers.buf);
 	  ASSERT (rv == msg.data.headers_len);
-	  HTTP_DBG (1, (char *) format (0, "%v", hc_session->resp_headers));
+	  HTTP_DBG (1,
+		    (char *) format (0, "%U", format_hash,
+				     hc_session->resp_headers.value_by_name));
 	  msg.data.body_offset -=
 	    msg.data.headers_len + msg.data.headers_offset;
+
+	  http_build_header_table (&hc_session->resp_headers, msg);
+	  const http_token_t *content_type = http_get_header (
+	    &hc_session->resp_headers,
+	    http_header_name_token (HTTP_HEADER_CONTENT_TYPE));
+	  if (content_type)
+	    {
+	      for (u8 i = 0; i < sizeof (mime_printable) /
+				   (sizeof (char) * mime_printable_max_len);
+		   i++)
+		{
+		  u8 mime_len =
+		    clib_strnlen (mime_printable[i], mime_printable_max_len);
+		  if (content_type->len >= mime_len &&
+		      clib_strncmp (content_type->base, mime_printable[i],
+				    mime_len) == 0)
+		    {
+		      hc_session->session_flags |= HC_S_FLAG_PRINTABLE_BODY;
+		      break;
+		    }
+		}
+	    }
 	}
 
       if (msg.data.body_len == 0)
 	{
 	  svm_fifo_dequeue_drop_all (s->rx_fifo);
+	  /* we don't need to print warning about binary content */
+	  hc_session->session_flags |= HC_S_FLAG_PRINTABLE_BODY;
 	  goto done;
 	}
 
@@ -423,11 +493,19 @@ hc_rx_callback (session_t *s)
 	{
 	  goto done;
 	}
-      vec_validate (hc_session->http_response, msg.data.body_len - 1);
+
+      if (msg.data.body_len > hcm->max_body_size || hcm->filename)
+	hc_session->session_flags |= HC_S_FLAG_CHUNKED_BODY;
+      vec_validate (hc_session->http_response,
+		    (hc_session->session_flags & HC_S_FLAG_CHUNKED_BODY ?
+		       hcm->rx_fifo_size - 1 :
+		       msg.data.body_len - 1));
       vec_reset_length (hc_session->http_response);
     }
 
-  max_deq = svm_fifo_max_dequeue (s->rx_fifo);
+  max_deq = (svm_fifo_max_dequeue (s->rx_fifo) > hcm->max_body_size ?
+	       hcm->rx_fifo_size :
+	       svm_fifo_max_dequeue (s->rx_fifo));
   if (!max_deq)
     {
       goto done;
@@ -444,19 +522,32 @@ hc_rx_callback (session_t *s)
     }
 
   ASSERT (rv == n_deq);
-  vec_set_len (hc_session->http_response, curr + n_deq);
+  if (!(hc_session->session_flags & HC_S_FLAG_CHUNKED_BODY))
+    vec_set_len (hc_session->http_response, curr + n_deq);
   ASSERT (hc_session->to_recv >= rv);
   hc_session->to_recv -= rv;
+  hc_session->body_recv += rv;
+  if (hcm->filename)
+    {
+      if (hc_session->file_ptr == NULL)
+	{
+	  vlib_process_signal_event_mt (wrk->vlib_main, hcm->cli_node_index,
+					HC_FOPEN_FAILED, 0);
+	  goto done;
+	}
+      fwrite (hc_session->http_response, sizeof (u8), rv,
+	      hc_session->file_ptr);
+    }
 
 done:
   if (hc_session->to_recv == 0)
     {
+      hc_session->stats.end = vlib_time_now (wrk->vlib_main);
+      hc_session->stats.elapsed_time =
+	hc_session->stats.end - hc_session->stats.start;
       if (hcm->repeat)
 	{
 	  hc_session->stats.request_count++;
-	  hc_session->stats.end = vlib_time_now (wrk->vlib_main);
-	  hc_session->stats.elapsed_time =
-	    hc_session->stats.end - hc_session->stats.start;
 
 	  if (hc_session->stats.elapsed_time >= hcm->duration &&
 	      hc_session->stats.request_count >= hc_session->stats.req_per_wrk)
@@ -526,6 +617,7 @@ hc_attach ()
   vnet_app_attach_args_t _a, *a = &_a;
   u64 options[18];
   u32 segment_size = 128 << 20;
+  vnet_app_add_cert_key_pair_args_t _ck_pair, *ck_pair = &_ck_pair;
   int rv;
 
   if (hcm->private_segment_size)
@@ -546,6 +638,8 @@ hc_attach ()
     hcm->fifo_size ? hcm->fifo_size : 32 << 10;
   a->options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
   a->options[APP_OPTIONS_PREALLOC_FIFO_PAIRS] = hcm->prealloc_fifos;
+  a->options[APP_OPTIONS_TLS_ENGINE] = CRYPTO_ENGINE_OPENSSL;
+  hcm->rx_fifo_size = a->options[APP_OPTIONS_RX_FIFO_SIZE];
   if (hcm->appns_id)
     {
       a->namespace_id = hcm->appns_id;
@@ -559,6 +653,14 @@ hc_attach ()
   hcm->app_index = a->app_index;
   vec_free (a->name);
   hcm->attached = 1;
+
+  clib_memset (ck_pair, 0, sizeof (*ck_pair));
+  ck_pair->cert = (u8 *) test_srv_crt_rsa;
+  ck_pair->key = (u8 *) test_srv_key_rsa;
+  ck_pair->cert_len = test_srv_crt_rsa_len;
+  ck_pair->key_len = test_srv_key_rsa_len;
+  vnet_app_add_cert_key_pair (ck_pair);
+  hcm->ckpair_index = ck_pair->index;
 
   return 0;
 }
@@ -599,19 +701,27 @@ hc_connect ()
     &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
   clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
 
+  if (hcm->connect_sep.flags & SESSION_ENDPT_CFG_F_SECURE)
+    {
+      ext_cfg = session_endpoint_add_ext_cfg (
+	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+	sizeof (transport_endpt_crypto_cfg_t));
+      ext_cfg->crypto.ckpair_index = hcm->ckpair_index;
+    }
+
   session_send_rpc_evt_to_thread_force (transport_cl_thread (), hc_connect_rpc,
 					a);
 }
 
 static void
-hc_get_repeat_stats (vlib_main_t *vm)
+hc_get_req_stats (vlib_main_t *vm)
 {
   hc_main_t *hcm = &hc_main;
-  hc_worker_t *wrk;
-  hc_session_t *hc_session;
 
-  if (hcm->repeat)
+  if (hcm->repeat || hcm->verbose)
     {
+      hc_worker_t *wrk;
+      hc_session_t *hc_session;
       vec_foreach (wrk, hcm->wrk)
 	{
 	  vec_foreach (hc_session, wrk->sessions)
@@ -625,12 +735,23 @@ hc_get_repeat_stats (vlib_main_t *vm)
 		}
 	    }
 	}
-      vlib_cli_output (vm,
-		       "< %d request(s) in %.6fs\n< avg latency "
-		       "%.4fms\n< %.2f req/sec",
-		       hc_stats.request_count, hc_stats.elapsed_time,
-		       (hc_stats.elapsed_time / hc_stats.request_count) * 1000,
-		       hc_stats.request_count / hc_stats.elapsed_time);
+
+      if (hcm->repeat)
+	{
+	  vlib_cli_output (vm,
+			   "* %d request(s) in %.6fs\n"
+			   "* avg latency %.4fms\n"
+			   "* %.2f req/sec",
+			   hc_stats.request_count, hc_stats.elapsed_time,
+			   (hc_stats.elapsed_time / hc_stats.request_count) *
+			     1000,
+			   hc_stats.request_count / hc_stats.elapsed_time);
+	}
+      else
+	{
+	  vlib_cli_output (vm, "* latency: %.4fms",
+			   hc_stats.elapsed_time * 1000);
+	}
     }
 }
 
@@ -640,7 +761,6 @@ hc_get_event (vlib_main_t *vm)
   hc_main_t *hcm = &hc_main;
   uword event_type, *event_data = 0;
   clib_error_t *err = NULL;
-  FILE *file_ptr;
   u64 event_timeout;
   hc_worker_t *wrk;
   hc_session_t *hc_session;
@@ -650,59 +770,63 @@ hc_get_event (vlib_main_t *vm)
     event_timeout += 5;
   vlib_process_wait_for_event_or_clock (vm, event_timeout);
   event_type = vlib_process_get_events (vm, &event_data);
+  hc_get_req_stats (vm);
 
   switch (event_type)
     {
     case ~0:
-      hc_get_repeat_stats (vm);
       err = clib_error_return (0, "error: timeout");
       break;
     case HC_CONNECT_FAILED:
-      hc_get_repeat_stats (vm);
       err = clib_error_return (0, "error: failed to connect");
       break;
     case HC_TRANSPORT_CLOSED:
-      hc_get_repeat_stats (vm);
       err = clib_error_return (0, "error: transport closed");
       break;
     case HC_GENERIC_ERR:
-      hc_get_repeat_stats (vm);
       err = clib_error_return (0, "error: unknown");
+      break;
+    case HC_FOPEN_FAILED:
+      err = clib_error_return (0, "* couldn't open file %v", hcm->filename);
       break;
     case HC_REPLY_RECEIVED:
       if (hcm->filename)
 	{
 	  wrk = hc_worker_get (hcm->worker_index);
 	  hc_session = hc_session_get (wrk->session_index, wrk->thread_index);
-	  file_ptr =
-	    fopen ((char *) format (0, "/tmp/%v", hcm->filename), "a");
-	  if (file_ptr == NULL)
-	    {
-	      vlib_cli_output (vm, "couldn't open file %v", hcm->filename);
-	    }
-	  else
-	    {
-	      fprintf (file_ptr, "< %s\n< %s\n< %s",
-		       hc_session->response_status, hc_session->resp_headers,
-		       hc_session->http_response);
-	      fclose (file_ptr);
-	      vlib_cli_output (vm, "file saved (/tmp/%v)", hcm->filename);
-	    }
+	  vlib_cli_output (vm, "< %v\n%U\n* %u bytes saved to file (/tmp/%s)",
+			   hc_session->response_status,
+			   format_http_header_table, &hc_session->resp_headers,
+			   "< ", hc_session->body_recv, hcm->filename);
+	  fclose (hc_session->file_ptr);
 	}
-      if (hcm->verbose)
+      else if (hcm->verbose)
 	{
 	  wrk = hc_worker_get (hcm->worker_index);
 	  hc_session = hc_session_get (wrk->session_index, wrk->thread_index);
-	  vlib_cli_output (vm, "< %v\n< %v\n%v", hc_session->response_status,
-			   hc_session->resp_headers,
-			   hc_session->http_response);
+	  vlib_cli_output (vm, "< %v\n%U\n", hc_session->response_status,
+			   format_http_header_table, &hc_session->resp_headers,
+			   "< ");
+	  /* if the body was read in chunks and not saved to file - that
+	     means we've hit the response body size limit */
+	  if (hc_session->session_flags & HC_S_FLAG_CHUNKED_BODY)
+	    vlib_cli_output (
+	      vm, "* response body over limit, read total %llu bytes",
+	      hc_session->body_recv);
+	  else
+	    {
+	      if (hc_session->session_flags & HC_S_FLAG_PRINTABLE_BODY)
+		vlib_cli_output (vm, "%v", hc_session->http_response);
+	      else
+		vlib_cli_output (vm,
+				 "* binary file, not printing!\n* consider "
+				 "saving to file with the 'file' option");
+	    }
 	}
       break;
     case HC_REPEAT_DONE:
-      hc_get_repeat_stats (vm);
       break;
     default:
-      hc_get_repeat_stats (vm);
       err = clib_error_return (0, "error: unexpected event %d", event_type);
       break;
     }
@@ -727,6 +851,7 @@ hc_run (vlib_main_t *vm)
     {
       wrk->has_common_headers = false;
       wrk->thread_index = wrk - hcm->wrk;
+      wrk->vlib_main = vlib_get_main_by_index (wrk->thread_index);
       /* 4k for headers should be enough */
       vec_validate (wrk->headers_buf, 4095);
       http_init_headers_ctx (&wrk->req_headers, wrk->headers_buf,
@@ -770,7 +895,7 @@ hc_worker_cleanup (hc_worker_t *wrk)
   vec_free (wrk->headers_buf);
   vec_foreach (hc_session, wrk->sessions)
     {
-      vec_free (hc_session->resp_headers);
+      http_free_header_table (&hc_session->resp_headers);
       vec_free (hc_session->http_response);
       vec_free (hc_session->response_status);
     }
@@ -829,8 +954,12 @@ hc_command_fn (vlib_main_t *vm, unformat_input_t *input,
   hcm->private_segment_size = 0;
   hcm->fifo_size = 0;
   hcm->was_transport_closed = false;
+  hcm->verbose = false;
+  /* default max - 64MB */
+  hcm->max_body_size = 64 << 20;
   hc_stats.request_count = 0;
   hc_stats.elapsed_time = 0;
+  vec_free (hcm->filename);
 
   if (hcm->attached)
     return clib_error_return (0, "failed: already running!");
@@ -892,6 +1021,9 @@ hc_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       else if (unformat (line_input, "prealloc-fifos %d",
 			 &hcm->prealloc_fifos))
+	;
+      else if (unformat (line_input, "max-body-size %U", unformat_memory_size,
+			 &hcm->max_body_size))
 	;
       else if (unformat (line_input, "private-segment-size %U",
 			 unformat_memory_size, &mem_size))
@@ -969,7 +1101,7 @@ hc_command_fn (vlib_main_t *vm, unformat_input_t *input,
   hcm->appns_id = appns_id;
 
   if (hcm->repeat)
-    vlib_cli_output (vm, "Running, please wait...");
+    vlib_cli_output (vm, "* Running, please wait...");
 
   session_enable_disable_args_t args = { .is_en = 1,
 					 .rt_engine_type =
@@ -1007,7 +1139,8 @@ VLIB_CLI_COMMAND (hc_command, static) = {
     "[save-to <filename>] [header <Key:Value>] [verbose] "
     "[timeout <seconds> (default = 10)] [repeat <count> | duration <seconds>] "
     "[sessions <# of sessions>] [appns <app-ns> secret <appns-secret>] "
-    "[fifo-size <nM|G>] [private-segment-size <nM|G>] [prealloc-fifos <n>]",
+    "[fifo-size <nM|G>] [private-segment-size <nM|G>] [prealloc-fifos <n>]"
+    "[max-body-size <nM|G>]",
   .function = hc_command_fn,
   .is_mp_safe = 1,
 };

@@ -166,6 +166,9 @@ typedef struct application_
    * linked list maintained by the app sublayer for each worker
    */
   app_rx_mq_elt_t *rx_mqs;
+
+  /** collector index, if any */
+  u32 evt_collector_index;
 } application_t;
 
 typedef struct app_rx_mq_handle_
@@ -175,7 +178,7 @@ typedef struct app_rx_mq_handle_
     struct
     {
       u32 app_index;
-      u32 thread_index;
+      clib_thread_index_t thread_index;
     };
     u64 as_u64;
   };
@@ -209,16 +212,6 @@ typedef struct app_main_
    * Hash table of builtin apps by name
    */
   uword *app_by_name;
-
-  /**
-   * Pool from which we allocate certificates (key, cert)
-   */
-  app_cert_key_pair_t *cert_key_pair_store;
-
-  /*
-   * Last registered crypto engine type
-   */
-  crypto_engine_type_t last_crypto_engine;
 
   /**
    * App sublayer per-worker state
@@ -368,9 +361,11 @@ int app_worker_session_fifo_tuning (app_worker_t * app_wrk, session_t * s,
 				    session_ft_action_t act, u32 len);
 void app_worker_add_event (app_worker_t *app_wrk, session_t *s,
 			   session_evt_type_t evt_type);
-void app_worker_add_event_custom (app_worker_t *app_wrk, u32 thread_index,
+void app_worker_add_event_custom (app_worker_t *app_wrk,
+				  clib_thread_index_t thread_index,
 				  session_event_t *evt);
-int app_wrk_flush_wrk_events (app_worker_t *app_wrk, u32 thread_index);
+int app_wrk_flush_wrk_events (app_worker_t *app_wrk,
+			      clib_thread_index_t thread_index);
 void app_worker_del_all_events (app_worker_t *app_wrk);
 segment_manager_t *app_worker_get_listen_segment_manager (app_worker_t *,
 							  session_t *);
@@ -386,30 +381,24 @@ void app_wrk_send_ctrl_evt_fd (app_worker_t *app_wrk, u8 evt_type, void *msg,
 			       u32 msg_len, int fd);
 void app_wrk_send_ctrl_evt (app_worker_t *app_wrk, u8 evt_type, void *msg,
 			    u32 msg_len);
-u8 app_worker_mq_wrk_is_congested (app_worker_t *app_wrk, u32 thread_index);
-void app_worker_set_mq_wrk_congested (app_worker_t *app_wrk, u32 thread_index);
+u8 app_worker_mq_wrk_is_congested (app_worker_t *app_wrk,
+				   clib_thread_index_t thread_index);
+void app_worker_set_mq_wrk_congested (app_worker_t *app_wrk,
+				      clib_thread_index_t thread_index);
 void app_worker_unset_wrk_mq_congested (app_worker_t *app_wrk,
-					u32 thread_index);
+					clib_thread_index_t thread_index);
 session_t *app_worker_proxy_listener (app_worker_t * app, u8 fib_proto,
 				      u8 transport_proto);
 void app_worker_del_detached_sm (app_worker_t * app_wrk, u32 sm_index);
 u8 *format_app_worker (u8 * s, va_list * args);
-u8 *format_app_worker_listener (u8 * s, va_list * args);
-u8 *format_crypto_engine (u8 * s, va_list * args);
+u8 *format_app_worker_listener (u8 *s, va_list *args);
 u8 *format_crypto_context (u8 * s, va_list * args);
 void app_worker_format_connects (app_worker_t * app_wrk, int verbose);
 session_error_t vnet_app_worker_add_del (vnet_app_worker_add_del_args_t *a);
 
 uword unformat_application_proto (unformat_input_t * input, va_list * args);
 
-app_cert_key_pair_t *app_cert_key_pair_get (u32 index);
-app_cert_key_pair_t *app_cert_key_pair_get_if_valid (u32 index);
-app_cert_key_pair_t *app_cert_key_pair_get_default ();
-
 void sapi_socket_close_w_handle (u32 api_handle);
-
-crypto_engine_type_t app_crypto_engine_type_add (void);
-u8 app_crypto_engine_n_types (void);
 
 static inline u8
 app_worker_application_is_builtin (app_worker_t *app_wrk)

@@ -81,6 +81,17 @@ http_test_parse_authority (vlib_main_t *vm)
   vec_free (authority);
   vec_free (formated);
 
+  authority = format (0, "[DEAD:BEEF::1234]:443");
+  rv = http_parse_authority (authority, vec_len (authority), &parsed);
+  HTTP_TEST ((rv == 0), "'%v' should be valid", authority);
+  HTTP_TEST ((parsed.host_type == HTTP_URI_HOST_TYPE_IP6),
+	     "host_type=%d should be %d", parsed.host_type,
+	     HTTP_URI_HOST_TYPE_IP6);
+  HTTP_TEST ((parsed.ip.as_u8[0] == 0xDE && parsed.ip.as_u8[1] == 0xAD &&
+	      parsed.ip.as_u8[2] == 0xBE && parsed.ip.as_u8[3] == 0xEF),
+	     "not parsed correctly");
+  vec_free (authority);
+
   /* registered name */
   authority = format (0, "example.com:80");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
@@ -152,55 +163,84 @@ http_test_parse_authority (vlib_main_t *vm)
   vec_free (authority);
   vec_free (formated);
 
+  authority = format (0, "1e.com");
+  rv = http_parse_authority (authority, vec_len (authority), &parsed);
+  HTTP_TEST ((rv == 0), "'%v' should be valid", authority);
+  HTTP_TEST ((parsed.host_type == HTTP_URI_HOST_TYPE_REG_NAME),
+	     "host_type=%d should be %d", parsed.host_type,
+	     HTTP_URI_HOST_TYPE_REG_NAME);
+  HTTP_TEST ((parsed.port == 0), "port=%u should be 0", parsed.port);
+  formated = http_serialize_authority (&parsed);
+  rv = vec_cmp (authority, formated);
+  HTTP_TEST ((rv == 0), "'%v' should match '%v'", authority, formated);
+  vec_free (authority);
+  vec_free (formated);
+
   /* invalid port */
   authority = format (0, "example.com:80000000");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* no port after colon */
   authority = format (0, "example.com:");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid character in registered name */
   authority = format (0, "bad#example.com");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid IPv6 address not terminated with ']' */
   authority = format (0, "[dead:beef::1234");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* empty IPv6 address */
   authority = format (0, "[]");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid IPv6 address too few hex quads */
   authority = format (0, "[dead:beef]:80");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid IPv6 address more than one :: */
   authority = format (0, "[dead::beef::1]:80");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid IPv6 address too much hex quads */
   authority = format (0, "[d:e:a:d:b:e:e:f:1:2]:80");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid character in IPv6 address */
   authority = format (0, "[xyz0::1234]:443");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   /* invalid IPv6 address */
   authority = format (0, "[deadbeef::1234");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
+
+  /* registered name too long */
+  vec_validate_init_empty (authority, 257, 'a');
+  rv = http_parse_authority (authority, vec_len (authority), &parsed);
+  HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
+  vec_free (authority);
 
   return 0;
 }
@@ -333,6 +373,17 @@ http_test_udp_payload_datagram (vlib_main_t *vm)
   HTTP_TEST ((rv == 1), "'%U' should be skipped (unknown capsule type)",
 	     format_hex_bytes, unknown_type_input,
 	     sizeof (unknown_type_input));
+  HTTP_TEST ((payload_len == 39), "payload_len=%llu should be 39",
+	     payload_len);
+
+  /* Type = 0x00, Len = 37,  Context ID = 0x01 */
+  u8 nonzero_context_id[] = { 0x00, 0x25, 0x01, 0x12, 0x34, 0x56, 0x78 };
+  rv = http_decap_udp_payload_datagram (nonzero_context_id,
+					sizeof (nonzero_context_id),
+					&payload_offset, &payload_len);
+  HTTP_TEST ((rv == 1), "'%U' should be skipped (context id is not zero)",
+	     format_hex_bytes, nonzero_context_id,
+	     sizeof (nonzero_context_id));
   HTTP_TEST ((payload_len == 39), "payload_len=%llu should be 39",
 	     payload_len);
 
@@ -489,8 +540,12 @@ http_test_http_header_table (vlib_main_t *vm)
   HTTP_TEST ((value != 0), "'%s' is in headers",
 	     http_header_name_str (HTTP_HEADER_CONTENT_ENCODING));
   rv = http_token_is (value->base, value->len, http_token_lit ("GZIP"));
-  HTTP_TEST ((rv = 1), "header value '%U' should be 'GZIP'", format_http_bytes,
-	     value->base, value->len);
+  HTTP_TEST ((rv == 1), "header value '%U' should be 'GZIP'",
+	     format_http_bytes, value->base, value->len);
+  rv =
+    http_token_contains (value->base, value->len, http_token_lit ("deflate"));
+  HTTP_TEST ((rv == 0), "header value '%U' doesn't contain 'deflate'",
+	     format_http_bytes, value->base, value->len);
 
   value =
     http_get_header (&ht, http_header_name_token (HTTP_HEADER_CONTENT_TYPE));
@@ -515,8 +570,17 @@ http_test_http_header_table (vlib_main_t *vm)
   /* repeated header */
   value = http_get_header (&ht, http_token_lit ("sandwich"));
   HTTP_TEST ((value != 0), "'sandwich' is in headers");
+  rv = http_token_is (value->base, value->len, http_token_lit ("Spam"));
+  HTTP_TEST ((rv == 0), "header value '%U' should be 'Eggs, Spam'",
+	     format_http_bytes, value->base, value->len);
   rv = http_token_is (value->base, value->len, http_token_lit ("Eggs, Spam"));
-  HTTP_TEST ((rv = 1), "header value '%U' should be 'Eggs, Spam'",
+  HTTP_TEST ((rv == 1), "header value '%U' should be 'Eggs, Spam'",
+	     format_http_bytes, value->base, value->len);
+  rv = http_token_contains (value->base, value->len, http_token_lit ("Spam"));
+  HTTP_TEST ((rv == 1), "header value '%U' contains 'Spam'", format_http_bytes,
+	     value->base, value->len);
+  rv = http_token_contains (value->base, value->len, http_token_lit ("spam"));
+  HTTP_TEST ((rv == 0), "header value '%U' doesn't contain 'spam'",
 	     format_http_bytes, value->base, value->len);
 
   value = http_get_header (&ht, http_token_lit ("Jade"));
@@ -629,6 +693,147 @@ http_test_parse_request (const char *first_req, uword first_req_len,
   if (memcmp (control_data.headers + headers[0].value_offset, "custom-value",
 	      12))
     return 3;
+  vec_free (headers);
+  vec_free (buf);
+
+  return 0;
+}
+
+static int
+http_test_parse_response (const char *first_resp, uword first_resp_len,
+			  const char *second_resp, uword second_resp_len,
+			  const char *third_resp, uword third_resp_len,
+			  hpack_dynamic_table_t *dynamic_table)
+{
+  http2_error_t rv;
+  u8 *buf = 0;
+  hpack_response_control_data_t control_data;
+  http_field_line_t *headers = 0;
+  u16 parsed_bitmap;
+
+  static http2_error_t (*_hpack_parse_response) (
+    u8 * src, u32 src_len, u8 * dst, u32 dst_len,
+    hpack_response_control_data_t * control_data, http_field_line_t * *headers,
+    hpack_dynamic_table_t * dynamic_table);
+
+  _hpack_parse_response =
+    vlib_get_plugin_symbol ("http_plugin.so", "hpack_parse_response");
+
+  parsed_bitmap = HPACK_PSEUDO_HEADER_STATUS_PARSED;
+
+  /* first request */
+  vec_validate_init_empty (buf, 254, 0);
+  memset (&control_data, 0, sizeof (control_data));
+  rv = _hpack_parse_response ((u8 *) first_resp, (u32) first_resp_len, buf,
+			      254, &control_data, &headers, dynamic_table);
+  if (rv != HTTP2_ERROR_NO_ERROR ||
+      control_data.parsed_bitmap != parsed_bitmap ||
+      control_data.sc != HTTP_STATUS_FOUND || vec_len (headers) != 3 ||
+      dynamic_table->used != 222)
+    return 1;
+  if (headers[0].name_len != 13 || headers[0].value_len != 7)
+    return 1;
+  if (memcmp (control_data.headers + headers[0].name_offset, "cache-control",
+	      13))
+    return 1;
+  if (memcmp (control_data.headers + headers[0].value_offset, "private", 7))
+    return 1;
+  if (headers[1].name_len != 4 || headers[1].value_len != 29)
+    return 1;
+  if (memcmp (control_data.headers + headers[1].name_offset, "date", 4))
+    return 1;
+  if (memcmp (control_data.headers + headers[1].value_offset,
+	      "Mon, 21 Oct 2013 20:13:21 GMT", 29))
+    return 1;
+  if (headers[2].name_len != 8 || headers[2].value_len != 23)
+    return 1;
+  if (memcmp (control_data.headers + headers[2].name_offset, "location", 8))
+    return 1;
+  if (memcmp (control_data.headers + headers[2].value_offset,
+	      "https://www.example.com", 23))
+    return 1;
+  vec_free (headers);
+  vec_free (buf);
+
+  /* second request */
+  vec_validate_init_empty (buf, 254, 0);
+  memset (&control_data, 0, sizeof (control_data));
+  rv = _hpack_parse_response ((u8 *) second_resp, (u32) second_resp_len, buf,
+			      254, &control_data, &headers, dynamic_table);
+  if (rv != HTTP2_ERROR_NO_ERROR ||
+      control_data.parsed_bitmap != parsed_bitmap ||
+      control_data.sc != HTTP_STATUS_TEMPORARY_REDIRECT ||
+      vec_len (headers) != 3 || dynamic_table->used != 222)
+    return 2;
+  if (headers[0].name_len != 13 || headers[0].value_len != 7)
+    return 1;
+  if (memcmp (control_data.headers + headers[0].name_offset, "cache-control",
+	      13))
+    return 1;
+  if (memcmp (control_data.headers + headers[0].value_offset, "private", 7))
+    return 1;
+  if (headers[1].name_len != 4 || headers[1].value_len != 29)
+    return 1;
+  if (memcmp (control_data.headers + headers[1].name_offset, "date", 4))
+    return 1;
+  if (memcmp (control_data.headers + headers[1].value_offset,
+	      "Mon, 21 Oct 2013 20:13:21 GMT", 29))
+    return 1;
+  if (headers[2].name_len != 8 || headers[2].value_len != 23)
+    return 1;
+  if (memcmp (control_data.headers + headers[2].name_offset, "location", 8))
+    return 1;
+  if (memcmp (control_data.headers + headers[2].value_offset,
+	      "https://www.example.com", 23))
+    return 1;
+  vec_free (headers);
+  vec_free (buf);
+
+  /* third request */
+  vec_validate_init_empty (buf, 254, 0);
+  memset (&control_data, 0, sizeof (control_data));
+  rv = _hpack_parse_response ((u8 *) third_resp, (u32) third_resp_len, buf,
+			      254, &control_data, &headers, dynamic_table);
+  if (rv != HTTP2_ERROR_NO_ERROR ||
+      control_data.parsed_bitmap != parsed_bitmap ||
+      control_data.sc != HTTP_STATUS_OK || vec_len (headers) != 5 ||
+      dynamic_table->used != 215)
+    return 3;
+  if (headers[0].name_len != 13 || headers[0].value_len != 7)
+    return 1;
+  if (memcmp (control_data.headers + headers[0].name_offset, "cache-control",
+	      13))
+    return 1;
+  if (memcmp (control_data.headers + headers[0].value_offset, "private", 7))
+    return 1;
+  if (headers[1].name_len != 4 || headers[1].value_len != 29)
+    return 1;
+  if (memcmp (control_data.headers + headers[1].name_offset, "date", 4))
+    return 1;
+  if (memcmp (control_data.headers + headers[1].value_offset,
+	      "Mon, 21 Oct 2013 20:13:22 GMT", 29))
+    return 1;
+  if (headers[2].name_len != 8 || headers[2].value_len != 23)
+    return 1;
+  if (memcmp (control_data.headers + headers[2].name_offset, "location", 8))
+    return 1;
+  if (memcmp (control_data.headers + headers[2].value_offset,
+	      "https://www.example.com", 23))
+    return 1;
+  if (headers[3].name_len != 16 || headers[3].value_len != 4)
+    return 1;
+  if (memcmp (control_data.headers + headers[3].name_offset,
+	      "content-encoding", 16))
+    return 1;
+  if (memcmp (control_data.headers + headers[3].value_offset, "gzip", 4))
+    return 1;
+  if (headers[4].name_len != 10 || headers[4].value_len != 56)
+    return 1;
+  if (memcmp (control_data.headers + headers[4].name_offset, "set-cookie", 10))
+    return 1;
+  if (memcmp (control_data.headers + headers[4].value_offset,
+	      "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", 56))
+    return 1;
   vec_free (headers);
   vec_free (buf);
 
@@ -956,6 +1161,49 @@ http_test_hpack (vlib_main_t *vm)
   _hpack_dynamic_table_free (&table);
   HTTP_TEST ((result == 0), "request with Huffman Coding (result=%d)", result);
 
+  vlib_cli_output (vm, "hpack_parse_response");
+
+  /* C.5. Response Examples without Huffman Coding */
+  _hpack_dynamic_table_init (&table, 256);
+  result = http_test_parse_response (
+    http_token_lit (
+      "\x48\x03\x33\x30\x32\x58\x07\x70\x72\x69\x76\x61\x74\x65"
+      "\x61\x1D\x4D\x6F\x6E\x2C\x20\x32\x31\x20\x4F\x63\x74\x20\x32\x30\x31"
+      "\x33\x20\x32\x30\x3A\x31\x33\x3A\x32\x31\x20\x47\x4D\x54\x6E\x17\x68"
+      "\x74\x74\x70\x73\x3A\x2F\x2F\x77\x77\x77\x2E\x65\x78\x61\x6D\x70\x6C"
+      "\x65\x2E\x63\x6F\x6D"),
+    http_token_lit ("\x48\x03\x33\x30\x37\xC1\xC0\xBF"),
+    http_token_lit (
+      "\x88\xC1\x61\x1D\x4D\x6F\x6E\x2C\x20\x32\x31\x20\x4F\x63\x74\x20\x32"
+      "\x30\x31\x33\x20\x32\x30\x3A\x31\x33\x3A\x32\x32\x20\x47\x4D\x54\xC0"
+      "\x5A\x04\x67\x7A\x69\x70\x77\x38\x66\x6F\x6F\x3D\x41\x53\x44\x4A\x4B"
+      "\x48\x51\x4B\x42\x5A\x58\x4F\x51\x57\x45\x4F\x50\x49\x55\x41\x58\x51"
+      "\x57\x45\x4F\x49\x55\x3B\x20\x6D\x61\x78\x2D\x61\x67\x65\x3D\x33\x36"
+      "\x30\x30\x3B\x20\x76\x65\x72\x73\x69\x6F\x6E\x3D\x31"),
+    &table);
+  _hpack_dynamic_table_free (&table);
+  HTTP_TEST ((result == 0), "response without Huffman Coding (result=%d)",
+	     result);
+
+  /* C.6. Response Examples with Huffman Coding */
+  _hpack_dynamic_table_init (&table, 256);
+  result = http_test_parse_response (
+    http_token_lit ("\x48\x82\x64\x02\x58\x85\xAE\xC3\x77\x1A\x4B\x61\x96\xD0"
+		    "\x7A\xBE\x94\x10\x54\xD4\x44\xA8\x20\x05\x95\x04\x0B\x81"
+		    "\x66\xE0\x82\xA6\x2D\x1B\xFF\x6E\x91\x9D\x29\xAD\x17\x18"
+		    "\x63\xC7\x8F\x0B\x97\xC8\xE9\xAE\x82\xAE\x43\xD3"),
+    http_token_lit ("\x48\x83\x64\x0E\xFF\xC1\xC0\xBF"),
+    http_token_lit (
+      "\x88\xC1\x61\x96\xD0\x7A\xBE\x94\x10\x54\xD4\x44\xA8\x20\x05\x95\x04"
+      "\x0B\x81\x66\xE0\x84\xA6\x2D\x1B\xFF\xC0\x5A\x83\x9B\xD9\xAB\x77\xAD"
+      "\x94\xE7\x82\x1D\xD7\xF2\xE6\xC7\xB3\x35\xDF\xDF\xCD\x5B\x39\x60\xD5"
+      "\xAF\x27\x08\x7F\x36\x72\xC1\xAB\x27\x0F\xB5\x29\x1F\x95\x87\x31\x60"
+      "\x65\xC0\x03\xED\x4E\xE5\xB1\x06\x3D\x50\x07"),
+    &table);
+  _hpack_dynamic_table_free (&table);
+  HTTP_TEST ((result == 0), "response with Huffman Coding (result=%d)",
+	     result);
+
   vlib_cli_output (vm, "hpack_serialize_response");
 
   hpack_response_control_data_t resp_cd;
@@ -1013,10 +1261,76 @@ http_test_hpack (vlib_main_t *vm)
   HTTP_TEST ((vec_len (buf) == (sizeof (expected2) - 1) &&
 	      !memcmp (buf, expected2, sizeof (expected2) - 1)),
 	     "response encoded as %U", format_hex_bytes, buf, vec_len (buf));
-  vec_free (buf);
+  vec_reset_length (buf);
   vec_free (headers_buf);
-  vec_free (server_name);
   vec_free (date);
+
+  vlib_cli_output (vm, "hpack_serialize_request");
+
+  hpack_request_control_data_t req_cd;
+  u8 *authority, *path;
+
+  static void (*_hpack_serialize_request) (
+    u8 * app_headers, u32 app_headers_len,
+    hpack_request_control_data_t * control_data, u8 * *dst);
+
+  _hpack_serialize_request =
+    vlib_get_plugin_symbol ("http_plugin.so", "hpack_serialize_request");
+
+  authority = format (0, "www.example.com");
+  path = format (0, "/");
+
+  vec_validate (buf, 127);
+  vec_reset_length (buf);
+
+  req_cd.method = HTTP_REQ_GET;
+  req_cd.parsed_bitmap = HPACK_PSEUDO_HEADER_SCHEME_PARSED;
+  req_cd.scheme = HTTP_URL_SCHEME_HTTP;
+  req_cd.parsed_bitmap |= HPACK_PSEUDO_HEADER_PATH_PARSED;
+  req_cd.path = path;
+  req_cd.path_len = vec_len (path);
+  req_cd.parsed_bitmap |= HPACK_PSEUDO_HEADER_AUTHORITY_PARSED;
+  req_cd.authority = authority;
+  req_cd.authority_len = vec_len (authority);
+  req_cd.user_agent_len = 0;
+  req_cd.content_len = HPACK_ENCODER_SKIP_CONTENT_LEN;
+  u8 expected3[] =
+    "\x82\x86\x84\x01\x8C\xF1\xE3\xC2\xE5\xF2\x3A\x6B\xA0\xAB\x90\xF4\xFF";
+  _hpack_serialize_request (0, 0, &req_cd, &buf);
+  HTTP_TEST ((vec_len (buf) == (sizeof (expected3) - 1) &&
+	      !memcmp (buf, expected3, sizeof (expected3) - 1)),
+	     "request encoded as %U", format_hex_bytes, buf, vec_len (buf));
+  vec_reset_length (buf);
+  vec_free (authority);
+  vec_free (path);
+  memset (&req_cd, 0, sizeof (req_cd));
+
+  authority = format (0, "example.org:123");
+
+  req_cd.method = HTTP_REQ_CONNECT;
+  req_cd.parsed_bitmap |= HPACK_PSEUDO_HEADER_AUTHORITY_PARSED;
+  req_cd.authority = authority;
+  req_cd.authority_len = vec_len (authority);
+  req_cd.user_agent = server_name;
+  req_cd.user_agent_len = vec_len (server_name);
+  req_cd.content_len = HPACK_ENCODER_SKIP_CONTENT_LEN;
+
+  vec_validate (headers_buf, 127);
+  http_init_headers_ctx (&headers, headers_buf, vec_len (headers_buf));
+  http_add_custom_header (&headers, http_token_lit ("sandwich"),
+			  http_token_lit ("spam"));
+
+  u8 expected4[] =
+    "\x02\x07\x43\x4F\x4E\x4E\x45\x43\x54\x01\x8B\x2F\x91\xD3\x5D\x05\x5C\xF6"
+    "\x4D\x70\x22\x67\x0F\x2B\x8B\x9D\x29\xAD\x4B\x6A\x32\x54\x49\x50\x94\x7f"
+    "\x00\x86\x40\xEA\x93\xC1\x89\x3F\x83\x45\x63\xA7";
+  _hpack_serialize_request (headers_buf, headers.tail_offset, &req_cd, &buf);
+  HTTP_TEST ((vec_len (buf) == (sizeof (expected4) - 1) &&
+	      !memcmp (buf, expected4, sizeof (expected4) - 1)),
+	     "request encoded as %U", format_hex_bytes, buf, vec_len (buf));
+  vec_free (buf);
+  vec_free (server_name);
+  vec_free (authority);
 
   return 0;
 }

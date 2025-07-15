@@ -4,66 +4,55 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
 	"net/http/httputil"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/edwarnicke/exechelper"
-
+	. "fd.io/hs-test/infra/common"
 	containerTypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/onsi/gomega/gmeasure"
-	"gopkg.in/yaml.v3"
-
+	"github.com/edwarnicke/exechelper"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gmeasure"
+	"gopkg.in/yaml.v3"
 )
 
 const (
 	DEFAULT_NETWORK_NUM int = 1
 )
 
-var IsPersistent = flag.Bool("persist", false, "persists topology config")
-var IsVerbose = flag.Bool("verbose", false, "verbose test output")
-var IsCoverage = flag.Bool("coverage", false, "use coverage run config")
 var IsUnconfiguring = flag.Bool("unconfigure", false, "remove topology")
-var IsVppDebug = flag.Bool("debug", false, "attach gdb to vpp")
-var NConfiguredCpus = flag.Int("cpus", 1, "number of CPUs assigned to vpp")
+var NConfiguredCpus = flag.Int("cpus", 1, "number of CPUs assigned to non-vpp containers")
+var NConfiguredVppCpus = flag.Int("vpp_cpus", 1, "number of CPUs assigned to vpp containers")
 var VppSourceFileDir = flag.String("vppsrc", "", "vpp source file directory")
 var IsDebugBuild = flag.Bool("debug_build", false, "some paths are different with debug build")
 var UseCpu0 = flag.Bool("cpu0", false, "use cpu0")
 var IsLeakCheck = flag.Bool("leak_check", false, "run leak-check tests")
-var ParallelTotal = flag.Lookup("ginkgo.parallel.total")
-var DryRun = flag.Bool("dryrun", false, "set up containers but don't run tests")
-var NumaAwareCpuAlloc bool
-var TestTimeout time.Duration
 
 type HstSuite struct {
-	AllContainers     map[string]*Container
-	StartedContainers []*Container
-	Volumes           []string
-	NetConfigs        []NetConfig
-	NetInterfaces     map[string]*NetInterface
-	Ip4AddrAllocator  *Ip4AddressAllocator
-	TestIds           map[string]string
-	CpuAllocator      *CpuAllocatorT
-	CpuContexts       []*CpuContext
-	CpuCount          int
-	Ppid              string
-	ProcessIndex      string
-	Logger            *log.Logger
-	LogFile           *os.File
-	Docker            *client.Client
-	CoverageRun       bool
+	HstCommon
+	AllContainers       map[string]*Container
+	StartedContainers   []*Container
+	NetConfigs          []NetConfig
+	NetInterfaces       map[string]*NetInterface
+	Ip4AddrAllocator    *Ip4AddressAllocator
+	Ip6AddrAllocator    *Ip6AddressAllocator
+	TestIds             map[string]string
+	CpuAllocator        *CpuAllocatorT
+	CpuContexts         []*CpuContext
+	CpusPerContainer    int
+	CpusPerVppContainer int
+	Docker              *client.Client
+	CoverageRun         bool
+	numOfNewPorts       int
+	SkipIfNotEnoguhCpus bool
 }
 
 type colors struct {
@@ -80,9 +69,12 @@ var Colors = colors{
 
 // ../../src/vnet/udp/udp_local.h:foreach_udp4_dst_port
 var reservedPorts = []string{
+	"22",
 	"53",
 	"67",
 	"68",
+	"80",
+	"443",
 	"500",
 	"2152",
 	"3784",
@@ -96,6 +88,8 @@ var reservedPorts = []string{
 	"4789",
 	"48879",
 	"4790",
+	"5000",
+	"5001",
 	"6633",
 	"6081",
 	"53053",
@@ -104,19 +98,6 @@ var reservedPorts = []string{
 // used for colorful ReportEntry
 type StringerStruct struct {
 	Label string
-}
-
-var testCounter uint16
-var startTime time.Time = time.Now()
-
-func testCounterFunc() {
-	if ParallelTotal.Value.String() != "1" {
-		return
-	}
-	testCounter++
-	fmt.Printf("Test counter: %d\n"+
-		"Time elapsed: %.2fs\n",
-		testCounter, time.Since(startTime).Seconds())
 }
 
 // ColorableString for ReportEntry to use
@@ -129,15 +110,10 @@ func (s StringerStruct) String() string {
 	return s.Label
 }
 
-func getTestFilename() string {
-	_, filename, _, _ := runtime.Caller(2)
-	return filepath.Base(filename)
-}
-
 func (s *HstSuite) getLogDirPath() string {
 	testId := s.GetTestId()
 	testName := s.GetCurrentTestName()
-	logDirPath := logDir + testName + "/" + testId + "/"
+	logDirPath := LogDir + testName + "/" + testId + "/"
 
 	cmd := exec.Command("mkdir", "-p", logDirPath)
 	if err := cmd.Run(); err != nil {
@@ -155,55 +131,38 @@ func (s *HstSuite) newDockerClient() {
 }
 
 func (s *HstSuite) SetupSuite() {
-	s.CreateLogger()
-	s.Log("[* SUITE SETUP]")
-	s.newDockerClient()
 	RegisterFailHandler(func(message string, callerSkip ...int) {
 		s.HstFail()
 		Fail(message, callerSkip...)
 	})
+	s.HstCommon.SetupSuite()
+	s.newDockerClient()
+
 	var err error
-	s.Ppid = fmt.Sprint(os.Getppid())
-	// remove last number so we have space to prepend a process index (interfaces have a char limit)
-	s.Ppid = s.Ppid[:len(s.Ppid)-1]
-	s.ProcessIndex = fmt.Sprint(GinkgoParallelProcess())
 	s.CpuAllocator, err = CpuAllocator()
+	s.CpuAllocator.suite = s
 	if err != nil {
 		Fail("failed to init cpu allocator: " + fmt.Sprint(err))
 	}
-	s.CpuCount = *NConfiguredCpus
+	s.CpusPerContainer = *NConfiguredCpus
+	s.CpusPerVppContainer = *NConfiguredVppCpus
 	s.CoverageRun = *IsCoverage
 }
 
 func (s *HstSuite) AllocateCpus(containerName string) []int {
 	var cpuCtx *CpuContext
 	var err error
-	currentTestName := CurrentSpecReport().LeafNodeText
 
-	if strings.Contains(currentTestName, "MTTest") {
-		prevContainerCount := s.CpuAllocator.maxContainerCount
-		if strings.Contains(containerName, "vpp") {
-			// CPU range is assigned based on the Ginkgo process index (or build number if
-			// running in the CI), *NConfiguredCpus and a maxContainerCount.
-			// maxContainerCount is set to 4 when CpuAllocator is initialized.
-			// 4 is not a random number - all of our suites use a maximum of 4 containers simultaneously,
-			// and it's also the maximum number of containers we can run with *NConfiguredCpus=2 (with CPU0=true)
-			// on processors with 8 threads. Currently, the CpuAllocator puts all cores into a slice,
-			// makes the length of the slice divisible by 4x*NConfiguredCpus, and then the minCpu and
-			// maxCpu (range) for each container is calculated. Then we just offset based on minCpu,
-			// the number of started containers and *NConfiguredCpus. This way, every container
-			// uses the correct CPUs, even if multiple NUMA nodes are available.
-			// However, because of this, if we want to assign different number of cores to different containers,
-			// we have to change maxContainerCount to manipulate the CPU range. Hopefully a temporary workaround.
-			s.CpuAllocator.maxContainerCount = 1
-			cpuCtx, err = s.CpuAllocator.Allocate(1, 3, 0)
-		} else {
-			s.CpuAllocator.maxContainerCount = 3
-			cpuCtx, err = s.CpuAllocator.Allocate(len(s.StartedContainers), s.CpuCount, 2)
-		}
-		s.CpuAllocator.maxContainerCount = prevContainerCount
+	if strings.Contains(containerName, "vpp") {
+		// CPUs are allocated based on s.CpusPerVppContainer/s.CpusPerContainer (defaults can be overridden globally
+		// or per test) and 'lastCpu' which serves as an offset. 'lastCpu' is incremented by 4 for each
+		// GinkgoParallelProcess() in SetupTest() in hst_suite, because all suites use 4 containers
+		// at most with 1 CPU each. GinkgoParallelProcess() offset doesn't impact MW or solo tests.
+		// Numa aware cpu allocation will use the second numa
+		// node if a container doesn't "fit" into the first node.
+		cpuCtx, err = s.CpuAllocator.Allocate(s.CpusPerVppContainer, s.CpuAllocator.lastCpu)
 	} else {
-		cpuCtx, err = s.CpuAllocator.Allocate(len(s.StartedContainers), s.CpuCount, 0)
+		cpuCtx, err = s.CpuAllocator.Allocate(s.CpusPerContainer, s.CpuAllocator.lastCpu)
 	}
 
 	s.AssertNil(err)
@@ -215,27 +174,30 @@ func (s *HstSuite) AddCpuContext(cpuCtx *CpuContext) {
 	s.CpuContexts = append(s.CpuContexts, cpuCtx)
 }
 
-func (s *HstSuite) TearDownSuite() {
-	defer s.LogFile.Close()
-	defer s.Docker.Close()
-	if *IsPersistent || *DryRun {
-		return
-	}
-	s.Log("[* SUITE TEARDOWN]")
-	s.UnconfigureNetworkTopology()
-}
-
-func (s *HstSuite) TearDownTest() {
-	s.Log("[* TEST TEARDOWN]")
-	if *IsPersistent || *DryRun {
-		return
-	}
-	coreDump := s.WaitForCoreDump()
-	s.ResetContainers()
-
+func (s *HstSuite) TeardownSuite() {
+	s.HstCommon.TeardownSuite()
+	// allow ports to be reused by removing them from reservedPorts slice
+	reservedPorts = reservedPorts[:len(reservedPorts)-s.numOfNewPorts]
 	if s.Ip4AddrAllocator != nil {
 		s.Ip4AddrAllocator.DeleteIpAddresses()
 	}
+
+	if s.Ip6AddrAllocator != nil {
+		s.Ip6AddrAllocator.DeleteIpAddresses()
+	}
+	defer s.LogFile.Close()
+	defer s.Docker.Close()
+	s.UnconfigureNetworkTopology()
+}
+
+func (s *HstSuite) TeardownTest() {
+	s.HstCommon.TeardownTest()
+	s.SkipIfNotEnoguhCpus = false
+	// reset to defaults
+	s.CpusPerContainer = *NConfiguredCpus
+	s.CpusPerVppContainer = *NConfiguredVppCpus
+	coreDump := s.WaitForCoreDump()
+	s.ResetContainers()
 
 	if coreDump {
 		Fail("VPP crashed")
@@ -255,8 +217,9 @@ func (s *HstSuite) SkipIfNotCoverage() {
 }
 
 func (s *HstSuite) SetupTest() {
-	testCounterFunc()
-	s.Log("[* TEST SETUP]")
+	s.HstCommon.SetupTest()
+	// doesn't impact MW/solo tests
+	s.CpuAllocator.lastCpu = (GinkgoParallelProcess() - 1) * 4
 	s.StartedContainers = s.StartedContainers[:0]
 	s.SkipIfUnconfiguring()
 	s.SetupContainers()
@@ -319,140 +282,9 @@ func (s *HstSuite) HstFail() {
 	}
 }
 
-func (s *HstSuite) AssertNil(object interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, object).To(BeNil(), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertNotNil(object interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, object).ToNot(BeNil(), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertEqual(expected, actual interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, actual).To(Equal(expected), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertNotEqual(expected, actual interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, actual).ToNot(Equal(expected), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertContains(testString, contains interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, strings.ToLower(fmt.Sprint(testString))).To(ContainSubstring(strings.ToLower(fmt.Sprint(contains))), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertNotContains(testString, contains interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, strings.ToLower(fmt.Sprint(testString))).ToNot(ContainSubstring(strings.ToLower(fmt.Sprint(contains))), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertEmpty(object interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, object).To(BeEmpty(), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertNotEmpty(object interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, object).ToNot(BeEmpty(), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertMatchError(actual, expected error, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, actual).To(MatchError(expected), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertGreaterThan(actual, expected interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, actual).Should(BeNumerically(">=", expected), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertTimeEqualWithinThreshold(actual, expected time.Time, threshold time.Duration, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, actual).Should(BeTemporally("~", expected, threshold), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertHttpStatus(resp *http.Response, expectedStatus int, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, resp).To(HaveHTTPStatus(expectedStatus), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertHttpHeaderWithValue(resp *http.Response, key string, value interface{}, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, resp).To(HaveHTTPHeaderWithValue(key, value), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertHttpHeaderNotPresent(resp *http.Response, key string, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, resp.Header.Get(key)).To(BeEmpty(), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertHttpContentLength(resp *http.Response, expectedContentLen int64, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, resp).To(HaveHTTPHeaderWithValue("Content-Length", strconv.FormatInt(expectedContentLen, 10)), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertHttpBody(resp *http.Response, expectedBody string, msgAndArgs ...interface{}) {
-	ExpectWithOffset(2, resp).To(HaveHTTPBody(expectedBody), msgAndArgs...)
-}
-
-func (s *HstSuite) AssertChannelClosed(timeout time.Duration, channel chan error) {
-	EventuallyWithOffset(2, channel).WithTimeout(timeout).Should(BeClosed())
-}
-
-// Pass the parsed result struct and the minimum amount of data transferred in MB
-func (s *HstSuite) AssertIperfMinTransfer(result IPerfResult, minTransferred int) {
-	if result.Start.Details.Protocol == "TCP" {
-		s.AssertGreaterThan(result.End.TcpReceived.MBytes, minTransferred)
-	} else {
-		s.AssertGreaterThan(result.End.Udp.MBytes, minTransferred)
-	}
-}
-
-func (s *HstSuite) CreateLogger() {
-	suiteName := s.GetCurrentSuiteName()
-	var err error
-	s.LogFile, err = os.Create("summary/" + suiteName + ".log")
-	if err != nil {
-		Fail("Unable to create log file.")
-	}
-	s.Logger = log.New(io.Writer(s.LogFile), "", log.LstdFlags)
-}
-
-// Logs to files by default, logs to stdout when VERBOSE=true with GinkgoWriter
-// to keep console tidy
-func (s *HstSuite) Log(log any, arg ...any) {
-	var logStr string
-	if len(arg) == 0 {
-		logStr = fmt.Sprint(log)
-	} else {
-		logStr = fmt.Sprintf(fmt.Sprint(log), arg...)
-	}
-	logs := strings.Split(logStr, "\n")
-
-	for _, line := range logs {
-		s.Logger.Println(line)
-	}
-	if *IsVerbose {
-		GinkgoWriter.Println(logStr)
-	}
-}
-
-func (s *HstSuite) Skip(args string) {
-	Skip(args)
-}
-
 func (s *HstSuite) SkipIfMultiWorker(args ...any) {
 	if *NConfiguredCpus > 1 {
 		s.Skip("test case not supported with multiple vpp workers")
-	}
-}
-
-func (s *HstSuite) SkipIfNotEnoughAvailableCpus() {
-	var maxRequestedCpu int
-	availableCpus := len(s.CpuAllocator.cpus) - 1
-
-	if *UseCpu0 {
-		availableCpus++
-	}
-
-	if s.CpuAllocator.runningInCi {
-		maxRequestedCpu = ((s.CpuAllocator.buildNumber + 1) * s.CpuAllocator.maxContainerCount * s.CpuCount)
-	} else {
-		maxRequestedCpu = (GinkgoParallelProcess() * s.CpuAllocator.maxContainerCount * s.CpuCount)
-	}
-
-	if availableCpus < maxRequestedCpu {
-		s.Skip(fmt.Sprintf("Test case cannot allocate requested cpus "+
-			"(%d containers * %d cpus, %d available). Try using 'CPU0=true'",
-			s.CpuAllocator.maxContainerCount, s.CpuCount, availableCpus))
 	}
 }
 
@@ -468,8 +300,13 @@ func (s *HstSuite) SkipIfArm() {
 	}
 }
 
+type coreInfo struct {
+	file    string
+	binPath string
+}
+
 func (s *HstSuite) WaitForCoreDump() bool {
-	var filename string
+	var coreFiles []coreInfo
 	dir, err := os.Open(s.getLogDirPath())
 	if err != nil {
 		s.Log(err)
@@ -483,15 +320,21 @@ func (s *HstSuite) WaitForCoreDump() bool {
 		return false
 	}
 	for _, file := range files {
-		if strings.Contains(file, "core") {
-			filename = file
+		coreBin, isCore := s.GetCoreProcessName(s.getLogDirPath() + file)
+		if isCore {
+			coreFiles = append(coreFiles, coreInfo{file, coreBin})
 		}
 	}
 	timeout := 60
 	waitTime := 5
 
-	if filename != "" {
-		corePath := s.getLogDirPath() + filename
+	if len(coreFiles) == 0 {
+		return false
+	}
+	arch, _ := exechelper.Output("uname -m")
+	archStr := strings.TrimSpace(string(arch))
+	for _, core := range coreFiles {
+		corePath := s.getLogDirPath() + core.file
 		s.Log(fmt.Sprintf("WAITING FOR CORE DUMP (%s)", corePath))
 		for i := waitTime; i <= timeout; i += waitTime {
 			fileInfo, err := os.Stat(corePath)
@@ -509,14 +352,34 @@ func (s *HstSuite) WaitForCoreDump() bool {
 				if *IsDebugBuild {
 					debug = "_debug"
 				}
-				vppBinPath := fmt.Sprintf("../../build-root/build-vpp%s-native/vpp/bin/vpp", debug)
-				pluginsLibPath := fmt.Sprintf("build-root/build-vpp%s-native/vpp/lib/x86_64-linux-gnu/vpp_plugins", debug)
-				cmd := fmt.Sprintf("sudo gdb %s -c %s -ex 'set solib-search-path %s/%s' -ex 'bt full' -batch", vppBinPath, corePath, *VppSourceFileDir, pluginsLibPath)
+				var binPath, libPath string
+				if strings.Contains(core.binPath, "vpp") {
+					binPath = fmt.Sprintf("../../build-root/build-vpp%s-native/vpp/bin/vpp", debug)
+					libPath = fmt.Sprintf("build-root/build-vpp%s-native/vpp/lib/%s-linux-gnu/vpp_plugins", debug, archStr)
+
+				} else {
+					binPath = core.binPath
+					// this was most likely LDP and we want symbol table
+					libPath = fmt.Sprintf("build-root/build-vpp%s-native/vpp/lib/%s-linux-gnu", debug, archStr)
+				}
+				cmd := fmt.Sprintf("sudo gdb %s -c %s -ex 'set solib-search-path %s/%s' -ex 'bt full' -batch", binPath, corePath, *VppSourceFileDir, libPath)
 				s.Log(cmd)
 				output, _ := exechelper.Output(cmd)
-				AddReportEntry("VPP Backtrace", StringerStruct{Label: string(output)})
-				os.WriteFile(s.getLogDirPath()+"backtrace.log", output, os.FileMode(0644))
-				if s.CpuAllocator.runningInCi {
+				if strings.Contains(core.binPath, "vpp") {
+					AddReportEntry("VPP Backtrace", StringerStruct{Label: string(output)})
+				} else {
+					AddReportEntry("APP Backtrace", StringerStruct{Label: string(output)})
+				}
+				f, err := os.OpenFile(s.getLogDirPath()+"backtrace.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, os.FileMode(0644))
+				if err != nil {
+					s.Log("Error opening backtrace.log: " + fmt.Sprint(err))
+				} else {
+					if _, err := f.Write(output); err != nil {
+						s.Log("Error writing backtrace.log: " + fmt.Sprint(err))
+					}
+					f.Close()
+				}
+				if RunningInCi {
 					err = os.Remove(corePath)
 					if err == nil {
 						s.Log("removed " + corePath)
@@ -524,14 +387,15 @@ func (s *HstSuite) WaitForCoreDump() bool {
 						s.Log(err)
 					}
 				}
-				return true
+				break
 			}
 		}
 	}
-	return false
+	return true
 }
 
 func (s *HstSuite) ResetContainers() {
+	s.CpuAllocator.lastCpu = 0
 	for _, container := range s.StartedContainers {
 		container.stop()
 		s.Log("Removing container " + container.Name)
@@ -573,15 +437,6 @@ func (s *HstSuite) LoadContainerTopology(topologyName string) {
 		Fail("unmarshal error: " + fmt.Sprint(err))
 	}
 
-	for _, elem := range yamlTopo.Volumes {
-		volumeMap := elem["volume"].(VolumeConfig)
-		hostDir := volumeMap["host-dir"].(string)
-		workingVolumeDir := logDir + s.GetCurrentTestName() + volumeDir
-		volDirReplacer := strings.NewReplacer("$HST_VOLUME_DIR", workingVolumeDir)
-		hostDir = volDirReplacer.Replace(hostDir)
-		s.Volumes = append(s.Volumes, hostDir)
-	}
-
 	s.AllContainers = make(map[string]*Container)
 	for _, elem := range yamlTopo.Containers {
 		newContainer, err := newContainer(s, elem)
@@ -612,10 +467,16 @@ func (s *HstSuite) LoadNetworkTopology(topologyName string) {
 		Fail("unmarshal error: " + fmt.Sprint(err))
 	}
 
+	s.Ip6AddrAllocator = NewIp6AddressAllocator()
 	s.Ip4AddrAllocator = NewIp4AddressAllocator()
 	s.NetInterfaces = make(map[string]*NetInterface)
 
 	for _, elem := range yamlTopo.Devices {
+		if _, ok := elem["ipv6"]; ok {
+			elem["ipv6"] = elem["ipv6"].(bool)
+		} else {
+			elem["ipv6"] = false
+		}
 		if _, ok := elem["name"]; ok {
 			elem["name"] = s.ProcessIndex + elem["name"].(string) + s.Ppid
 		}
@@ -651,12 +512,22 @@ func (s *HstSuite) LoadNetworkTopology(topologyName string) {
 			}
 		case Veth, Tap:
 			{
-				if netIf, err := newNetworkInterface(elem, s.Ip4AddrAllocator); err == nil {
-					s.NetConfigs = append(s.NetConfigs, netIf)
-					s.NetInterfaces[netIf.Name()] = netIf
+				if elem["ipv6"].(bool) {
+					if netIf, err := newNetworkInterface6(elem, s.Ip6AddrAllocator); err == nil {
+						s.NetConfigs = append(s.NetConfigs, netIf)
+						s.NetInterfaces[netIf.Name()] = netIf
+					} else {
+						Fail("network config error: " + fmt.Sprint(err))
+					}
 				} else {
-					Fail("network config error: " + fmt.Sprint(err))
+					if netIf, err := newNetworkInterface(elem, s.Ip4AddrAllocator); err == nil {
+						s.NetConfigs = append(s.NetConfigs, netIf)
+						s.NetInterfaces[netIf.Name()] = netIf
+					} else {
+						Fail("network config error: " + fmt.Sprint(err))
+					}
 				}
+
 			}
 		case Bridge:
 			{
@@ -706,7 +577,7 @@ func (s *HstSuite) GetTestId() string {
 	}
 
 	if _, ok := s.TestIds[testName]; !ok {
-		s.TestIds[testName] = time.Now().Format("2006-01-02_15-04-05")
+		s.TestIds[testName] = time.Now().Format("060102_150405")
 	}
 
 	return s.TestIds[testName]
@@ -721,8 +592,8 @@ func (s *HstSuite) GetCurrentSuiteName() string {
 }
 
 // Returns last 3 digits of PID + Ginkgo process index as the 4th digit. If the port is in the 'reservedPorts' slice,
-// increment port number by ten and check again.
-func (s *HstSuite) GetPortFromPpid() string {
+// increment port number by ten and check again. Generates a new port after each use.
+func (s *HstSuite) GeneratePort() string {
 	port := s.Ppid
 	var err error
 	var portInt int
@@ -730,13 +601,22 @@ func (s *HstSuite) GetPortFromPpid() string {
 		port += "0"
 	}
 	port = port[len(port)-3:] + s.ProcessIndex
+	port = strings.TrimLeft(port, "0")
 	for slices.Contains(reservedPorts, port) {
 		portInt, err = strconv.Atoi(port)
 		s.AssertNil(err)
 		portInt += 10
 		port = fmt.Sprintf("%d", portInt)
 	}
+	reservedPorts = append(reservedPorts, port)
+	s.numOfNewPorts++
 	return port
+}
+
+func (s *HstSuite) GeneratePortAsInt() uint16 {
+	port, err := strconv.Atoi(s.GeneratePort())
+	s.AssertNil(err)
+	return uint16(port)
 }
 
 /*

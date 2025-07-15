@@ -6,11 +6,13 @@ import (
 	"runtime"
 	"strings"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
 var noTopoTests = map[string][]func(s *NoTopoSuite){}
 var noTopoSoloTests = map[string][]func(s *NoTopoSuite){}
+var noTopoMWTests = map[string][]func(s *NoTopoSuite){}
 
 type NoTopoSuite struct {
 	HstSuite
@@ -26,14 +28,21 @@ type NoTopoSuite struct {
 		Curl        *Container
 		Ab          *Container
 	}
-	NginxServerPort string
+	Ports struct {
+		NginxServer string
+		NginxHttp3  string
+		Http        string
+	}
 }
 
 func RegisterNoTopoTests(tests ...func(s *NoTopoSuite)) {
-	noTopoTests[getTestFilename()] = tests
+	noTopoTests[GetTestFilename()] = tests
 }
 func RegisterNoTopoSoloTests(tests ...func(s *NoTopoSuite)) {
-	noTopoSoloTests[getTestFilename()] = tests
+	noTopoSoloTests[GetTestFilename()] = tests
+}
+func RegisterNoTopoMWTests(tests ...func(s *NoTopoSuite)) {
+	noTopoMWTests[GetTestFilename()] = tests
 }
 
 func (s *NoTopoSuite) SetupSuite() {
@@ -48,6 +57,9 @@ func (s *NoTopoSuite) SetupSuite() {
 	s.Containers.Wrk = s.GetContainerByName("wrk")
 	s.Containers.Curl = s.GetContainerByName("curl")
 	s.Containers.Ab = s.GetContainerByName("ab")
+	s.Ports.Http = s.GeneratePort()
+	s.Ports.NginxServer = s.GeneratePort()
+	s.Ports.NginxHttp3 = s.GeneratePort()
 }
 
 func (s *NoTopoSuite) SetupTest() {
@@ -70,7 +82,7 @@ func (s *NoTopoSuite) SetupTest() {
 	vpp, _ := s.Containers.Vpp.newVppInstance(s.Containers.Vpp.AllocatedCpus, sessionConfig)
 
 	s.AssertNil(vpp.Start())
-	s.AssertNil(vpp.CreateTap(s.Interfaces.Tap, 1, 1), "failed to create tap interface")
+	s.AssertNil(vpp.CreateTap(s.Interfaces.Tap, false, 1), "failed to create tap interface")
 
 	if *DryRun {
 		s.LogStartedContainers()
@@ -78,11 +90,11 @@ func (s *NoTopoSuite) SetupTest() {
 	}
 }
 
-func (s *NoTopoSuite) TearDownTest() {
+func (s *NoTopoSuite) TeardownTest() {
+	defer s.HstSuite.TeardownTest()
 	if CurrentSpecReport().Failed() {
 		s.CollectNginxLogs(s.Containers.NginxHttp3)
 	}
-	s.HstSuite.TearDownTest()
 }
 
 func (s *NoTopoSuite) CreateNginxConfig(container *Container, multiThreadWorkers bool) {
@@ -94,8 +106,10 @@ func (s *NoTopoSuite) CreateNginxConfig(container *Container, multiThreadWorkers
 	}
 	values := struct {
 		Workers uint8
+		Port    string
 	}{
 		Workers: workers,
+		Port:    s.Ports.NginxServer,
 	}
 	container.CreateConfigFromTemplate(
 		"/nginx.conf",
@@ -107,7 +121,6 @@ func (s *NoTopoSuite) CreateNginxConfig(container *Container, multiThreadWorkers
 // Creates container and config.
 func (s *NoTopoSuite) CreateNginxServer() {
 	s.AssertNil(s.Containers.NginxServer.Create())
-	s.NginxServerPort = s.GetPortFromPpid()
 	nginxSettings := struct {
 		LogPrefix string
 		Address   string
@@ -116,7 +129,7 @@ func (s *NoTopoSuite) CreateNginxServer() {
 	}{
 		LogPrefix: s.Containers.NginxServer.Name,
 		Address:   s.Interfaces.Tap.Ip4AddressString(),
-		Port:      s.NginxServerPort,
+		Port:      s.Ports.NginxServer,
 		Timeout:   600,
 	}
 	s.Containers.NginxServer.CreateConfigFromTemplate(
@@ -165,8 +178,12 @@ func (s *NoTopoSuite) HostAddr() string {
 func (s *NoTopoSuite) CreateNginxHttp3Config(container *Container) {
 	nginxSettings := struct {
 		LogPrefix string
+		Address   string
+		Port      string
 	}{
 		LogPrefix: container.Name,
+		Address:   s.VppAddr(),
+		Port:      s.Ports.NginxHttp3,
 	}
 	container.CreateConfigFromTemplate(
 		"/nginx.conf",
@@ -184,10 +201,10 @@ var _ = Describe("NoTopoSuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range noTopoTests {
@@ -213,10 +230,10 @@ var _ = Describe("NoTopoSuiteSolo", Ordered, ContinueOnFailure, Serial, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range noTopoSoloTests {
@@ -226,6 +243,35 @@ var _ = Describe("NoTopoSuiteSolo", Ordered, ContinueOnFailure, Serial, func() {
 			funcValue := runtime.FuncForPC(pc)
 			testName := filename + "/" + strings.Split(funcValue.Name(), ".")[2]
 			It(testName, Label("SOLO"), func(ctx SpecContext) {
+				s.Log(testName + ": BEGIN")
+				test(&s)
+			}, SpecTimeout(TestTimeout))
+		}
+	}
+})
+
+var _ = Describe("NoTopoMWSuite", Ordered, ContinueOnFailure, Serial, func() {
+	var s NoTopoSuite
+	BeforeAll(func() {
+		s.SetupSuite()
+	})
+	BeforeEach(func() {
+		s.SkipIfNotEnoguhCpus = true
+	})
+	AfterAll(func() {
+		s.TeardownSuite()
+	})
+	AfterEach(func() {
+		s.TeardownTest()
+	})
+
+	for filename, tests := range noTopoMWTests {
+		for _, test := range tests {
+			test := test
+			pc := reflect.ValueOf(test).Pointer()
+			funcValue := runtime.FuncForPC(pc)
+			testName := filename + "/" + strings.Split(funcValue.Name(), ".")[2]
+			It(testName, Label("SOLO", "VPP Multi-Worker"), func(ctx SpecContext) {
 				s.Log(testName + ": BEGIN")
 				test(&s)
 			}, SpecTimeout(TestTimeout))

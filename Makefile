@@ -61,7 +61,11 @@ GDB_ARGS= -ex "handle SIGUSR1 noprint nostop"
 # We allow Darwin (MacOS) for docs generation; VPP build will still fail.
 ifneq ($(shell uname),Darwin)
 OS_ID        = $(shell grep '^ID=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
+ifeq ($(OS_ID),rhel)
+OS_VERSION_ID= $(shell grep '^VERSION_ID=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g' | sed -e 's/\..*//')
+else
 OS_VERSION_ID= $(shell grep '^VERSION_ID=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
+endif
 OS_CODENAME  = $(shell grep '^VERSION_CODENAME=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
 endif
 
@@ -87,12 +91,12 @@ endif
 
 # +libganglia1-dev if building the gmond plugin
 
-DEB_DEPENDS  = curl build-essential autoconf automake ccache
-DEB_DEPENDS += debhelper dkms git libtool libapr1-dev dh-python
-DEB_DEPENDS += libconfuse-dev git-review exuberant-ctags cscope pkg-config
-DEB_DEPENDS += clang gcovr lcov chrpath autoconf libnuma-dev
+DEB_DEPENDS  = curl build-essential ccache
+DEB_DEPENDS += debhelper git dh-python
+DEB_DEPENDS += git-review exuberant-ctags cscope
+DEB_DEPENDS += clang gcovr lcov chrpath
 DEB_DEPENDS += python3-all python3-setuptools check
-DEB_DEPENDS += libffi-dev python3-ply libunwind-dev
+DEB_DEPENDS += python3-ply libunwind-dev
 DEB_DEPENDS += cmake ninja-build python3-jsonschema python3-yaml
 DEB_DEPENDS += python3-venv  # ensurepip
 DEB_DEPENDS += python3-dev python3-pip
@@ -102,11 +106,12 @@ DEB_DEPENDS += python3-virtualenv
 DEB_DEPENDS += libssl-dev
 DEB_DEPENDS += libelf-dev libpcap-dev # for libxdp (af_xdp)
 DEB_DEPENDS += iperf3 # for 'make test TEST=vcl'
-DEB_DEPENDS += nasm
 DEB_DEPENDS += iperf ethtool  # for 'make test TEST=vm_vpp_interfaces'
 DEB_DEPENDS += libpcap-dev
 DEB_DEPENDS += tshark
 DEB_DEPENDS += jq # for extracting test summary from .json report (hs-test)
+DEB_DEPENDS += libiberty-dev
+DEB_DEPENDS += nasm libnuma-dev # for make-ext-deps
 
 LIBFFI=libffi6 # works on all but 20.04 and debian-testing
 ifeq ($(OS_VERSION_ID),24.04)
@@ -124,41 +129,33 @@ else ifeq ($(OS_VERSION_ID),22.04)
 	# overwrite clang-format version to run `make checkstyle` successfully
 	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to 15
 	export CLANG_FORMAT_VER=15
-	LIBFFI=libffi7
 	DEB_DEPENDS += enchant-2  # for docs
 else ifeq ($(OS_VERSION_ID),20.04)
 	DEB_DEPENDS += python3-virtualenv
 	DEB_DEPENDS += libssl-dev
 	DEB_DEPENDS += clang clang-format-11
-	LIBFFI=libffi7
 	DEB_DEPENDS += enchant-2  # for docs
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-10)
 	DEB_DEPENDS += virtualenv
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-11)
 	DEB_DEPENDS += virtualenv
 	DEB_DEPENDS += clang clang-format-11
-	LIBFFI=libffi7
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-12)
 	DEB_DEPENDS += virtualenv
 	DEB_DEPENDS += clang-14 clang-format-15
 	# for extras/scripts/checkstyle.sh
 	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to -15
 	export CLANG_FORMAT_VER=15
-	LIBFFI=libffi8
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),debian-13)
 	DEB_DEPENDS += virtualenv
 	DEB_DEPENDS += clang-19 clang-format-19
 	# for extras/scripts/checkstyle.sh
 	# TODO: remove once ubuntu 20.04 is deprecated and extras/scripts/checkstyle.sh is upgraded to -15
 	export CLANG_FORMAT_VER=15
-	LIBFFI=libffi8
 else
 	DEB_DEPENDS += clang-11 clang-format-11
-	LIBFFI=libffi7
 	DEB_DEPENDS += enchant-2  # for docs
 endif
-
-DEB_DEPENDS += $(LIBFFI)
 
 RPM_DEPENDS  = glibc-static
 RPM_DEPENDS += apr-devel
@@ -209,6 +206,20 @@ else ifeq ($(OS_ID)-$(OS_VERSION_ID),centos-8)
 	RPM_DEPENDS += infiniband-diags libibumad
 	RPM_DEPENDS += libpcap-devel llvm-toolset
 	RPM_DEPENDS_GROUPS = 'Development Tools'
+else ifeq ($(OS_ID)-$(OS_VERSION_ID),rhel-8)
+	RPM_DEPENDS += yum-utils
+	RPM_DEPENDS += openssl-devel
+	RPM_DEPENDS += python3-ply # for vppapigen
+	RPM_DEPENDS += python36-devel
+	RPM_DEPENDS += python3-pip
+	RPM_DEPENDS += python3-virtualenv
+	RPM_DEPENDS += python3-jsonschema
+	RPM_DEPENDS += gcc-toolset-9
+	RPM_DEPENDS += gcc-toolset-9-libasan-devel
+	RPM_DEPENDS += cmake
+	RPM_DEPENDS += llvm-toolset
+	RPM_DEPENDS += infiniband-diags
+	RPM_DEPENDS += autoconf automake bison byacc libtool
 else ifeq ($(OS_ID)-$(OS_VERSION_ID),anolis-8)
 	RPM_DEPENDS += yum-utils
 	RPM_DEPENDS += compat-openssl10 openssl-devel
@@ -389,7 +400,7 @@ ifeq ($(filter ubuntu debian linuxmint,$(OS_ID)),$(OS_ID))
 	exit 0
 else ifneq ("$(wildcard /etc/redhat-release)","")
 	@for i in $(RPM_DEPENDS) ; do \
-	    RPM=$$(basename -s .rpm "$${i##*/}" | cut -d- -f1,2,3,4)  ;	\
+	    RPM=$$(basename -s .rpm "$${i##*/}")  ;	\
 	    MISSING+=$$(rpm -q $$RPM | grep "^package")	   ;    \
 	done							   ;	\
 	if [ -n "$$MISSING" ] ; then \
@@ -411,7 +422,11 @@ ifeq ($(filter ubuntu debian linuxmint,$(OS_ID)),$(OS_ID))
 	@sudo -E apt-get update
 	@sudo -E apt-get $(APT_ARGS) $(CONFIRM) $(FORCE) install $(DEB_DEPENDS)
 else ifneq ("$(wildcard /etc/redhat-release)","")
-ifeq ($(OS_ID),rhel)
+ifeq ($(OS_ID)-$(OS_VERSION_ID),rhel-8)
+	@sudo -E dnf install $(CONFIRM) https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+	@sudo -E dnf install $(CONFIRM) $(RPM_DEPENDS)
+	@sudo -E debuginfo-install $(CONFIRM) glibc openssl-libs zlib
+else ifeq ($(OS_ID)-$(OS_VERSION_ID),rhel-7)
 	@sudo -E yum-config-manager --enable rhel-server-rhscl-7-rpms
 	@sudo -E yum groupinstall $(CONFIRM) $(RPM_DEPENDS_GROUPS)
 	@sudo -E yum install $(CONFIRM) $(RPM_DEPENDS)
@@ -572,9 +587,9 @@ test-cov-post-standalone:
 test-cov-both:
 	@echo "Running Python, Golang tests and merging coverage reports."
 	find $(BR) -name '*.gcda' -delete
-	@$(MAKE) test-cov
+	-@$(MAKE) test-cov
 	find $(BR) -name '*.gcda' -delete
-	@$(MAKE) test-cov-hs
+	-@$(MAKE) test-cov-hs
 	@$(MAKE) cov-merge
 
 .PHONY: test-cov-build
@@ -599,6 +614,7 @@ cov-merge:
 		-a $(BR)/test-coverage-merged/coverage-filtered1.info -o $(BR)/test-coverage-merged/coverage-merged.info
 	@genhtml $(BR)/test-coverage-merged/coverage-merged.info \
 		--output-directory $(BR)/test-coverage-merged/html
+	-@rm -f $(BR)/test-coverage-merged/html/cmd_line
 	@echo "Code coverage report is in $(BR)/test-coverage-merged/html/index.html"
 
 .PHONY: test-all

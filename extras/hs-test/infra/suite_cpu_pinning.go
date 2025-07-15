@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
@@ -14,8 +15,7 @@ var cpuPinningSoloTests = map[string][]func(s *CpuPinningSuite){}
 
 type CpuPinningSuite struct {
 	HstSuite
-	previousMaxContainerCount int
-	Interfaces                struct {
+	Interfaces struct {
 		Tap *NetInterface
 	}
 	Containers struct {
@@ -24,11 +24,11 @@ type CpuPinningSuite struct {
 }
 
 func RegisterCpuPinningTests(tests ...func(s *CpuPinningSuite)) {
-	cpuPinningTests[getTestFilename()] = tests
+	cpuPinningTests[GetTestFilename()] = tests
 }
 
 func RegisterCpuPinningSoloTests(tests ...func(s *CpuPinningSuite)) {
-	cpuPinningSoloTests[getTestFilename()] = tests
+	cpuPinningSoloTests[GetTestFilename()] = tests
 }
 
 func (s *CpuPinningSuite) SetupSuite() {
@@ -41,10 +41,8 @@ func (s *CpuPinningSuite) SetupSuite() {
 
 func (s *CpuPinningSuite) SetupTest() {
 	// Skip if we cannot allocate 3 CPUs for test container
-	s.previousMaxContainerCount = s.CpuAllocator.maxContainerCount
-	s.CpuCount = 3
-	s.CpuAllocator.maxContainerCount = 1
-	s.SkipIfNotEnoughAvailableCpus()
+	s.CpusPerVppContainer = 3
+	s.SkipIfNotEnoguhCpus = true
 
 	s.HstSuite.SetupTest()
 	vpp, err := s.Containers.Vpp.newVppInstance(s.Containers.Vpp.AllocatedCpus)
@@ -56,12 +54,10 @@ func (s *CpuPinningSuite) SetupTest() {
 	}
 }
 
-func (s *CpuPinningSuite) TearDownTest() {
+func (s *CpuPinningSuite) TeardownTest() {
+	defer s.HstSuite.TeardownTest()
 	// reset vars
-	s.CpuCount = *NConfiguredCpus
-	s.CpuAllocator.maxContainerCount = s.previousMaxContainerCount
-	s.HstSuite.TearDownTest()
-
+	s.CpusPerContainer = *NConfiguredCpus
 }
 
 var _ = Describe("CpuPinningSuite", Ordered, ContinueOnFailure, func() {
@@ -73,11 +69,11 @@ var _ = Describe("CpuPinningSuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	// https://onsi.github.io/ginkgo/#dynamically-generating-specs
@@ -104,10 +100,10 @@ var _ = Describe("CpuPinningSuiteSolo", Ordered, ContinueOnFailure, Serial, func
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range cpuPinningSoloTests {

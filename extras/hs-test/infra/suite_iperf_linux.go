@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
@@ -19,16 +20,19 @@ type IperfSuite struct {
 		Server *Container
 		Client *Container
 	}
+	Ports struct {
+		Port1 string
+	}
 }
 
 var iperfTests = map[string][]func(s *IperfSuite){}
 var iperfSoloTests = map[string][]func(s *IperfSuite){}
 
 func RegisterIperfTests(tests ...func(s *IperfSuite)) {
-	iperfTests[getTestFilename()] = tests
+	iperfTests[GetTestFilename()] = tests
 }
 func RegisterIperfSoloTests(tests ...func(s *IperfSuite)) {
-	iperfSoloTests[getTestFilename()] = tests
+	iperfSoloTests[GetTestFilename()] = tests
 }
 
 func (s *IperfSuite) SetupSuite() {
@@ -40,6 +44,7 @@ func (s *IperfSuite) SetupSuite() {
 	s.Interfaces.Server = s.GetInterfaceByName("hstsrv")
 	s.Containers.Server = s.GetContainerByName("server")
 	s.Containers.Client = s.GetContainerByName("client")
+	s.Ports.Port1 = s.GeneratePort()
 }
 
 var _ = Describe("IperfSuite", Ordered, ContinueOnFailure, func() {
@@ -51,10 +56,10 @@ var _ = Describe("IperfSuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range iperfTests {
@@ -80,10 +85,10 @@ var _ = Describe("IperfSuiteSolo", Ordered, ContinueOnFailure, Serial, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range iperfSoloTests {

@@ -16,6 +16,7 @@ tc_names=()
 skip_names=()
 dryrun=
 no_color=
+perf=
 
 for i in "$@"
 do
@@ -63,6 +64,9 @@ case "${i}" in
     --cpus=*)
         args="$args -cpus ${i#*=}"
         ;;
+    --vpp_cpus=*)
+        args="$args -vpp_cpus ${i#*=}"
+        ;;
     --vppsrc=*)
         args="$args -vppsrc ${i#*=}"
         ;;
@@ -81,6 +85,9 @@ case "${i}" in
         ;;
     --parallel=*)
         ginkgo_args="$ginkgo_args -procs=${i#*=}"
+        ;;
+    --ginkgo_timeout=*)
+        ginkgo_args="$ginkgo_args --timeout=${i#*=}"
         ;;
     --repeat=*)
         ginkgo_args="$ginkgo_args --repeat=${i#*=}"
@@ -111,8 +118,21 @@ case "${i}" in
             ginkgo_args="$ginkgo_args --no-color"
         fi
         ;;
+    --perf=*)
+        perf="${i#*=}"
+        args="$args -perf"
+        ;;
+    --timeout=*)
+        args="$args -timeout ${i#*=}"
+        ;;
 esac
 done
+
+if [ "$perf" = "true" ]; then
+    ginkgo_args="$ginkgo_args --label-filter=Perf"
+else
+    ginkgo_args="$ginkgo_args --label-filter=!Perf"
+fi
 
 if [ ${#tc_names[@]} -gt 1 ]
 then
@@ -147,14 +167,19 @@ if [ $focused_test -eq 0 ] && [ $debug_set -eq 1 ]; then
     exit 2
 fi
 
+sudo_user="${SUDO_USER:-${USER:-root}}"
+args="$args -sudo_user $sudo_user"
+
 if [ $leak_check_set -eq 1 ]; then
   if [ $focused_test -eq 0 ]; then
-    echo -e "\e[1;31ma single test has to be specified when leak_check is set\e[1;0m"
+    echo -e "\e[1;31ma single test has to be specified via TEST var when leak_check is set\e[1;0m"
     exit 2
+  else
+    if [[ $tc_list != *"MemLeak"* ]]; then
+        echo -e "\e[1;31ma none of the selected tests are memleak tests\e[1;0m"
+        exit 2
+    fi
   fi
-  ginkgo_args="--focus ${tc_names[0]}"
-  sudo -E go run github.com/onsi/ginkgo/v2/ginkgo $ginkgo_args -- $args
-  exit 0
 fi
 
 if [ -n "${BUILD_NUMBER}" ]; then
@@ -163,7 +188,9 @@ fi
 
 mkdir -p summary
 # shellcheck disable=SC2086
-sudo -E go run github.com/onsi/ginkgo/v2/ginkgo --json-report=summary/report.json $ginkgo_args -- $args
+CMD="sudo -E go run github.com/onsi/ginkgo/v2/ginkgo --json-report=summary/report.json $ginkgo_args -- $args"
+echo "$CMD"
+$CMD
 exit_status=$?
 
 if [ -e "summary/failed-summary.log" ]; then
@@ -179,9 +206,8 @@ Suite:
 Message:\n"
 + (
     if .ReportEntries? then
-        (.ReportEntries[] | select(.Name == "VPP Backtrace") |
-        "\tVPP crashed
-Full Back Trace:
+        (.ReportEntries[] | select(.Name | contains("Backtrace")) |
+        "\tFull Back Trace:
 \(.Value.Representation | ltrimstr("{{red}}") | rtrimstr("{{/}}"))"
         ) // "\(.Failure.Message)"
     else

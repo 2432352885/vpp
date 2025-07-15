@@ -4,10 +4,10 @@
 
 #include <vppinfra/error.h>
 #include <vppinfra/ring.h>
-#include <http/http.h>
 #include <http/http2/hpack.h>
 #include <http/http2/huffman_table.h>
 #include <http/http_status_codes.h>
+#include <http/http_private.h>
 
 #define HPACK_STATIC_TABLE_SIZE 61
 
@@ -101,6 +101,14 @@ static hpack_token_t hpack_headers[] = {
 #undef _
 };
 
+static http_token_t http_methods[] = {
+#define _(s, str) { http_token_lit (str) },
+  foreach_http_method
+#undef _
+};
+
+#define http_method_token(e) http_methods[e].base, http_methods[e].len
+
 __clib_export uword
 hpack_decode_int (u8 **src, u8 *end, u8 prefix_len)
 {
@@ -193,6 +201,8 @@ hpack_decode_huffman (u8 **src, u8 *end, u8 **buf, uword *buf_len)
 	  /* trim code to correct length */
 	  u32 code = (accumulator >> (accumulator_len - hg->code_len)) &
 		     ((1 << hg->code_len) - 1);
+	  if (!code)
+	    return HTTP2_ERROR_COMPRESSION_ERROR;
 	  /* find symbol in the list */
 	  **buf = hg->symbols[code - hg->first_code];
 	  (*buf)++;
@@ -241,7 +251,8 @@ hpack_decode_string (u8 **src, u8 *end, u8 **buf, uword *buf_len)
   u8 *p, is_huffman;
   uword len;
 
-  ASSERT (*src < end);
+  if (*src == end)
+    return HTTP2_ERROR_COMPRESSION_ERROR;
 
   p = *src;
   /* H flag in first bit */
@@ -508,11 +519,6 @@ hpack_get_table_entry (uword index, http_token_t *name, http_token_t *value,
       name->len = e->name_len;
       if (value_is_indexed)
 	{
-	  if (PREDICT_FALSE (e->value_len == 0))
-	    {
-	      HTTP_DBG (1, "static table entry [%llu] without value", index);
-	      return HTTP2_ERROR_COMPRESSION_ERROR;
-	    }
 	  value->base = e->value;
 	  value->len = e->value_len;
 	}
@@ -706,6 +712,9 @@ hpack_header_value_is_valid (u8 *value, u32 value_len)
     0xffffffffffffffff,
   };
 
+  if (value_len == 0)
+    return 1;
+
   /* must not start or end with SP or HTAB */
   if ((value[0] == 0x20 || value[0] == 0x09 || value[value_len - 1] == 0x20 ||
        value[value_len - 1] == 0x09))
@@ -763,6 +772,30 @@ hpack_parse_scheme (u8 *value, u32 value_len)
   return HTTP_URL_SCHEME_UNKNOWN;
 }
 
+static inline int
+hpack_parse_status_code (u8 *value, u32 value_len, http_status_code_t *sc)
+{
+  u16 status_code = 0;
+  u8 *p;
+
+  if (value_len != 3)
+    return HTTP2_ERROR_PROTOCOL_ERROR;
+
+  p = value;
+  parse_int (status_code, 100);
+  parse_int (status_code, 10);
+  parse_int (status_code, 1);
+  if (status_code < 100 || status_code > 599)
+    {
+      HTTP_DBG (1, "invalid status code %d", status_code);
+      return -1;
+    }
+  HTTP_DBG (1, "status code: %d", status_code);
+  *sc = http_sc_by_u16 (status_code);
+
+  return 0;
+}
+
 static http2_error_t
 hpack_parse_req_pseudo_header (u8 *name, u32 name_len, u8 *value,
 			       u32 value_len,
@@ -775,7 +808,8 @@ hpack_parse_req_pseudo_header (u8 *name, u32 name_len, u8 *value,
     case 5:
       if (!memcmp (name + 1, "path", 4))
 	{
-	  if (control_data->parsed_bitmap & HPACK_PSEUDO_HEADER_PATH_PARSED)
+	  if (control_data->parsed_bitmap & HPACK_PSEUDO_HEADER_PATH_PARSED ||
+	      value_len == 0)
 	    return HTTP2_ERROR_PROTOCOL_ERROR;
 	  control_data->parsed_bitmap |= HPACK_PSEUDO_HEADER_PATH_PARSED;
 	  control_data->path = value;
@@ -812,6 +846,18 @@ hpack_parse_req_pseudo_header (u8 *name, u32 name_len, u8 *value,
 	  return HTTP2_ERROR_PROTOCOL_ERROR;
 	}
       break;
+    case 9:
+      if (!memcmp (name + 1, "protocol", 8))
+	{
+	  if (control_data->parsed_bitmap &
+	      HPACK_PSEUDO_HEADER_PROTOCOL_PARSED)
+	    return HTTP2_ERROR_PROTOCOL_ERROR;
+	  control_data->parsed_bitmap |= HPACK_PSEUDO_HEADER_PROTOCOL_PARSED;
+	  control_data->protocol = value;
+	  control_data->protocol_len = value_len;
+	  break;
+	}
+      break;
     case 10:
       if (!memcmp (name + 1, "authority", 9))
 	{
@@ -828,6 +874,91 @@ hpack_parse_req_pseudo_header (u8 *name, u32 name_len, u8 *value,
       return HTTP2_ERROR_PROTOCOL_ERROR;
     }
 
+  return HTTP2_ERROR_NO_ERROR;
+}
+
+static http2_error_t
+hpack_parse_resp_pseudo_header (u8 *name, u32 name_len, u8 *value,
+				u32 value_len,
+				hpack_response_control_data_t *control_data)
+{
+  HTTP_DBG (2, "%U: %U", format_http_bytes, name, name_len, format_http_bytes,
+	    value, value_len);
+  switch (name_len)
+    {
+    case 7:
+      if (!memcmp (name + 1, "status", 6))
+	{
+	  if (control_data->parsed_bitmap & HPACK_PSEUDO_HEADER_STATUS_PARSED)
+	    return HTTP2_ERROR_PROTOCOL_ERROR;
+	  control_data->parsed_bitmap |= HPACK_PSEUDO_HEADER_STATUS_PARSED;
+	  if (hpack_parse_status_code (value, value_len, &control_data->sc))
+	    return HTTP2_ERROR_PROTOCOL_ERROR;
+	}
+      break;
+    default:
+      return HTTP2_ERROR_PROTOCOL_ERROR;
+    }
+
+  return HTTP2_ERROR_NO_ERROR;
+}
+
+/* Special treatment for headers like:
+ *
+ * RFC9113 8.2.2: any message containing connection-specific header
+ * fields MUST be treated as malformed (connection, upgrade, keep-alive,
+ * proxy-connection, transfer-encoding), TE header MUST NOT contain any value
+ * other than "trailers"
+ *
+ * find headers that will be used later in preprocessing (content-length)
+ */
+always_inline http2_error_t
+hpack_preprocess_header (u8 *name, u32 name_len, u8 *value, u32 value_len,
+			 uword index, uword *content_len_header_index)
+{
+  switch (name_len)
+    {
+    case 2:
+      if (name[0] == 't' && name[1] == 'e' &&
+	  !http_token_is_case ((const char *) value, value_len,
+			       http_token_lit ("trailers")))
+	return HTTP2_ERROR_PROTOCOL_ERROR;
+      break;
+    case 7:
+      if (!memcmp (name, "upgrade", 7))
+	return HTTP2_ERROR_PROTOCOL_ERROR;
+      break;
+    case 10:
+      switch (name[0])
+	{
+	case 'c':
+	  if (!memcmp (name + 1, "onnection", 9))
+	    return HTTP2_ERROR_PROTOCOL_ERROR;
+	  break;
+	case 'k':
+	  if (!memcmp (name + 1, "eep-alive", 9))
+	    return HTTP2_ERROR_PROTOCOL_ERROR;
+	  break;
+	default:
+	  break;
+	}
+      break;
+    case 14:
+      if (!memcmp (name, "content-length", 14) &&
+	  *content_len_header_index == ~0)
+	*content_len_header_index = index;
+      break;
+    case 16:
+      if (!memcmp (name, "proxy-connection", 16))
+	return HTTP2_ERROR_PROTOCOL_ERROR;
+      break;
+    case 17:
+      if (!memcmp (name, "transfer-encoding", 17))
+	return HTTP2_ERROR_PROTOCOL_ERROR;
+      break;
+    default:
+      break;
+    }
   return HTTP2_ERROR_NO_ERROR;
 }
 
@@ -850,6 +981,7 @@ hpack_parse_request (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
   b_left = dst_len;
   control_data->parsed_bitmap = 0;
   control_data->headers_len = 0;
+  control_data->content_len_header_index = ~0;
 
   while (p != end)
     {
@@ -903,8 +1035,109 @@ hpack_parse_request (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
       header->value_len = value_len;
       control_data->headers_len += name_len;
       control_data->headers_len += value_len;
+      if (regular_header_parsed)
+	{
+	  rv = hpack_preprocess_header (
+	    name, name_len, value, value_len, header - *headers,
+	    &control_data->content_len_header_index);
+	  if (rv != HTTP2_ERROR_NO_ERROR)
+	    {
+	      HTTP_DBG (1, "connection-specific header present");
+	      return rv;
+	    }
+	}
     }
+  control_data->control_data_len = dst_len - b_left;
+  HTTP_DBG (2, "%U", format_hpack_dynamic_table, dynamic_table);
+  return HTTP2_ERROR_NO_ERROR;
+}
 
+__clib_export http2_error_t
+hpack_parse_response (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
+		      hpack_response_control_data_t *control_data,
+		      http_field_line_t **headers,
+		      hpack_dynamic_table_t *dynamic_table)
+{
+  u8 *p, *end, *b, *name, *value;
+  u8 regular_header_parsed = 0;
+  u32 name_len, value_len;
+  uword b_left;
+  http_field_line_t *header;
+  http2_error_t rv;
+
+  p = src;
+  end = src + src_len;
+  b = dst;
+  b_left = dst_len;
+  control_data->parsed_bitmap = 0;
+  control_data->headers_len = 0;
+  control_data->content_len_header_index = ~0;
+
+  while (p != end)
+    {
+      name = b;
+      rv = hpack_decode_header (&p, end, &b, &b_left, &name_len, &value_len,
+				dynamic_table);
+      if (rv != HTTP2_ERROR_NO_ERROR)
+	{
+	  HTTP_DBG (1, "hpack_decode_header: %U", format_http2_error, rv);
+	  return rv;
+	}
+      value = name + name_len;
+
+      /* pseudo header */
+      if (name[0] == ':')
+	{
+	  /* all pseudo-headers must be before regular headers */
+	  if (regular_header_parsed)
+	    {
+	      HTTP_DBG (1, "pseudo-headers after regular header");
+	      return HTTP2_ERROR_PROTOCOL_ERROR;
+	    }
+	  rv = hpack_parse_resp_pseudo_header (name, name_len, value,
+					       value_len, control_data);
+	  if (rv != HTTP2_ERROR_NO_ERROR)
+	    {
+	      HTTP_DBG (1, "hpack_parse_resp_pseudo_header: %U",
+			format_http2_error, rv);
+	      return rv;
+	    }
+	  continue;
+	}
+      else
+	{
+	  if (!hpack_header_name_is_valid (name, name_len))
+	    return HTTP2_ERROR_PROTOCOL_ERROR;
+	  if (!regular_header_parsed)
+	    {
+	      regular_header_parsed = 1;
+	      control_data->headers = name;
+	    }
+	}
+      if (!hpack_header_value_is_valid (value, value_len))
+	return HTTP2_ERROR_PROTOCOL_ERROR;
+      vec_add2 (*headers, header, 1);
+      HTTP_DBG (2, "%U: %U", format_http_bytes, name, name_len,
+		format_http_bytes, value, value_len);
+      header->name_offset = name - control_data->headers;
+      header->name_len = name_len;
+      header->value_offset = value - control_data->headers;
+      header->value_len = value_len;
+      control_data->headers_len += name_len;
+      control_data->headers_len += value_len;
+      if (regular_header_parsed)
+	{
+	  rv = hpack_preprocess_header (
+	    name, name_len, value, value_len, header - *headers,
+	    &control_data->content_len_header_index);
+	  if (rv != HTTP2_ERROR_NO_ERROR)
+	    {
+	      HTTP_DBG (1, "connection-specific header present");
+	      return rv;
+	    }
+	}
+    }
+  control_data->control_data_len = dst_len - b_left;
   HTTP_DBG (2, "%U", format_hpack_dynamic_table, dynamic_table);
   return HTTP2_ERROR_NO_ERROR;
 }
@@ -966,38 +1199,38 @@ hpack_encode_custom_header (u8 *dst, const u8 *name, u32 name_len,
   return dst;
 }
 
+#define encode_indexed_static_entry(_index)                                   \
+  vec_add2 (dst, a, 1);                                                       \
+  *a++ = 0x80 | _index;
+
 static inline u8 *
 hpack_encode_status_code (u8 *dst, http_status_code_t sc)
 {
   u32 orig_len, actual_size;
   u8 *a, *b;
 
-#define encode_common_sc(_index)                                              \
-  vec_add2 (dst, a, 1);                                                       \
-  *a++ = 0x80 | _index;
-
   switch (sc)
     {
     case HTTP_STATUS_OK:
-      encode_common_sc (8);
+      encode_indexed_static_entry (8);
       break;
     case HTTP_STATUS_NO_CONTENT:
-      encode_common_sc (9);
+      encode_indexed_static_entry (9);
       break;
     case HTTP_STATUS_PARTIAL_CONTENT:
-      encode_common_sc (10);
+      encode_indexed_static_entry (10);
       break;
     case HTTP_STATUS_NOT_MODIFIED:
-      encode_common_sc (11);
+      encode_indexed_static_entry (11);
       break;
     case HTTP_STATUS_BAD_REQUEST:
-      encode_common_sc (12);
+      encode_indexed_static_entry (12);
       break;
     case HTTP_STATUS_NOT_FOUND:
-      encode_common_sc (13);
+      encode_indexed_static_entry (13);
       break;
     case HTTP_STATUS_INTERNAL_ERROR:
-      encode_common_sc (14);
+      encode_indexed_static_entry (14);
       break;
     default:
       orig_len = vec_len (dst);
@@ -1010,6 +1243,110 @@ hpack_encode_status_code (u8 *dst, http_status_code_t sc)
       vec_set_len (dst, orig_len + actual_size);
       break;
     }
+  return dst;
+}
+
+static inline u8 *
+hpack_encode_method (u8 *dst, http_req_method_t method)
+{
+  u32 orig_len, actual_size;
+  u8 *a, *b;
+
+  switch (method)
+    {
+    case HTTP_REQ_GET:
+      encode_indexed_static_entry (2);
+      break;
+    case HTTP_REQ_POST:
+      encode_indexed_static_entry (3);
+      break;
+    default:
+      orig_len = vec_len (dst);
+      vec_add2 (dst, a, 9);
+      b = a;
+      /* Literal Header Field without Indexing — Indexed Name */
+      *b++ = 2;
+      b = hpack_encode_string (b, (const u8 *) http_method_token (method));
+      actual_size = b - a;
+      vec_set_len (dst, orig_len + actual_size);
+      break;
+    }
+  return dst;
+}
+
+static inline u8 *
+hpack_encode_scheme (u8 *dst, http_url_scheme_t scheme)
+{
+  u8 *a;
+
+  switch (scheme)
+    {
+    case HTTP_URL_SCHEME_HTTP:
+      encode_indexed_static_entry (6);
+      break;
+    case HTTP_URL_SCHEME_HTTPS:
+      encode_indexed_static_entry (7);
+      break;
+    default:
+      ASSERT (0);
+      break;
+    }
+  return dst;
+}
+
+static inline u8 *
+hpack_encode_path (u8 *dst, u8 *path, u32 path_len)
+{
+  u32 orig_len, actual_size;
+  u8 *a, *b;
+
+  switch (path_len)
+    {
+    case 1:
+      if (path[0] == '/')
+	{
+	  encode_indexed_static_entry (4);
+	  return dst;
+	}
+      break;
+    case 11:
+      if (!memcmp (path, "/index.html", 11))
+	{
+	  encode_indexed_static_entry (5);
+	  return dst;
+	}
+      break;
+    default:
+      break;
+    }
+
+  orig_len = vec_len (dst);
+  vec_add2 (dst, a, path_len + 2);
+  b = a;
+  /* Literal Header Field without Indexing — Indexed Name */
+  *b++ = 4;
+  b = hpack_encode_string (b, path, path_len);
+  actual_size = b - a;
+  vec_set_len (dst, orig_len + actual_size);
+
+  return dst;
+}
+
+static inline u8 *
+hpack_encode_authority (u8 *dst, u8 *authority, u32 authority_len)
+{
+  u32 orig_len, actual_size;
+  u8 *a, *b;
+
+  orig_len = vec_len (dst);
+  vec_add2 (dst, a, authority_len + 2);
+  b = a;
+  /* Literal Header Field without Indexing — Indexed Name */
+  *b++ = 1;
+  b = hpack_encode_string (b, authority, authority_len);
+  actual_size = b - a;
+  vec_set_len (dst, orig_len + actual_size);
+
   return dst;
 }
 
@@ -1070,6 +1407,65 @@ hpack_serialize_response (u8 *app_headers, u32 app_headers_len,
       *dst = p;
       return;
     }
+
+  end = app_headers + app_headers_len;
+  while (app_headers < end)
+    {
+      /* custom header name? */
+      u32 *tmp = (u32 *) app_headers;
+      if (PREDICT_FALSE (*tmp & HTTP_CUSTOM_HEADER_NAME_BIT))
+	{
+	  http_custom_token_t *name, *value;
+	  name = (http_custom_token_t *) app_headers;
+	  u32 name_len = name->len & ~HTTP_CUSTOM_HEADER_NAME_BIT;
+	  app_headers += sizeof (http_custom_token_t) + name_len;
+	  value = (http_custom_token_t *) app_headers;
+	  app_headers += sizeof (http_custom_token_t) + value->len;
+	  p = hpack_encode_custom_header (p, name->token, name_len,
+					  value->token, value->len);
+	}
+      else
+	{
+	  http_app_header_t *header;
+	  header = (http_app_header_t *) app_headers;
+	  app_headers += sizeof (http_app_header_t) + header->value.len;
+	  p = hpack_encode_header (p, header->name, header->value.token,
+				   header->value.len);
+	}
+    }
+
+  *dst = p;
+}
+
+__clib_export void
+hpack_serialize_request (u8 *app_headers, u32 app_headers_len,
+			 hpack_request_control_data_t *control_data, u8 **dst)
+{
+  u8 *p, *end;
+
+  p = *dst;
+
+  /* pseudo-headers must go first */
+  p = hpack_encode_method (p, control_data->method);
+
+  if (control_data->parsed_bitmap & HPACK_PSEUDO_HEADER_SCHEME_PARSED)
+    p = hpack_encode_scheme (p, control_data->scheme);
+
+  if (control_data->parsed_bitmap & HPACK_PSEUDO_HEADER_PATH_PARSED)
+    p = hpack_encode_path (p, control_data->path, control_data->path_len);
+
+  p = hpack_encode_authority (p, control_data->authority,
+			      control_data->authority_len);
+
+  /* user agent */
+  if (control_data->user_agent_len)
+    p =
+      hpack_encode_header (p, HTTP_HEADER_USER_AGENT, control_data->user_agent,
+			   control_data->user_agent_len);
+
+  /* content length if any */
+  if (control_data->content_len != HPACK_ENCODER_SKIP_CONTENT_LEN)
+    p = hpack_encode_content_len (p, control_data->content_len);
 
   end = app_headers + app_headers_len;
   while (app_headers < end)

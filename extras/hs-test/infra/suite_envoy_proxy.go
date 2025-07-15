@@ -12,13 +12,12 @@ import (
 	"strings"
 	"time"
 
+	. "fd.io/hs-test/infra/common"
 	. "github.com/onsi/ginkgo/v2"
 )
 
 type EnvoyProxySuite struct {
 	HstSuite
-	nginxPort  uint16
-	proxyPort  uint16
 	maxTimeout int
 	Interfaces struct {
 		Server *NetInterface
@@ -30,17 +29,22 @@ type EnvoyProxySuite struct {
 		Vpp                  *Container
 		Curl                 *Container
 	}
+	Ports struct {
+		Nginx      uint16
+		Proxy      uint16
+		EnvoyAdmin uint16
+	}
 }
 
 var envoyProxyTests = map[string][]func(s *EnvoyProxySuite){}
 var envoyProxySoloTests = map[string][]func(s *EnvoyProxySuite){}
 
 func RegisterEnvoyProxyTests(tests ...func(s *EnvoyProxySuite)) {
-	envoyProxyTests[getTestFilename()] = tests
+	envoyProxyTests[GetTestFilename()] = tests
 }
 
 func RegisterEnvoyProxySoloTests(tests ...func(s *EnvoyProxySuite)) {
-	envoyProxySoloTests[getTestFilename()] = tests
+	envoyProxySoloTests[GetTestFilename()] = tests
 }
 
 func (s *EnvoyProxySuite) SetupSuite() {
@@ -59,6 +63,9 @@ func (s *EnvoyProxySuite) SetupSuite() {
 	s.Containers.Vpp = s.GetContainerByName("vpp")
 	s.Containers.EnvoyProxy = s.GetContainerByName("envoy-vcl")
 	s.Containers.Curl = s.GetContainerByName("curl")
+	s.Ports.Nginx = s.GeneratePortAsInt()
+	s.Ports.Proxy = s.GeneratePortAsInt()
+	s.Ports.EnvoyAdmin = s.GeneratePortAsInt()
 }
 
 func (s *EnvoyProxySuite) SetupTest() {
@@ -78,7 +85,6 @@ func (s *EnvoyProxySuite) SetupTest() {
 
 	// nginx HTTP server
 	s.AssertNil(s.Containers.NginxServerTransient.Create())
-	s.nginxPort = 80
 	nginxSettings := struct {
 		LogPrefix string
 		Address   string
@@ -87,7 +93,7 @@ func (s *EnvoyProxySuite) SetupTest() {
 	}{
 		LogPrefix: s.Containers.NginxServerTransient.Name,
 		Address:   s.Interfaces.Server.Ip4AddressString(),
-		Port:      s.nginxPort,
+		Port:      s.Ports.Nginx,
 		Timeout:   s.maxTimeout,
 	}
 	s.Containers.NginxServerTransient.CreateConfigFromTemplate(
@@ -99,17 +105,20 @@ func (s *EnvoyProxySuite) SetupTest() {
 	// Envoy
 	s.AssertNil(s.Containers.EnvoyProxy.Create())
 
-	s.proxyPort = 8080
 	envoySettings := struct {
-		LogPrefix     string
-		ServerAddress string
-		ServerPort    uint16
-		ProxyPort     uint16
+		LogPrefix      string
+		ServerAddress  string
+		ServerPort     uint16
+		ProxyPort      uint16
+		ProxyAddr      string
+		EnvoyAdminPort uint16
 	}{
-		LogPrefix:     s.Containers.EnvoyProxy.Name,
-		ServerAddress: s.Interfaces.Server.Ip4AddressString(),
-		ServerPort:    s.nginxPort,
-		ProxyPort:     s.proxyPort,
+		LogPrefix:      s.Containers.EnvoyProxy.Name,
+		ServerAddress:  s.Interfaces.Server.Ip4AddressString(),
+		ServerPort:     s.Ports.Nginx,
+		ProxyPort:      s.Ports.Proxy,
+		ProxyAddr:      s.ProxyAddr(),
+		EnvoyAdminPort: s.Ports.EnvoyAdmin,
 	}
 	s.Containers.EnvoyProxy.CreateConfigFromTemplate(
 		"/etc/envoy/envoy.yaml",
@@ -120,8 +129,8 @@ func (s *EnvoyProxySuite) SetupTest() {
 	s.AssertNil(vpp.Start())
 	// wait for VPP to start
 	time.Sleep(time.Second * 1)
-	s.AssertNil(vpp.CreateTap(s.Interfaces.Client, 1, 1))
-	s.AssertNil(vpp.CreateTap(s.Interfaces.Server, 1, 2))
+	s.AssertNil(vpp.CreateTap(s.Interfaces.Client, false, 1))
+	s.AssertNil(vpp.CreateTap(s.Interfaces.Server, false, 2))
 	s.Containers.Vpp.Exec(false, "chmod 777 -R %s", s.Containers.Vpp.GetContainerWorkDir())
 
 	// Add Ipv4 ARP entry for nginx HTTP server, otherwise first request fail (HTTP error 503)
@@ -133,25 +142,23 @@ func (s *EnvoyProxySuite) SetupTest() {
 	if *DryRun {
 		vpp.AppendToCliConfig(arp)
 		s.LogStartedContainers()
-		s.Log("%s* Proxy IP used in tests: %s:%d%s", Colors.pur, s.ProxyAddr(), s.ProxyPort(), Colors.rst)
+		s.Log("%s* Proxy IP used in tests: %s:%d%s", Colors.pur, s.ProxyAddr(), s.Ports.Proxy, Colors.rst)
 		s.Skip("Dry run mode = true")
 	}
 
 	s.Containers.Vpp.VppInstance.Vppctl(arp)
 	s.AssertNil(s.Containers.NginxServerTransient.Start())
 	s.AssertNil(s.Containers.EnvoyProxy.Start())
+	// give envoy some time to start
+	time.Sleep(time.Second * 2)
 }
 
-func (s *EnvoyProxySuite) TearDownTest() {
+func (s *EnvoyProxySuite) TeardownTest() {
+	defer s.HstSuite.TeardownTest()
 	if CurrentSpecReport().Failed() {
 		s.CollectNginxLogs(s.Containers.NginxServerTransient)
 		s.CollectEnvoyLogs(s.Containers.EnvoyProxy)
 	}
-	s.HstSuite.TearDownTest()
-}
-
-func (s *EnvoyProxySuite) ProxyPort() uint16 {
-	return s.proxyPort
 }
 
 func (s *EnvoyProxySuite) ProxyAddr() string {
@@ -182,10 +189,10 @@ var _ = Describe("EnvoyProxySuite", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range envoyProxyTests {
@@ -211,10 +218,10 @@ var _ = Describe("EnvoyProxySuiteSolo", Ordered, ContinueOnFailure, func() {
 		s.SetupTest()
 	})
 	AfterAll(func() {
-		s.TearDownSuite()
+		s.TeardownSuite()
 	})
 	AfterEach(func() {
-		s.TearDownTest()
+		s.TeardownTest()
 	})
 
 	for filename, tests := range envoyProxySoloTests {

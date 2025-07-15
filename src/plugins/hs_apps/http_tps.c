@@ -25,7 +25,7 @@ typedef struct
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   u32 session_index;
-  u32 thread_index;
+  clib_thread_index_t thread_index;
   u64 data_len;
   u64 data_offset;
   u32 vpp_session_index;
@@ -73,12 +73,13 @@ typedef struct hs_main_
   u8 no_zc;
   u8 *default_uri;
   u32 seed;
+  u8 *test_header_value;
 } hts_main_t;
 
 static hts_main_t hts_main;
 
 static hts_session_t *
-hts_session_alloc (u32 thread_index)
+hts_session_alloc (clib_thread_index_t thread_index)
 {
   hts_main_t *htm = &hts_main;
   hts_session_t *hs;
@@ -92,7 +93,7 @@ hts_session_alloc (u32 thread_index)
 }
 
 static hts_session_t *
-hts_session_get (u32 thread_index, u32 hts_index)
+hts_session_get (clib_thread_index_t thread_index, u32 hts_index)
 {
   hts_main_t *htm = &hts_main;
 
@@ -345,6 +346,11 @@ hts_session_rx_body (hts_session_t *hs, session_t *ts)
       ASSERT (rv == n_deq);
     }
   hs->left_recv -= n_deq;
+  if (svm_fifo_needs_deq_ntf (ts->rx_fifo, n_deq))
+    {
+      svm_fifo_clear_deq_ntf (ts->rx_fifo);
+      session_program_transport_io_evt (ts->handle, SESSION_IO_EVT_RX);
+    }
 
   if (hs->close_threshold > 0)
     {
@@ -365,8 +371,10 @@ hts_ts_rx_callback (session_t *ts)
 {
   hts_main_t *htm = &hts_main;
   hts_session_t *hs;
-  u8 *target = 0;
+  u8 *target = 0, *query = 0;
   http_msg_t msg;
+  unformat_input_t input;
+  u64 test_header_len;
   int rv;
 
   hs = hts_session_get (ts->thread_index, ts->opaque);
@@ -409,6 +417,35 @@ hts_ts_rx_callback (session_t *ts)
 	clib_warning ("%s request target: %v",
 		      msg.method_type == HTTP_REQ_GET ? "GET" : "POST",
 		      target);
+
+      if (msg.data.target_query_len != 0)
+	{
+	  vec_validate (query, msg.data.target_query_len - 1);
+	  rv = svm_fifo_peek (ts->rx_fifo, msg.data.target_query_offset,
+			      msg.data.target_query_len, query);
+	  ASSERT (rv == msg.data.target_query_len);
+	  if (htm->debug_level)
+	    clib_warning ("query: %v", query);
+	  unformat_init_vector (&input, query);
+	  if (unformat (&input, "test_header=%U", unformat_memory_size,
+			&test_header_len))
+	    {
+	      if (test_header_len > vec_len (htm->test_header_value))
+		{
+		  test_header_len = vec_len (htm->test_header_value);
+		  clib_warning ("test_header_len too big, truncated to %U",
+				format_memory_size, test_header_len);
+		}
+	      vec_resize (hs->resp_headers_buf,
+			  sizeof (http_app_header_t) + test_header_len);
+	      hs->resp_headers.len = vec_len (hs->resp_headers_buf);
+	      hs->resp_headers.buf = hs->resp_headers_buf;
+	      http_add_custom_header (
+		&hs->resp_headers, http_token_lit ("x-test"),
+		(const char *) htm->test_header_value, test_header_len);
+	    }
+	  vec_free (query);
+	}
 
       if (msg.method_type == HTTP_REQ_GET)
 	{
@@ -620,7 +657,7 @@ hts_start_listen (hts_main_t *htm, session_endpoint_cfg_t *sep, u8 *uri,
   u8 need_crypto;
   hts_session_t *hls;
   session_t *ls;
-  u32 thread_index = 0;
+  clib_thread_index_t thread_index = 0;
   int rv;
 
   clib_memset (a, 0, sizeof (*a));
@@ -760,6 +797,8 @@ hts_create (vlib_main_t *vm)
 
   if (htm->no_zc)
     vec_validate (htm->test_data, (64 << 10) - 1);
+
+  vec_validate_init_empty (htm->test_header_value, htm->fifo_size - 1024, 'x');
 
   if (hts_attach (htm))
     {

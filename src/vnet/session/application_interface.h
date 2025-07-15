@@ -17,17 +17,9 @@
 
 #include <vlibmemory/api.h>
 #include <svm/message_queue.h>
+#include <vnet/session/application_crypto.h>
 #include <vnet/session/session_types.h>
-#include <vnet/tls/tls_test.h>
 #include <svm/fifo_segment.h>
-
-typedef struct certificate_
-{
-  u32 *app_interests;		/* vec of application index asking for deletion cb */
-  u32 cert_key_index;		/* index in cert & key pool */
-  u8 *key;
-  u8 *cert;
-} app_cert_key_pair_t;
 
 typedef struct session_cb_vft_
 {
@@ -84,6 +76,8 @@ typedef struct session_cb_vft_
   /** Custom fifo allocation for proxy */
   int (*proxy_alloc_session_fifos) (session_t *s);
 
+  /** Collect and export session logs */
+  int (*app_evt_callback) (session_t *s);
 } session_cb_vft_t;
 
 #define foreach_app_init_args			\
@@ -180,34 +174,6 @@ typedef struct _vnet_application_add_tls_key_args_t
   u8 *key;
 } vnet_app_add_tls_key_args_t;
 
-typedef enum crypto_engine_type_
-{
-  CRYPTO_ENGINE_NONE,
-  CRYPTO_ENGINE_OPENSSL,
-  CRYPTO_ENGINE_MBEDTLS,
-  CRYPTO_ENGINE_VPP,
-  CRYPTO_ENGINE_PICOTLS,
-  CRYPTO_ENGINE_LAST = CRYPTO_ENGINE_PICOTLS,
-} crypto_engine_type_t;
-
-typedef struct _vnet_app_add_cert_key_pair_args_
-{
-  u8 *cert;
-  u8 *key;
-  u32 cert_len;
-  u32 key_len;
-  u32 index;
-} vnet_app_add_cert_key_pair_args_t;
-
-typedef struct crypto_ctx_
-{
-  u32 ctx_index;		/**< index in crypto context pool */
-  u32 n_subscribers;		/**< refcount of sessions using said context */
-  u32 ckpair_index;		/**< certificate & key */
-  u8 crypto_engine;
-  void *data;			/**< protocol specific data */
-} crypto_context_t;
-
 /* Application attach options */
 typedef enum
 {
@@ -243,7 +209,8 @@ typedef enum
   _ (EVT_MQ_USE_EVENTFD, "Use eventfds for signaling")                        \
   _ (MEMFD_FOR_BUILTIN, "Use memfd for builtin app segs")                     \
   _ (USE_HUGE_PAGE, "Use huge page for FIFO")                                 \
-  _ (GET_ORIGINAL_DST, "Get original dst enabled")
+  _ (GET_ORIGINAL_DST, "Get original dst enabled")                            \
+  _ (EVT_COLLECTOR, "App requests event collector")
 
 typedef enum _app_options
 {
